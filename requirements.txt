@@ -1,0 +1,28 @@
+# HairCLIPv2 runtime dependencies for Python 3.11 / CUDA 12.4 on RunPod.
+# Install this file first.
+# Optional extras:
+#   - requirements-dev.txt for notebook tooling
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.4.1+cu124
+torchvision==0.19.1+cu124
+numpy==2.2.6
+Pillow==10.2.0
+
+matplotlib==3.9.4
+scikit-image==0.25.2
+scipy==1.16.3
+tqdm==4.67.3
+ftfy==6.3.1
+gdown==5.2.1
+kornia==0.6.7
+mediapipe==0.10.32
+opencv-python-headless==4.10.0.84
+requests==2.32.3
+runpod==1.8.1
+huggingface_hub==0.30.2
+python-dotenv==1.0.1
+ninja==1.11.1.4
+
+git+https://github.com/openai/CLIP.git@ded190a052fdf4585bd685cee5bc96e0310d2c93

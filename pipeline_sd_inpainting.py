@@ -1,0 +1,784 @@
+"""
+MirrAI SD Inpainting Pipeline
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+완전 생성형(Text→Hair) 파이프라인.
+
+아키텍처:
+  ┌─────────────────────────────────────────────────────────────┐
+  │  입력: 사진 + hairstyle_text + color_text                    │
+  ├─────────────────────────────────────────────────────────────┤
+  │  [1] MediaPipe FaceDetection → 얼굴 bbox + landmarks        │
+  │  [2] BiSeNet → base hair mask (원본 해상도)                  │
+  │  [3] SAM2   → 정밀 hair mask 보정 (point + text prompt)     │
+  │  [4] Canny edge → ControlNet conditioning (얼굴 구조 보존)  │
+  │  [5] face crop → IP-Adapter conditioning (얼굴 identity)    │
+  │  [6] SD 1.5 Inpainting + ControlNet → hair 영역 생성        │
+  │  [7] Composite → 원본 얼굴 유지 + 생성 헤어 합성             │
+  └─────────────────────────────────────────────────────────────┘
+  출력: top-k 결과 이미지 (각기 다른 seed)
+
+모델:
+  - BiSeNet: pretrained_models/seg.pth (기존 모델 재사용)
+  - SAM2:    pretrained_models/sam2.pt  (기존 모델 재사용)
+  - SD Inpaint: runwayml/stable-diffusion-inpainting (HF Hub)
+  - ControlNet: lllyasviel/control_v11p_sd15_canny   (HF Hub)
+  - IP-Adapter: h94/IP-Adapter / ip-adapter-plus-face_sd15.bin (HF Hub)
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+
+logger = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+# ── HuggingFace 모델 ID ────────────────────────────────────────────────────────
+SD_INPAINT_MODEL_ID   = "runwayml/stable-diffusion-inpainting"
+CONTROLNET_MODEL_ID   = "lllyasviel/control_v11p_sd15_canny"
+IP_ADAPTER_REPO_ID    = "h94/IP-Adapter"
+IP_ADAPTER_WEIGHT     = "ip-adapter-plus-face_sd15.bin"
+
+# ── BiSeNet 설정 ───────────────────────────────────────────────────────────────
+HAIR_CLASS_IDX   = 10
+BISENET_CLASSES  = 16
+
+# ── SD 생성 해상도 ─────────────────────────────────────────────────────────────
+SD_SIZE = 512   # SD 1.5 native resolution
+
+# ── 공통 네거티브 프롬프트 ─────────────────────────────────────────────────────
+NEGATIVE_PROMPT = (
+    "ugly, deformed, blurry, low quality, bad anatomy, distorted face, "
+    "distorted hair, bald patch, artifacts, watermark, signature, "
+    "cartoon, anime, illustration, painting, drawing"
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclasses.dataclass
+class SDInpaintConfig:
+    """SD Inpainting 파이프라인 설정"""
+    # SD 생성 파라미터
+    num_inference_steps: int = 30
+    guidance_scale: float = 7.5
+    controlnet_conditioning_scale: float = 0.5
+    ip_adapter_scale: float = 0.6
+
+    # Canny edge 파라미터
+    canny_low: int  = 80
+    canny_high: int = 200
+
+    # hair mask dilate (SD 입력용 — 경계 확장)
+    mask_dilate_px: int = 20
+
+    # IP-Adapter 얼굴 crop padding 비율
+    face_crop_padding: float = 0.25
+
+    # 씨드 리스트 (top_k 개 결과용)
+    seeds: List[int] = dataclasses.field(
+        default_factory=lambda: [42, 1234, 9999, 7777, 314]
+    )
+
+    # 디바이스 / dtype
+    device: str = "cuda"
+    dtype: str = "float16"
+
+    # SAM2 사용 여부
+    use_sam2: bool = True
+
+    # 메모리 최적화
+    enable_xformers: bool = True
+
+    # 후처리 옵션 (현재 파이프라인에서는 기본 alpha blend 사용)
+    use_clip_ranking: bool = False   # 향후 CLIP 랭킹 확장용
+    use_color_match:  bool = False   # 향후 LAB 색상 매칭 확장용
+    use_poisson_blend: bool = False  # 향후 Poisson blend 확장용
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclasses.dataclass
+class SDInpaintResult:
+    image: np.ndarray       # H×W×3 BGR (원본 해상도)
+    image_pil: Image.Image  # PIL RGB
+    seed: int
+    rank: int
+    mask_used: str          # "sam2" | "bisenet"
+    clip_score: float = 0.0 # CLIP 점수 (현재는 rank 순서, 향후 CLIP 랭킹 확장용)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MirrAISDPipeline:
+    """
+    SAM2 + SD Inpainting + ControlNet(Canny) + IP-Adapter 기반 헤어 변환 파이프라인.
+
+    - hair segmentation: 기존 BiSeNet seg.pth + SAM2 sam2.pt 재사용
+    - 생성:              SD 1.5 Inpainting + ControlNet canny + IP-Adapter face
+    """
+
+    def __init__(self, config: Optional[SDInpaintConfig] = None) -> None:
+        self.config = config or SDInpaintConfig()
+        self.device = torch.device(
+            self.config.device if torch.cuda.is_available() else "cpu"
+        )
+        self.dtype = (
+            torch.float16 if self.config.dtype == "float16" else torch.bfloat16
+        )
+
+        self._bisenet    = None   # BiSeNet face parsing
+        self._sam2_factory = None  # SAM2 predictor factory (callable)
+        self._sd_pipe    = None   # StableDiffusionControlNetInpaintPipeline
+        self._mp_face    = None   # MediaPipe FaceDetection
+        self._loaded     = False
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public API
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def load(self) -> None:
+        """모델 로드 (cold start). 이미 로드된 경우 no-op."""
+        if self._loaded:
+            return
+        logger.info("[SDPipeline] 모델 로딩 시작...")
+        self._load_bisenet()
+        self._load_sam2()
+        self._load_mediapipe()
+        self._load_sd_pipeline()
+        self._loaded = True
+        logger.info("[SDPipeline] 모든 모델 로드 완료")
+
+    def run(
+        self,
+        image: np.ndarray,     # BGR, any resolution
+        hairstyle_text: str,
+        color_text: str,
+        top_k: int = 3,
+    ) -> List[SDInpaintResult]:
+        """
+        헤어 스타일 변환 실행.
+
+        Args:
+            image:          입력 이미지 (BGR numpy)
+            hairstyle_text: 헤어스타일 텍스트 (트렌드 데이터 hairstyle_text)
+            color_text:     헤어 컬러 텍스트 (트렌드 데이터 color_text)
+            top_k:          반환 결과 수 (기본 3)
+
+        Returns:
+            SDInpaintResult 리스트 (rank 0이 first)
+        """
+        if not self._loaded:
+            self.load()
+
+        top_k = min(top_k, len(self.config.seeds))
+        seeds = self.config.seeds[:top_k]
+
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        H, W = image.shape[:2]
+
+        # ── Step 1: 얼굴 검출 ────────────────────────────────────────────────
+        face_obs = self._detect_face(img_rgb)
+        if face_obs is None:
+            raise ValueError("얼굴을 검출할 수 없습니다.")
+        face_bbox = face_obs  # (x1, y1, x2, y2)
+        logger.info(f"[SDPipeline] 얼굴 검출: {face_bbox}")
+
+        # ── Step 2: BiSeNet base hair mask ───────────────────────────────────
+        hair_mask_base = self._bisenet_hair_mask(img_rgb)  # H×W float32
+
+        # ── Step 3: SAM2 refinement ───────────────────────────────────────────
+        hair_mask, mask_source = self._refine_with_sam2(
+            img_rgb, hair_mask_base, face_bbox, hairstyle_text
+        )
+        logger.info(
+            f"[SDPipeline] hair mask source={mask_source}, "
+            f"pixels={hair_mask.sum():.0f}"
+        )
+
+        if hair_mask.sum() < 300:
+            raise ValueError("머리카락 영역이 너무 작습니다.")
+
+        # ── Step 4: SD 입력 준비 ─────────────────────────────────────────────
+        img_pil = Image.fromarray(img_rgb)
+        img_512, mask_512, canny_512, scale, pad = self._prepare_sd_inputs(
+            img_rgb, hair_mask
+        )
+
+        # ── Step 5: 얼굴 crop (IP-Adapter) ───────────────────────────────────
+        face_crop_pil = self._crop_face(img_pil, face_bbox)
+
+        # ── Step 6: 프롬프트 ─────────────────────────────────────────────────
+        prompt = self._build_prompt(hairstyle_text, color_text)
+        logger.info(f"[SDPipeline] 프롬프트: {prompt}")
+
+        # ── Step 7: SD Inpainting ─────────────────────────────────────────────
+        gen_images = self._generate(img_512, mask_512, canny_512, face_crop_pil, prompt, seeds)
+
+        # ── Step 8: Composite → 원본 해상도 ───────────────────────────────────
+        results: List[SDInpaintResult] = []
+        for rank, (gen_pil, seed) in enumerate(zip(gen_images, seeds)):
+            composited_bgr = self._composite(
+                image, img_rgb, gen_pil, hair_mask, scale, pad, (W, H)
+            )
+            results.append(SDInpaintResult(
+                image=composited_bgr,
+                image_pil=Image.fromarray(cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)),
+                seed=seed,
+                rank=rank,
+                mask_used=mask_source,
+            ))
+
+        return results
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Model Loading
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _load_bisenet(self) -> None:
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.insert(0, str(PROJECT_ROOT))
+        from models.face_parsing.model import BiSeNet
+
+        seg_path = PROJECT_ROOT / "pretrained_models" / "seg.pth"
+        if not seg_path.exists():
+            raise FileNotFoundError(f"BiSeNet 가중치 없음: {seg_path}")
+
+        seg = BiSeNet(n_classes=BISENET_CLASSES, output_size=1024, input_size=512)
+        seg.load_state_dict(torch.load(str(seg_path), map_location="cpu"), strict=False)
+        seg.eval().requires_grad_(False)
+        if self.dtype == torch.float16:
+            seg.half()
+        seg.to(self.device)
+        self._bisenet = seg
+        logger.info("[SDPipeline] BiSeNet 로드 완료")
+
+    def _load_sam2(self) -> None:
+        if not self.config.use_sam2:
+            logger.info("[SDPipeline] SAM2 비활성화 (config.use_sam2=False)")
+            return
+
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.insert(0, str(PROJECT_ROOT))
+        from utils.sam2_runtime import create_sam2_predictor_factory
+
+        factory = create_sam2_predictor_factory(
+            device=str(self.device),
+            auto_download=True,
+        )
+        if factory is None:
+            logger.warning(
+                "[SDPipeline] SAM2 factory 생성 실패 (checkpoint 없음 or sam2 미설치). "
+                "BiSeNet-only로 진행."
+            )
+        else:
+            self._sam2_factory = factory
+            logger.info("[SDPipeline] SAM2 factory 등록 완료")
+
+    def _load_mediapipe(self) -> None:
+        import mediapipe as mp
+        self._mp_face = mp.solutions.face_detection.FaceDetection(
+            model_selection=1, min_detection_confidence=0.5
+        )
+        logger.info("[SDPipeline] MediaPipe FaceDetection 로드 완료")
+
+    def _load_sd_pipeline(self) -> None:
+        from diffusers import (
+            ControlNetModel,
+            StableDiffusionControlNetInpaintPipeline,
+        )
+        from diffusers.schedulers import DPMSolverMultistepScheduler
+
+        logger.info(f"[SDPipeline] ControlNet 로드: {CONTROLNET_MODEL_ID}")
+        controlnet = ControlNetModel.from_pretrained(
+            CONTROLNET_MODEL_ID, torch_dtype=self.dtype
+        )
+
+        logger.info(f"[SDPipeline] SD Inpainting 로드: {SD_INPAINT_MODEL_ID}")
+        pipe = StableDiffusionControlNetInpaintPipeline.from_pretrained(
+            SD_INPAINT_MODEL_ID,
+            controlnet=controlnet,
+            torch_dtype=self.dtype,
+            safety_checker=None,
+            requires_safety_checker=False,
+        )
+
+        # DPM-Solver++ 스케줄러 (20~30 steps로 고품질)
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            pipe.scheduler.config, use_karras_sigmas=True
+        )
+
+        # IP-Adapter face
+        logger.info(f"[SDPipeline] IP-Adapter 로드: {IP_ADAPTER_WEIGHT}")
+        pipe.load_ip_adapter(
+            IP_ADAPTER_REPO_ID,
+            subfolder="models",
+            weight_name=IP_ADAPTER_WEIGHT,
+        )
+        pipe.set_ip_adapter_scale(self.config.ip_adapter_scale)
+
+        # 메모리 최적화
+        if self.config.enable_xformers:
+            try:
+                pipe.enable_xformers_memory_efficient_attention()
+                logger.info("[SDPipeline] xformers 활성화")
+            except Exception:
+                logger.warning("[SDPipeline] xformers 없음 — 기본 attention 사용")
+
+        pipe.to(self.device)
+        self._sd_pipe = pipe
+        logger.info("[SDPipeline] SD Pipeline 로드 완료")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Segmentation: BiSeNet + SAM2
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _detect_face(
+        self, img_rgb: np.ndarray
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """MediaPipe로 얼굴 bbox (x1, y1, x2, y2) 반환"""
+        H, W = img_rgb.shape[:2]
+        result = self._mp_face.process(img_rgb)
+        if not result.detections:
+            return None
+        bb = result.detections[0].location_data.relative_bounding_box
+        x1 = max(0, int(bb.xmin * W))
+        y1 = max(0, int(bb.ymin * H))
+        x2 = min(W, int((bb.xmin + bb.width) * W))
+        y2 = min(H, int((bb.ymin + bb.height) * H))
+        return (x1, y1, x2, y2)
+
+    def _bisenet_hair_mask(self, img_rgb: np.ndarray) -> np.ndarray:
+        """
+        BiSeNet으로 머리카락 마스크 생성.
+        입력: H×W×3 RGB (any resolution)
+        출력: H×W float32 [0, 1]
+        """
+        H, W = img_rgb.shape[:2]
+
+        # BiSeNet 입력: 512×512, [-1, 1] 정규화
+        inp_np = cv2.resize(img_rgb, (512, 512), interpolation=cv2.INTER_AREA)
+        inp_t = torch.from_numpy(inp_np).float().permute(2, 0, 1).unsqueeze(0)
+        inp_t = inp_t / 127.5 - 1.0
+        if self.dtype == torch.float16:
+            inp_t = inp_t.half()
+        inp_t = inp_t.to(self.device)
+
+        with torch.no_grad():
+            output = self._bisenet(inp_t)
+            # BiSeNet.forward()는 (magnify(feat_out)[1024×1024], feat_out[256×256]) 튜플을 반환.
+            # feat_out[1] 이 실제 분류 logit (입력의 1/2 해상도, AdaptiveAvgPool로 blurred되지 않음).
+            if isinstance(output, (list, tuple)):
+                logits = output[1]   # feat_out — 실제 분류 logit
+            else:
+                logits = output
+            parsing = logits.argmax(dim=1).squeeze(0).cpu().numpy()
+
+        hair_512 = (parsing == HAIR_CLASS_IDX).astype(np.float32)
+        hair_orig = cv2.resize(hair_512, (W, H), interpolation=cv2.INTER_LINEAR)
+        return (hair_orig > 0.5).astype(np.float32)
+
+    def _refine_with_sam2(
+        self,
+        img_rgb: np.ndarray,           # H×W×3 RGB
+        base_mask: np.ndarray,          # H×W float32
+        face_bbox: Tuple[int, int, int, int],
+        prompt_text: str,
+    ) -> Tuple[np.ndarray, str]:
+        """
+        SAM2로 BiSeNet 마스크를 정밀 보정.
+
+        Returns:
+            (refined_mask H×W float32, source_name)
+        """
+        if self._sam2_factory is None:
+            # SAM2 없으면 BiSeNet mask에만 dilate 적용
+            return self._dilate_mask(base_mask), "bisenet"
+
+        try:
+            predictor = self._sam2_factory()
+            H, W = img_rgb.shape[:2]
+            x1, y1, x2, y2 = face_bbox
+
+            # SAM2 bbox: 얼굴 영역 + 위쪽 확장 (머리카락 포함)
+            bw = x2 - x1
+            bh = y2 - y1
+            sam_bbox = np.array([
+                max(0, x1 - int(bw * 0.15)),
+                max(0, y1 - int(bh * 0.4)),    # 머리 위까지 확장
+                min(W - 1, x2 + int(bw * 0.15)),
+                min(H - 1, y2 + int(bh * 0.08)),
+            ], dtype=np.float32)
+
+            # Positive points: BiSeNet hair mask 중심부
+            hair_coords = np.argwhere(base_mask > 0.5)  # (N, 2) [row, col]
+            if len(hair_coords) > 0:
+                # 상위 3개 대표점 (상단, 중간, 좌우)
+                pos_pts = self._sample_mask_points(hair_coords, n=3)
+            else:
+                cx = (x1 + x2) // 2
+                pos_pts = np.array([[cx, max(0, y1 - int(bh * 0.3))]], dtype=np.float32)
+
+            # Negative points: 얼굴 중심, 귀 근처
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            neg_pts = np.array([
+                [cx, cy],               # 얼굴 중심
+                [x1 + int(bw * 0.1), cy],  # 왼쪽 뺨
+                [x2 - int(bw * 0.1), cy],  # 오른쪽 뺨
+            ], dtype=np.float32)
+
+            point_coords = np.concatenate([pos_pts, neg_pts], axis=0)
+            point_labels = np.concatenate([
+                np.ones(len(pos_pts), dtype=np.int32),
+                np.zeros(len(neg_pts), dtype=np.int32),
+            ])
+
+            # SAM2 predict
+            predictor.set_image(img_rgb)
+            prediction = predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                box=sam_bbox[None, :],
+                multimask_output=False,
+            )
+
+            # predict() 반환 형태: dict | (masks, scores, logits) tuple
+            if isinstance(prediction, dict):
+                masks = prediction.get("masks")
+            elif isinstance(prediction, (tuple, list)):
+                # (masks, iou_scores, low_res_logits) 형태로 반환
+                masks = prediction[0]
+                # 드물게 masks 자체가 또 tuple/list인 경우 unwrap
+                while isinstance(masks, (tuple, list)):
+                    masks = masks[0]
+            else:
+                masks = prediction
+
+            if masks is not None:
+                # numpy/tensor → numpy 변환
+                if hasattr(masks, "cpu"):
+                    masks_np = masks.cpu().numpy()
+                else:
+                    masks_np = np.asarray(masks)
+
+                # shape 정규화: (N,H,W) or (H,W)
+                if masks_np.ndim == 3 and masks_np.shape[0] > 0:
+                    refined_np = masks_np[0].astype(np.float32)
+                elif masks_np.ndim == 2:
+                    refined_np = masks_np.astype(np.float32)
+                else:
+                    logger.warning("[SDPipeline] SAM2 마스크 shape 이상: %s", masks_np.shape)
+                    raise ValueError(f"Unexpected SAM2 mask shape: {masks_np.shape}")
+
+                refined_np = (refined_np > 0.5).astype(np.float32)
+                if refined_np.shape != (H, W):
+                    refined_np = cv2.resize(refined_np, (W, H), interpolation=cv2.INTER_LINEAR)
+                    refined_np = (refined_np > 0.5).astype(np.float32)
+                return self._dilate_mask(refined_np), "sam2"
+
+        except Exception as e:
+            logger.warning(f"[SDPipeline] SAM2 실패, BiSeNet으로 폴백: {e}")
+
+        return self._dilate_mask(base_mask), "bisenet"
+
+    def _dilate_mask(self, mask: np.ndarray) -> np.ndarray:
+        """마스크 dilate (경계 확장)"""
+        px = self.config.mask_dilate_px
+        if px <= 0:
+            return mask
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (px, px))
+        dilated = cv2.dilate(mask, kernel, iterations=1)
+        return np.clip(dilated, 0.0, 1.0).astype(np.float32)
+
+    @staticmethod
+    def _sample_mask_points(
+        hair_coords: np.ndarray, n: int = 3
+    ) -> np.ndarray:
+        """hair mask 좌표에서 대표 n개 point 샘플링 (row, col → x, y)"""
+        if len(hair_coords) == 0:
+            return np.empty((0, 2), dtype=np.float32)
+        idx = np.linspace(0, len(hair_coords) - 1, n, dtype=int)
+        pts = hair_coords[idx]  # (n, 2) [row, col]
+        return pts[:, ::-1].astype(np.float32)  # → (n, 2) [x=col, y=row]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SD Input Preparation
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _prepare_sd_inputs(
+        self,
+        img_rgb: np.ndarray,     # H×W×3 RGB
+        hair_mask: np.ndarray,   # H×W float32
+    ) -> Tuple[Image.Image, Image.Image, Image.Image, float, Tuple[int, int]]:
+        """
+        Letter-box resize → 512×512.
+
+        Returns:
+            img_512:    PIL RGB 512×512 (full image)
+            mask_512:   PIL L  512×512 (흰색=inpaint)
+            canny_512:  PIL RGB 512×512 (ControlNet conditioning)
+            scale:      resize 비율
+            pad:        (pad_left, pad_top) pixels
+        """
+        H, W = img_rgb.shape[:2]
+        scale = SD_SIZE / max(H, W)
+        new_w, new_h = int(W * scale), int(H * scale)
+        pad_l = (SD_SIZE - new_w) // 2
+        pad_t = (SD_SIZE - new_h) // 2
+
+        # ── image letterbox
+        img_rs = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        canvas = np.zeros((SD_SIZE, SD_SIZE, 3), dtype=np.uint8)
+        canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = img_rs
+
+        # ── mask letterbox
+        msk_rs = cv2.resize(hair_mask, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        msk_canvas = np.zeros((SD_SIZE, SD_SIZE), dtype=np.float32)
+        msk_canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = msk_rs
+
+        # ── Canny edge (hair 영역은 약화 → SD가 자유롭게 생성)
+        gray = cv2.cvtColor(canvas, cv2.COLOR_RGB2GRAY)
+        canny = cv2.Canny(gray, self.config.canny_low, self.config.canny_high)
+        hair_soft = cv2.GaussianBlur(msk_canvas, (0, 0), sigmaX=7)
+        canny_f = canny.astype(np.float32) * (1.0 - hair_soft * 0.8)
+        canny_rgb = cv2.cvtColor(canny_f.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+
+        img_512   = Image.fromarray(canvas)
+        mask_512  = Image.fromarray((msk_canvas * 255).astype(np.uint8), mode="L")
+        canny_512 = Image.fromarray(canny_rgb)
+
+        return img_512, mask_512, canny_512, scale, (pad_l, pad_t)
+
+    def _crop_face(
+        self,
+        img_pil: Image.Image,
+        face_bbox: Tuple[int, int, int, int],
+    ) -> Image.Image:
+        """IP-Adapter용 얼굴 crop (padding + 224×224 resize)"""
+        x1, y1, x2, y2 = face_bbox
+        W, H = img_pil.size
+        bw, bh = x2 - x1, y2 - y1
+        px = int(bw * self.config.face_crop_padding)
+        py = int(bh * self.config.face_crop_padding)
+        crop = img_pil.crop((
+            max(0, x1 - px), max(0, y1 - py),
+            min(W, x2 + px), min(H, y2 + py),
+        ))
+        return crop.resize((224, 224), Image.LANCZOS)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Prompt
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_prompt(hairstyle_text: str, color_text: str) -> str:
+        parts = []
+        if hairstyle_text:
+            parts.append(hairstyle_text.strip())
+        if color_text:
+            parts.append(f"{color_text.strip()} hair color")
+        style = ", ".join(parts) if parts else "natural hairstyle"
+        return (
+            f"professional portrait photo of a person with {style}, "
+            "photorealistic, high quality, natural lighting, 8k, "
+            "studio photography, sharp focus, beautiful hair"
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Generation
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _generate(
+        self,
+        img_512: Image.Image,
+        mask_512: Image.Image,
+        canny_512: Image.Image,
+        face_crop_pil: Image.Image,
+        prompt: str,
+        seeds: List[int],
+    ) -> List[Image.Image]:
+        """각 seed로 SD inpainting 실행 → PIL 이미지 리스트"""
+        # ── IP-Adapter 임베딩 사전 계산 ────────────────────────────────────────
+        # diffusers 0.30.x: ip_adapter_image 직접 전달 시
+        #   encoder_hidden_states = (text_embeds, image_embeds) tuple →
+        #   IPAdapterAttnProcessor2_0 에서 .shape 접근 시 AttributeError 발생.
+        # diffusers 0.31.0+: prepare_ip_adapter_image_embeds()로 미리 계산 후
+        #   ip_adapter_image_embeds 로 전달하면 정상 처리됨.
+        do_cfg = self.config.guidance_scale > 1.0
+        ip_embeds = None
+        try:
+            with torch.inference_mode():
+                ip_embeds = self._sd_pipe.prepare_ip_adapter_image_embeds(
+                    ip_adapter_image=[face_crop_pil],
+                    ip_adapter_image_embeds=None,
+                    device=self.device,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=do_cfg,
+                )
+            logger.info(
+                "[SDPipeline] IP-Adapter 임베딩 사전 계산 완료 "
+                f"(type={type(ip_embeds)}, "
+                f"shape={ip_embeds[0].shape if isinstance(ip_embeds, list) else ip_embeds.shape})"
+            )
+        except Exception as e:
+            # 임베딩 사전 계산 실패 → ip_adapter_image 직접 전달로 진행
+            # 단, 0.30.x 이하에서는 이 경로도 실패할 수 있음 (diffusers 업그레이드 필요)
+            logger.warning(
+                f"[SDPipeline] prepare_ip_adapter_image_embeds 실패 (diffusers 버전 확인 필요): "
+                f"{type(e).__name__}: {e}"
+            )
+
+        results: List[Image.Image] = []
+
+        for seed in seeds:
+            gen = torch.Generator(device=self.device).manual_seed(seed)
+            with torch.inference_mode():
+                if ip_embeds is not None:
+                    # 정상 경로: 사전 계산된 임베딩 사용 (diffusers 0.31.0+)
+                    out = self._sd_pipe(
+                        prompt=prompt,
+                        negative_prompt=NEGATIVE_PROMPT,
+                        image=img_512,
+                        mask_image=mask_512,
+                        control_image=canny_512,
+                        ip_adapter_image_embeds=ip_embeds,
+                        height=SD_SIZE,
+                        width=SD_SIZE,
+                        num_inference_steps=self.config.num_inference_steps,
+                        guidance_scale=self.config.guidance_scale,
+                        controlnet_conditioning_scale=self.config.controlnet_conditioning_scale,
+                        num_images_per_prompt=1,
+                        generator=gen,
+                        strength=1.0,
+                    )
+                else:
+                    # 폴백: ip_adapter_image 직접 전달 (0.31.0+ 에서는 동작)
+                    out = self._sd_pipe(
+                        prompt=prompt,
+                        negative_prompt=NEGATIVE_PROMPT,
+                        image=img_512,
+                        mask_image=mask_512,
+                        control_image=canny_512,
+                        ip_adapter_image=[face_crop_pil],
+                        height=SD_SIZE,
+                        width=SD_SIZE,
+                        num_inference_steps=self.config.num_inference_steps,
+                        guidance_scale=self.config.guidance_scale,
+                        controlnet_conditioning_scale=self.config.controlnet_conditioning_scale,
+                        num_images_per_prompt=1,
+                        generator=gen,
+                        strength=1.0,
+                    )
+            results.append(out.images[0])
+            logger.info(f"[SDPipeline] seed={seed} 생성 완료")
+        return results
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Compositing
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _composite(
+        self,
+        orig_bgr: np.ndarray,
+        orig_rgb: np.ndarray,
+        gen_pil: Image.Image,            # 512×512 RGB
+        hair_mask: np.ndarray,           # H×W float32 (original resolution)
+        scale: float,
+        pad: Tuple[int, int],            # (pad_left, pad_top)
+        original_size: Tuple[int, int],  # (W, H)
+    ) -> np.ndarray:
+        """
+        SD 생성 이미지를 원본에 합성.
+        - hair mask 영역: SD 생성 결과
+        - 그 외: 원본 (얼굴/배경 유지)
+        """
+        W, H = original_size
+        pad_l, pad_t = pad
+        new_w = int(W * scale)
+        new_h = int(H * scale)
+
+        # letterbox 제거 → 원본 비율로 crop
+        gen_np = np.array(gen_pil)   # 512×512×3 RGB
+        gen_cropped = gen_np[pad_t:pad_t + new_h, pad_l:pad_l + new_w]
+
+        # 원본 해상도로 upscale
+        gen_orig = cv2.resize(gen_cropped, (W, H), interpolation=cv2.INTER_LANCZOS4)
+
+        # alpha 블렌딩 (경계 gaussian smoothing)
+        alpha = cv2.GaussianBlur(hair_mask, (0, 0), sigmaX=4.0, sigmaY=4.0)
+        alpha = np.clip(alpha, 0.0, 1.0)[..., np.newaxis]   # H×W×1
+
+        orig_f = orig_rgb.astype(np.float32)
+        gen_f  = gen_orig.astype(np.float32)
+        blend  = gen_f * alpha + orig_f * (1.0 - alpha)
+        blend  = np.clip(blend, 0, 255).astype(np.uint8)
+
+        return cv2.cvtColor(blend, cv2.COLOR_RGB2BGR)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Utilities
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def unload(self) -> None:
+        """VRAM 해제"""
+        import gc
+        self._sd_pipe = None
+        self._bisenet = None
+        self._sam2_factory = None
+        if self._mp_face:
+            self._mp_face.close()
+        self._mp_face = None
+        self._loaded = False
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("[SDPipeline] 모델 언로드 완료")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI 테스트
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image",     required=True)
+    parser.add_argument("--hairstyle", default="wolf cut, layered")
+    parser.add_argument("--color",     default="auburn")
+    parser.add_argument("--top-k",     type=int, default=3)
+    parser.add_argument("--output",    default="./sd_output")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    img = cv2.imread(args.image)
+    if img is None:
+        raise FileNotFoundError(args.image)
+
+    pipe = MirrAISDPipeline()
+    pipe.load()
+
+    results = pipe.run(img, args.hairstyle, args.color, args.top_k)
+
+    os.makedirs(args.output, exist_ok=True)
+    for r in results:
+        path = os.path.join(args.output, f"rank{r.rank}_seed{r.seed}_{r.mask_used}.jpg")
+        cv2.imwrite(path, r.image)
+        print(f"저장: {path}")

@@ -1,0 +1,4 @@
+-r requirements.txt
+
+notebook==6.5.5
+ipykernel==6.29.5

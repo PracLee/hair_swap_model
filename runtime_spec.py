@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+GENERATOR_OUTPUT_SIZE = 1024
+EMBEDDING_REFERENCE_SIZE = 256
+SEGMENTATION_BACKBONE_SIZE = 512
+CLIP_INPUT_SIZE = 224
+SEGMENTATION_CLASSES = 16
+LATENT_STYLE_DIM = 512
+LATENT_LAYER_COUNT = 18
+GENERATOR_MLP_LAYERS = 8
+FEATURE_BLEND_SIZE = 32
+HAIR_CLASS_INDEX = 10
+EAR_CLASS_INDEX = 6
+DEFAULT_MASK_MORPH_KERNEL = 30
+
+EMBEDDING_DOWNSAMPLE_FACTOR = GENERATOR_OUTPUT_SIZE // EMBEDDING_REFERENCE_SIZE
+SEGMENTATION_DOWNSAMPLE_FACTOR = GENERATOR_OUTPUT_SIZE // SEGMENTATION_BACKBONE_SIZE
+
+
+def validate_runtime_spec() -> None:
+    if GENERATOR_OUTPUT_SIZE % EMBEDDING_REFERENCE_SIZE != 0:
+        raise ValueError("GENERATOR_OUTPUT_SIZE must be divisible by EMBEDDING_REFERENCE_SIZE.")
+    if GENERATOR_OUTPUT_SIZE % SEGMENTATION_BACKBONE_SIZE != 0:
+        raise ValueError("GENERATOR_OUTPUT_SIZE must be divisible by SEGMENTATION_BACKBONE_SIZE.")
+    if SEGMENTATION_CLASSES <= HAIR_CLASS_INDEX:
+        raise ValueError("HAIR_CLASS_INDEX must be within SEGMENTATION_CLASSES.")
+    if LATENT_STYLE_DIM <= 0 or LATENT_LAYER_COUNT <= 0 or GENERATOR_MLP_LAYERS <= 0:
+        raise ValueError("Latent and generator dimensions must be positive.")
+    if FEATURE_BLEND_SIZE <= 0 or FEATURE_BLEND_SIZE > EMBEDDING_REFERENCE_SIZE:
+        raise ValueError("FEATURE_BLEND_SIZE must be positive and no larger than EMBEDDING_REFERENCE_SIZE.")
+
+
+def scaled_mask_morph_kernel(spatial_size: int) -> int:
+    if spatial_size <= 0:
+        raise ValueError("spatial_size must be positive.")
+    kernel = round(DEFAULT_MASK_MORPH_KERNEL * spatial_size / GENERATOR_OUTPUT_SIZE)
+    return max(3, int(kernel))
