@@ -32,12 +32,17 @@ venv.bak/
 
 # Project specific
 images/
-models/
-pretrained_models/
+# 빌드에 필요한 폴더/파일은 제외 해제
+!models/
+!data/
+!pretrained_models/seg.pth
+# 나머지 무거운 모델들은 제외 유지
+pretrained_models/*
+models/*/*.pt
+models/*/*.pth
 output/
 runpod_inputs/
 criteria/
-data/
 
 # Generated files
 *.jpg
