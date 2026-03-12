@@ -11,6 +11,12 @@ on:
       - '**.py'
       - '**.sh'
   workflow_dispatch: # GitHub 웹사이트에서 수동 실행 버튼 활성화
+    inputs:
+      version:
+        description: '원하는 버전 태그를 입력하세요 (예: v8, v9) - 미입력시 자동번호 부여'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   build:
@@ -41,6 +47,16 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
+      - name: Generate Version Tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "TAG=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            # 자동 푸시이거나 버전을 입력하지 않은 경우 실행번호를 v1, v2... 형태로 사용
+            echo "TAG=v${{ github.run_number }}" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build and push SD Image
         uses: docker/build-push-action@v5
         with:
@@ -48,7 +64,10 @@ jobs:
           file: ./Dockerfile.sd
           platforms: linux/amd64
           push: true
-          tags: ${{ secrets.DOCKER_USERNAME }}/sd-v1:latest
+          # 지정된 버전 토큰과 최신(latest) 태그를 둘 다 할당
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/sd:${{ steps.version.outputs.TAG }}
+            ${{ secrets.DOCKER_USERNAME }}/sd:latest
           # 빌드 속도 개선을 위해 캐시 지정
           cache-from: type=gha
           cache-to: type=gha,mode=max
