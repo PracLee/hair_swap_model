@@ -334,13 +334,15 @@ class MirrAISDPipeline:
         )
         pipe.set_ip_adapter_scale(self.config.ip_adapter_scale)
 
-        # 메모리 최적화
-        if self.config.enable_xformers:
-            try:
-                pipe.enable_xformers_memory_efficient_attention()
-                logger.info("[SDPipeline] xformers 활성화")
-            except Exception:
-                logger.warning("[SDPipeline] xformers 없음 — 기본 attention 사용")
+        # 메모리 최적화 (PyTorch 2.0+ 기본 SDPA 사용)
+        # xformers를 강제 활성화하면 일부 Attention Processor(IP-Adapter)에서
+        # Tuple shape error 등 충돌이 발생할 수 있으므로 제거합니다.
+        # if self.config.enable_xformers:
+        #     try:
+        #         pipe.enable_xformers_memory_efficient_attention()
+        #         logger.info("[SDPipeline] xformers 활성화")
+        #     except Exception:
+        #         pass
 
         pipe.to(self.device)
         self._sd_pipe = pipe
@@ -615,77 +617,27 @@ class MirrAISDPipeline:
         seeds: List[int],
     ) -> List[Image.Image]:
         """각 seed로 SD inpainting 실행 → PIL 이미지 리스트"""
-        # ── IP-Adapter 임베딩 사전 계산 ────────────────────────────────────────
-        # diffusers 0.30.x: ip_adapter_image 직접 전달 시
-        #   encoder_hidden_states = (text_embeds, image_embeds) tuple →
-        #   IPAdapterAttnProcessor2_0 에서 .shape 접근 시 AttributeError 발생.
-        # diffusers 0.31.0+: prepare_ip_adapter_image_embeds()로 미리 계산 후
-        #   ip_adapter_image_embeds 로 전달하면 정상 처리됨.
-        do_cfg = self.config.guidance_scale > 1.0
-        ip_embeds = None
-        try:
-            with torch.inference_mode():
-                ip_embeds = self._sd_pipe.prepare_ip_adapter_image_embeds(
-                    ip_adapter_image=[face_crop_pil],
-                    ip_adapter_image_embeds=None,
-                    device=self.device,
-                    num_images_per_prompt=1,
-                    do_classifier_free_guidance=do_cfg,
-                )
-            logger.info(
-                "[SDPipeline] IP-Adapter 임베딩 사전 계산 완료 "
-                f"(type={type(ip_embeds)}, "
-                f"shape={ip_embeds[0].shape if isinstance(ip_embeds, list) else ip_embeds.shape})"
-            )
-        except Exception as e:
-            # 임베딩 사전 계산 실패 → ip_adapter_image 직접 전달로 진행
-            # 단, 0.30.x 이하에서는 이 경로도 실패할 수 있음 (diffusers 업그레이드 필요)
-            logger.warning(
-                f"[SDPipeline] prepare_ip_adapter_image_embeds 실패 (diffusers 버전 확인 필요): "
-                f"{type(e).__name__}: {e}"
-            )
-
         results: List[Image.Image] = []
 
         for seed in seeds:
             gen = torch.Generator(device=self.device).manual_seed(seed)
             with torch.inference_mode():
-                if ip_embeds is not None:
-                    # 정상 경로: 사전 계산된 임베딩 사용 (diffusers 0.31.0+)
-                    out = self._sd_pipe(
-                        prompt=prompt,
-                        negative_prompt=NEGATIVE_PROMPT,
-                        image=img_512,
-                        mask_image=mask_512,
-                        control_image=canny_512,
-                        ip_adapter_image_embeds=ip_embeds,
-                        height=SD_SIZE,
-                        width=SD_SIZE,
-                        num_inference_steps=self.config.num_inference_steps,
-                        guidance_scale=self.config.guidance_scale,
-                        controlnet_conditioning_scale=self.config.controlnet_conditioning_scale,
-                        num_images_per_prompt=1,
-                        generator=gen,
-                        strength=1.0,
-                    )
-                else:
-                    # 폴백: ip_adapter_image 직접 전달 (0.31.0+ 에서는 동작)
-                    out = self._sd_pipe(
-                        prompt=prompt,
-                        negative_prompt=NEGATIVE_PROMPT,
-                        image=img_512,
-                        mask_image=mask_512,
-                        control_image=canny_512,
-                        ip_adapter_image=[face_crop_pil],
-                        height=SD_SIZE,
-                        width=SD_SIZE,
-                        num_inference_steps=self.config.num_inference_steps,
-                        guidance_scale=self.config.guidance_scale,
-                        controlnet_conditioning_scale=self.config.controlnet_conditioning_scale,
-                        num_images_per_prompt=1,
-                        generator=gen,
-                        strength=1.0,
-                    )
+                out = self._sd_pipe(
+                    prompt=prompt,
+                    negative_prompt=NEGATIVE_PROMPT,
+                    image=img_512,
+                    mask_image=mask_512,
+                    control_image=canny_512,
+                    ip_adapter_image=[face_crop_pil],
+                    height=SD_SIZE,
+                    width=SD_SIZE,
+                    num_inference_steps=self.config.num_inference_steps,
+                    guidance_scale=self.config.guidance_scale,
+                    controlnet_conditioning_scale=self.config.controlnet_conditioning_scale,
+                    num_images_per_prompt=1,
+                    generator=gen,
+                    strength=1.0,
+                )
             results.append(out.images[0])
             logger.info(f"[SDPipeline] seed={seed} 생성 완료")
         return results
