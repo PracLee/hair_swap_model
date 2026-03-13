@@ -95,8 +95,9 @@ class SDInpaintConfig:
     canny_low: int  = 80
     canny_high: int = 200
 
-    # hair mask dilate (SD 입력용 — 경계 확장)
-    mask_dilate_px: int = 20
+    # hair mask dilate (SD 입력용 — 경계 확장, 잔머리 커버용으로 넉넉하게)
+    # 얼굴/목/눈 보호는 _exclude_face_interior() 에서 별도 처리함
+    mask_dilate_px: int = 30
 
     # IP-Adapter 얼굴 crop padding 비율
     face_crop_padding: float = 0.25
@@ -243,6 +244,12 @@ class MirrAISDPipeline:
                 f"[SDPipeline] 마스크 하단 확장 완료 ({hair_length}), "
                 f"pixels={hair_mask.sum():.0f}"
             )
+
+        # ── Step 3-c: 얼굴 내부 보호 (눈/코/입/목 영역 마스크 제거) ────────────
+        hair_mask = self._exclude_face_interior(hair_mask, face_bbox, H, W)
+        logger.info(
+            f"[SDPipeline] 얼굴 내부 보호 완료, pixels={hair_mask.sum():.0f}"
+        )
 
         # ── Step 4: SD 입력 준비 ─────────────────────────────────────────────
         img_pil = Image.fromarray(img_rgb)
@@ -674,17 +681,66 @@ class MirrAISDPipeline:
             return hair_mask
 
         # cutoff_y ~ lowest_hair_y 구간을 마스크에 추가
+        # 헤어가 실제로 있는 열(column) 범위를 위쪽 행들에서 추정
+        hair_cols_all = np.where(np.any(hair_mask[:cutoff_y] > 0.5, axis=0))[0]
+        if len(hair_cols_all) > 0:
+            default_c_min = int(hair_cols_all.min())
+            default_c_max = int(hair_cols_all.max())
+        else:
+            default_c_min, default_c_max = x1, x2
+
         expanded = hair_mask.copy()
         for row in range(cutoff_y, min(lowest_hair_y + 1, H)):
             row_hair_cols = np.where(hair_mask[row] > 0.3)[0]
             if len(row_hair_cols) > 0:
                 c_min, c_max = int(row_hair_cols.min()), int(row_hair_cols.max())
             else:
-                # 머리카락 없는 행: 얼굴 가로 폭 기준으로 채움
-                c_min, c_max = x1, x2
+                # 헤어 없는 행: 위에서 추정한 헤어 열 범위로만 채움 (얼굴/목 제외)
+                c_min, c_max = default_c_min, default_c_max
             expanded[row, max(0, c_min):min(W, c_max + 1)] = 1.0
 
         return expanded
+
+    def _exclude_face_interior(
+        self,
+        hair_mask: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        H: int,
+        W: int,
+    ) -> np.ndarray:
+        """
+        얼굴 내부(눈/코/입)와 목 영역을 마스크에서 명시적으로 제거.
+
+        - 이마 상단(y1 ~ y1+20%)는 헤어가 있을 수 있으므로 유지
+        - 눈/코/입 영역(y1+25% ~ y2-5%, x1+10% ~ x2-10%): 제거
+        - 턱 아래 ~ 목 영역(y2 ~ y2+face_h*0.5, 얼굴 폭 기준): 제거
+        """
+        x1, y1, x2, y2 = face_bbox
+        face_h = max(y2 - y1, 1)
+        face_w = max(x2 - x1, 1)
+        protected = hair_mask.copy()
+
+        # 얼굴 내부 (눈/코/입): 이마 아래 ~ 턱 위
+        eye_y1 = int(y1 + face_h * 0.25)
+        eye_y2 = int(y2 - face_h * 0.05)
+        eye_x1 = int(x1 + face_w * 0.10)
+        eye_x2 = int(x2 - face_w * 0.10)
+        protected[
+            max(0, eye_y1):min(H, eye_y2),
+            max(0, eye_x1):min(W, eye_x2),
+        ] = 0.0
+
+        # 목 영역: 턱 아래 ~ 얼굴 높이 50% 아래, 얼굴 폭 중앙부
+        neck_y1 = y2
+        neck_y2 = int(y2 + face_h * 0.5)
+        neck_x1 = int(x1 + face_w * 0.15)
+        neck_x2 = int(x2 - face_w * 0.15)
+        protected[
+            max(0, neck_y1):min(H, neck_y2),
+            max(0, neck_x1):min(W, neck_x2),
+        ] = 0.0
+
+        return protected
 
     # ──────────────────────────────────────────────────────────────────────────
     # Prompt
