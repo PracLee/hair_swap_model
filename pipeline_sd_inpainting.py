@@ -57,6 +57,7 @@ HAIR_CLASS_IDX   = 14
 # 8: r_eye, 9: l_eye, 10: nose, 11: inner_mouth, 12: lower_lip, 13: upper_lip
 # 얼굴 내부 및 목/귀 클래스 포함
 FACE_CLASS_IDXS  = frozenset([1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+CLOTH_CLASS_IDX  = 3   # SegFace class 3 = cloth → hair mask에서 제거해 옷 영역 보호
 
 # ── SD 생성 해상도 ─────────────────────────────────────────────────────────────
 SD_SIZE = 512   # SD 1.5 native resolution
@@ -222,8 +223,8 @@ class MirrAISDPipeline:
         face_bbox = face_obs  # (x1, y1, x2, y2)
         logger.info(f"[SDPipeline] 얼굴 검출: {face_bbox}")
 
-        # ── Step 2: SegFace base hair mask + 얼굴 픽셀 마스크 ───────────────────
-        hair_mask_base, face_region_mask = self._segface_hair_mask(img_rgb, face_bbox)
+        # ── Step 2: SegFace base hair mask + 얼굴 픽셀 마스크 + 옷 마스크 ──────
+        hair_mask_base, face_region_mask, cloth_mask = self._segface_hair_mask(img_rgb, face_bbox)
 
         # ── Step 3: SAM2 refinement ───────────────────────────────────────────
         hair_mask, mask_source = self._refine_with_sam2(
@@ -253,6 +254,14 @@ class MirrAISDPipeline:
         hair_mask = np.clip(hair_mask - face_region_mask, 0.0, 1.0)
         logger.info(
             f"[SDPipeline] 얼굴 픽셀 제거 완료, pixels={hair_mask.sum():.0f}"
+        )
+
+        # ── Step 3-d: SegFace 옷 픽셀 제거 (옷이 바뀌는 문제 방지) ────────────
+        # cloth_mask도 dilate하여 경계까지 보호 (머리카락이 옷 위로 걸칠 때 대비)
+        cloth_mask_dilated = self._dilate_mask(cloth_mask)
+        hair_mask = np.clip(hair_mask - cloth_mask_dilated, 0.0, 1.0)
+        logger.info(
+            f"[SDPipeline] 옷 픽셀 제거 완료, pixels={hair_mask.sum():.0f}"
         )
 
         # ── Step 4: SD 입력 준비 ─────────────────────────────────────────────
@@ -440,11 +449,16 @@ class MirrAISDPipeline:
         y2 = min(H, int((bb.ymin + bb.height) * H))
         return (x1, y1, x2, y2)
 
-    def _segface_hair_mask(self, img_rgb: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Tuple[np.ndarray, np.ndarray]:
+    def _segface_hair_mask(self, img_rgb: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        SegFace로 머리카락 + 얼굴 영역 마스크 생성.
+        SegFace로 머리카락 + 얼굴 + 옷 영역 마스크 생성.
         얼굴 bbox를 기준으로 여유 있게 크롭한 뒤 512x512로 리사이즈하여 SegFace에 입력.
         이후 원본 해상도의 전체 영역으로 다시 복원하여 출력.
+
+        Returns:
+            hair_mask  (H×W float32): 머리카락 영역
+            face_mask  (H×W float32): 얼굴/목/귀 영역 (inpaint에서 보호)
+            cloth_mask (H×W float32): 옷 영역 (inpaint에서 보호)
         """
         H, W = img_rgb.shape[:2]
         x1, y1, x2, y2 = face_bbox
@@ -497,25 +511,34 @@ class MirrAISDPipeline:
             # logits: [1, 19, 512, 512]
             parsing = logits.argmax(dim=1).squeeze(0).cpu().numpy()
 
-        hair_512 = (parsing == HAIR_CLASS_IDX).astype(np.float32)
-        face_512 = np.isin(parsing, list(FACE_CLASS_IDXS)).astype(np.float32)
+        hair_512  = (parsing == HAIR_CLASS_IDX).astype(np.float32)
+        face_512  = np.isin(parsing, list(FACE_CLASS_IDXS)).astype(np.float32)
+        cloth_512 = (parsing == CLOTH_CLASS_IDX).astype(np.float32)
 
         # 1. 원본 비율 (crop_w, crop_h) 해상도로 다시 리사이즈
-        hair_crop = cv2.resize(hair_512, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
-        face_crop = cv2.resize(face_512, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
-        
-        # 2. 패딩 부분 잘라내기
-        hair_crop = hair_crop[:ch, :cw]
-        face_crop = face_crop[:ch, :cw]
-        
-        # 3. 원본 HxW 해상도에 덮어쓰기
-        hair_orig = np.zeros((H, W), dtype=np.float32)
-        face_orig = np.zeros((H, W), dtype=np.float32)
-        
-        hair_orig[crop_y1:crop_y2, crop_x1:crop_x2] = hair_crop
-        face_orig[crop_y1:crop_y2, crop_x1:crop_x2] = face_crop
+        hair_crop  = cv2.resize(hair_512,  (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+        face_crop  = cv2.resize(face_512,  (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+        cloth_crop = cv2.resize(cloth_512, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
 
-        return (hair_orig > 0.5).astype(np.float32), (face_orig > 0.5).astype(np.float32)
+        # 2. 패딩 부분 잘라내기
+        hair_crop  = hair_crop[:ch, :cw]
+        face_crop  = face_crop[:ch, :cw]
+        cloth_crop = cloth_crop[:ch, :cw]
+
+        # 3. 원본 HxW 해상도에 덮어쓰기
+        hair_orig  = np.zeros((H, W), dtype=np.float32)
+        face_orig  = np.zeros((H, W), dtype=np.float32)
+        cloth_orig = np.zeros((H, W), dtype=np.float32)
+
+        hair_orig[crop_y1:crop_y2, crop_x1:crop_x2]  = hair_crop
+        face_orig[crop_y1:crop_y2, crop_x1:crop_x2]  = face_crop
+        cloth_orig[crop_y1:crop_y2, crop_x1:crop_x2] = cloth_crop
+
+        return (
+            (hair_orig  > 0.5).astype(np.float32),
+            (face_orig  > 0.5).astype(np.float32),
+            (cloth_orig > 0.5).astype(np.float32),
+        )
 
     def _refine_with_sam2(
         self,
@@ -638,47 +661,39 @@ class MirrAISDPipeline:
                 elif masks_np.ndim != 3 or masks_np.shape[0] == 0:
                     raise ValueError(f"Unexpected SAM2 mask shape: {masks_np.shape}")
 
-                # multimask: 얼굴 overlap 가장 적고 hair 영역 많은 마스크 선택
-                # hair_approx: 얼굴 위쪽 + 얼굴 옆/아래 측면 (긴 머리 포함)
-                hair_approx = np.zeros((H, W), dtype=np.float32)
-                # 정수리 영역
-                hair_approx[max(0, y1 - int(bh*0.8)):min(H, y1 + int(bh*0.1)),
-                            max(0, x1 - int(bw*0.5)):min(W, x2 + int(bw*0.5))] = 1.0
-                # 얼굴 옆 + 아래쪽 측면 (긴 머리 흘러내리는 구간)
-                hair_approx[y1:min(H, y2 + int(bh*1.2)),
-                            max(0, x1 - int(bw*0.6)):max(0, x1 - int(bw*0.05))] = 1.0  # 왼쪽
-                hair_approx[y1:min(H, y2 + int(bh*1.2)),
-                            min(W, x2 + int(bw*0.05)):min(W, x2 + int(bw*0.6))] = 1.0  # 오른쪽
-
-                # face 영역 근사 (페널티용)
-                face_approx = np.zeros((H, W), dtype=np.float32)
-                fy1 = max(0, int(y1 + bh * 0.1))
-                fy2 = min(H, int(y2))
-                fx1 = max(0, int(x1 + bw * 0.05))
-                fx2 = min(W, int(x2 - bw * 0.05))
-                face_approx[fy1:fy2, fx1:fx2] = 1.0
-
+                # multimask: SegFace의 base_mask와 가장 일치하는(IoU가 높은) 마스크를 선택
                 best_mask = None
-                best_score = -1.0
+                best_iou = -1.0
+                
+                # base_mask (SegFace 예측 결과)
+                base_f = (base_mask > 0.5).astype(np.float32)
+                base_sum = base_f.sum()
+                
                 for m in masks_np:
                     m_f = (m > 0.5).astype(np.float32)
                     if m_f.shape != (H, W):
                         m_f = cv2.resize(m_f, (W, H), interpolation=cv2.INTER_LINEAR)
                         m_f = (m_f > 0.5).astype(np.float32)
-                    # 얼굴 위쪽 hair 영역 hit - 얼굴 overlap 2배 패널티
-                    hair_hit = (m_f * hair_approx).sum()
-                    face_hit = (m_f * face_approx).sum()
-                    score = hair_hit - face_hit * 2.0
-                    if score > best_score:
-                        best_score = score
+                    
+                    # Compute IoU with base_mask
+                    intersection = (m_f * base_f).sum()
+                    union = m_f.sum() + base_sum - intersection
+                    iou = intersection / (union + 1e-6)
+                    
+                    if iou > best_iou:
+                        best_iou = iou
                         best_mask = m_f
 
                 refined_np = best_mask
-                # BiSeNet AND 교집합 제거 — BiSeNet이 hair를 일부만 감지하면 SAM2 결과도 잘려버림
-                # 얼굴 제거는 run()의 face_region_mask 빼기(line 251)에서 처리
+                
+                # 얼굴/몸통 등 잘못된 영역이 넓게 잡히는 것을 방지하기 위해 
+                # SegFace base_mask_dilated 와의 교집합만 취함
+                base_mask_dilated = self._dilate_mask(base_mask)
+                refined_np = np.clip(refined_np * base_mask_dilated, 0.0, 1.0)
+                
                 if refined_np.sum() < 300:
-                    logger.warning("[SDPipeline] SAM2 결과가 너무 작아 BiSeNet으로 폴백")
-                    return self._dilate_mask(base_mask), "bisenet"
+                    logger.warning("[SDPipeline] SAM2 결과가 너무 작아 SegFace로 폴백")
+                    return self._dilate_mask(base_mask), "segface"
 
                 return self._dilate_mask(refined_np), "sam2"
 
@@ -820,6 +835,10 @@ class MirrAISDPipeline:
         if not np.any(hair_rows):
             return hair_mask
         lowest_hair_y = int(np.max(np.where(hair_rows)))
+
+        # 마스크 확장 한계: 어깨 아래(얼굴 높이 2배)를 넘지 않도록 제한 (옷 보호)
+        max_expand_y = int(y2 + face_h * 2.0)
+        lowest_hair_y = min(lowest_hair_y, max_expand_y)
 
         if lowest_hair_y <= cutoff_y:
             # 이미 요청한 길이보다 짧음 → 확장 불필요
