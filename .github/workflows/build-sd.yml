@@ -18,6 +18,11 @@ on:
         default: ''
         type: string
 
+# 같은 브랜치에 새 커밋이 오면 진행 중인 빌드 자동 취소
+concurrency:
+  group: build-sd-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
