@@ -58,11 +58,23 @@ BISENET_CLASSES  = 16
 SD_SIZE = 512   # SD 1.5 native resolution
 
 # ── 공통 네거티브 프롬프트 ─────────────────────────────────────────────────────
-NEGATIVE_PROMPT = (
+_NEGATIVE_BASE = (
     "ugly, deformed, blurry, low quality, bad anatomy, distorted face, "
     "distorted hair, bald patch, artifacts, watermark, signature, "
     "cartoon, anime, illustration, painting, drawing"
 )
+
+# ── 헤어 길이 키워드 ────────────────────────────────────────────────────────────
+_SHORT_HAIR_KEYWORDS = frozenset([
+    "short", "bob", "pixie", "buzz", "hush", "crop", "cropped",
+    "undercut", "bowl", "chin length", "chin-length",
+    "above ear", "above shoulder", "ear length", "single",
+    "단발", "숏컷", "픽시",
+])
+_MEDIUM_HAIR_KEYWORDS = frozenset([
+    "lob", "midi", "medium", "shoulder length", "shoulder-length",
+    "collarbone", "clavicle", "mid length", "mid-length",
+])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,6 +228,18 @@ class MirrAISDPipeline:
         if hair_mask.sum() < 300:
             raise ValueError("머리카락 영역이 너무 작습니다.")
 
+        # ── Step 3-b: 헤어 길이 분류 + 단발/숏컷일 때 마스크 하단 확장 ────────
+        hair_length = self._classify_hair_length(hairstyle_text)
+        logger.info(f"[SDPipeline] 헤어 길이 분류: {hair_length}")
+        if hair_length in ("short", "medium"):
+            hair_mask = self._expand_mask_for_short_hair(
+                hair_mask, face_bbox, H, W, hair_length
+            )
+            logger.info(
+                f"[SDPipeline] 마스크 하단 확장 완료 ({hair_length}), "
+                f"pixels={hair_mask.sum():.0f}"
+            )
+
         # ── Step 4: SD 입력 준비 ─────────────────────────────────────────────
         img_pil = Image.fromarray(img_rgb)
         img_512, mask_512, canny_512, scale, pad = self._prepare_sd_inputs(
@@ -226,11 +250,17 @@ class MirrAISDPipeline:
         face_crop_pil = self._crop_face(img_pil, face_bbox)
 
         # ── Step 6: 프롬프트 ─────────────────────────────────────────────────
-        prompt = self._build_prompt(hairstyle_text, color_text)
+        prompt, neg_prompt, guidance = self._build_prompt(
+            hairstyle_text, color_text, hair_length
+        )
         logger.info(f"[SDPipeline] 프롬프트: {prompt}")
+        logger.info(f"[SDPipeline] 네거티브: {neg_prompt}")
+        logger.info(f"[SDPipeline] guidance_scale: {guidance}")
 
         # ── Step 7: SD Inpainting ─────────────────────────────────────────────
-        gen_images = self._generate(img_512, mask_512, canny_512, face_crop_pil, prompt, seeds)
+        gen_images = self._generate(
+            img_512, mask_512, canny_512, face_crop_pil, prompt, neg_prompt, guidance, seeds
+        )
 
         # ── Step 8: Composite → 원본 해상도 ───────────────────────────────────
         results: List[SDInpaintResult] = []
@@ -586,22 +616,120 @@ class MirrAISDPipeline:
         return crop.resize((224, 224), Image.LANCZOS)
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Hair Length Classification
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _classify_hair_length(hairstyle_text: str) -> str:
+        """헤어스타일 텍스트 → 'short' | 'medium' | 'long'"""
+        text = hairstyle_text.lower()
+        for kw in _SHORT_HAIR_KEYWORDS:
+            if kw in text:
+                return "short"
+        for kw in _MEDIUM_HAIR_KEYWORDS:
+            if kw in text:
+                return "medium"
+        return "long"
+
+    def _expand_mask_for_short_hair(
+        self,
+        hair_mask: np.ndarray,              # H×W float32
+        face_bbox: Tuple[int, int, int, int],
+        H: int,
+        W: int,
+        hair_length: str = "short",
+    ) -> np.ndarray:
+        """
+        단발/중단발 변환 시 마스크 하단 확장.
+
+        긴 머리 → 단발로 바꿀 때, 현재 긴 머리 마스크 하단(턱 아래)에도 마스크를
+        씌워 SD가 그 영역을 배경/피부로 채우도록 유도함.
+        확장 없이 그냥 두면 원본 긴 머리 픽셀이 composite에서 살아남음.
+        """
+        x1, y1, x2, y2 = face_bbox
+        face_h = max(y2 - y1, 1)
+
+        # 길이별 기준점: 어디부터 "머리카락이 없어야 하는가"
+        if hair_length == "short":
+            # 턱 바로 아래 (얼굴 높이의 +5%)
+            cutoff_y = int(y2 + face_h * 0.05)
+        else:  # medium
+            # 어깨 위 (얼굴 높이의 +60%)
+            cutoff_y = int(y2 + face_h * 0.60)
+        cutoff_y = max(0, min(cutoff_y, H - 1))
+
+        # 기존 머리카락의 최하단 행
+        hair_rows = np.any(hair_mask > 0.5, axis=1)
+        if not np.any(hair_rows):
+            return hair_mask
+        lowest_hair_y = int(np.max(np.where(hair_rows)))
+
+        if lowest_hair_y <= cutoff_y:
+            # 이미 요청한 길이보다 짧음 → 확장 불필요
+            return hair_mask
+
+        # cutoff_y ~ lowest_hair_y 구간을 마스크에 추가
+        expanded = hair_mask.copy()
+        for row in range(cutoff_y, min(lowest_hair_y + 1, H)):
+            row_hair_cols = np.where(hair_mask[row] > 0.3)[0]
+            if len(row_hair_cols) > 0:
+                c_min, c_max = int(row_hair_cols.min()), int(row_hair_cols.max())
+            else:
+                # 머리카락 없는 행: 얼굴 가로 폭 기준으로 채움
+                c_min, c_max = x1, x2
+            expanded[row, max(0, c_min):min(W, c_max + 1)] = 1.0
+
+        return expanded
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Prompt
     # ──────────────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _build_prompt(hairstyle_text: str, color_text: str) -> str:
+    def _build_prompt(
+        hairstyle_text: str,
+        color_text: str,
+        hair_length: str = "long",
+    ) -> Tuple[str, str, float]:
+        """
+        Returns:
+            positive_prompt, negative_prompt, guidance_scale
+        """
         parts = []
         if hairstyle_text:
             parts.append(hairstyle_text.strip())
         if color_text:
             parts.append(f"{color_text.strip()} hair color")
         style = ", ".join(parts) if parts else "natural hairstyle"
-        return (
-            f"professional portrait photo of a person with {style}, "
+
+        # ── 길이별 positive/negative 보강 ────────────────────────────────────
+        if hair_length == "short":
+            pos_suffix = (
+                ", short hairstyle, hair length above shoulders, "
+                "visible neck, bare neck, short hair ends at chin or above"
+            )
+            neg_prefix = "long hair, long flowing hair, hair below shoulders, wavy long hair, "
+            guidance = 9.5   # 프롬프트 추종 강화
+        elif hair_length == "medium":
+            pos_suffix = (
+                ", medium length hair, shoulder-length hair, "
+                "hair just above or at shoulder"
+            )
+            neg_prefix = "very long hair, very short hair, "
+            guidance = 8.5
+        else:
+            pos_suffix = ""
+            neg_prefix = ""
+            guidance = 7.5
+
+        positive = (
+            f"professional portrait photo of a person with {style}{pos_suffix}, "
             "photorealistic, high quality, natural lighting, 8k, "
             "studio photography, sharp focus, beautiful hair"
         )
+        negative = neg_prefix + _NEGATIVE_BASE
+
+        return positive, negative, guidance
 
     # ──────────────────────────────────────────────────────────────────────────
     # Generation
@@ -614,6 +742,8 @@ class MirrAISDPipeline:
         canny_512: Image.Image,
         face_crop_pil: Image.Image,
         prompt: str,
+        negative_prompt: str,
+        guidance_scale: float,
         seeds: List[int],
     ) -> List[Image.Image]:
         """각 seed로 SD inpainting 실행 → PIL 이미지 리스트"""
@@ -624,7 +754,7 @@ class MirrAISDPipeline:
             with torch.inference_mode():
                 out = self._sd_pipe(
                     prompt=prompt,
-                    negative_prompt=NEGATIVE_PROMPT,
+                    negative_prompt=negative_prompt,
                     image=img_512,
                     mask_image=mask_512,
                     control_image=canny_512,
@@ -632,7 +762,7 @@ class MirrAISDPipeline:
                     height=SD_SIZE,
                     width=SD_SIZE,
                     num_inference_steps=self.config.num_inference_steps,
-                    guidance_scale=self.config.guidance_scale,
+                    guidance_scale=guidance_scale,
                     controlnet_conditioning_scale=self.config.controlnet_conditioning_scale,
                     num_images_per_prompt=1,
                     generator=gen,
