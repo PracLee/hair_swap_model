@@ -51,11 +51,12 @@ CONTROLNET_MODEL_ID   = "lllyasviel/control_v11p_sd15_canny"
 IP_ADAPTER_REPO_ID    = "h94/IP-Adapter"
 IP_ADAPTER_WEIGHT     = "ip-adapter-plus-face_sd15.bin"
 
-# ── BiSeNet 설정 ───────────────────────────────────────────────────────────────
-HAIR_CLASS_IDX   = 10
-BISENET_CLASSES  = 16
-# 얼굴 내부 클래스 (skin/nose/eye_g/eyes/brows/ears/mouth/lips) - hair(10) 제거에 활용
-FACE_CLASS_IDXS  = frozenset([1, 2, 3, 4, 5, 6, 7, 8, 9])
+# ── SegFace 설정 ───────────────────────────────────────────────────────────────
+HAIR_CLASS_IDX   = 14
+# 0: bg, 1: neck, 2: face, 3: cloth, 4: r_ear, 5: l_ear, 6: r_bro, 7: l_bro, 
+# 8: r_eye, 9: l_eye, 10: nose, 11: inner_mouth, 12: lower_lip, 13: upper_lip
+# 얼굴 내부 및 목/귀 클래스 포함
+FACE_CLASS_IDXS  = frozenset([1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
 
 # ── SD 생성 해상도 ─────────────────────────────────────────────────────────────
 SD_SIZE = 512   # SD 1.5 native resolution
@@ -160,7 +161,7 @@ class MirrAISDPipeline:
             torch.float16 if self.config.dtype == "float16" else torch.bfloat16
         )
 
-        self._bisenet    = None   # BiSeNet face parsing
+        self._segface    = None   # SegFace (Swin-B) face parsing
         self._sam2_factory = None  # SAM2 predictor factory (callable)
         self._sd_pipe    = None   # StableDiffusionControlNetInpaintPipeline
         self._mp_face    = None   # MediaPipe FaceDetection
@@ -175,7 +176,7 @@ class MirrAISDPipeline:
         if self._loaded:
             return
         logger.info("[SDPipeline] 모델 로딩 시작...")
-        self._load_bisenet()
+        self._load_segface()
         self._load_sam2()
         self._load_mediapipe()
         self._load_sd_pipeline()
@@ -221,8 +222,8 @@ class MirrAISDPipeline:
         face_bbox = face_obs  # (x1, y1, x2, y2)
         logger.info(f"[SDPipeline] 얼굴 검출: {face_bbox}")
 
-        # ── Step 2: BiSeNet base hair mask + 얼굴 픽셀 마스크 ───────────────────
-        hair_mask_base, face_region_mask = self._bisenet_hair_mask(img_rgb)
+        # ── Step 2: SegFace base hair mask + 얼굴 픽셀 마스크 ───────────────────
+        hair_mask_base, face_region_mask = self._segface_hair_mask(img_rgb, face_bbox)
 
         # ── Step 3: SAM2 refinement ───────────────────────────────────────────
         hair_mask, mask_source = self._refine_with_sam2(
@@ -248,7 +249,7 @@ class MirrAISDPipeline:
                 f"pixels={hair_mask.sum():.0f}"
             )
 
-        # ── Step 3-c: BiSeNet 얼굴 픽셀 제거 (bbox 직사각형 대신 픽셀 단위 보정) ─
+        # ── Step 3-c: SegFace 얼굴 픽셀 제거 (bbox 직사각형 대신 픽셀 단위 보정) ─
         hair_mask = np.clip(hair_mask - face_region_mask, 0.0, 1.0)
         logger.info(
             f"[SDPipeline] 얼굴 픽셀 제거 완료, pixels={hair_mask.sum():.0f}"
@@ -394,8 +395,30 @@ class MirrAISDPipeline:
         self._sd_pipe = pipe
         logger.info("[SDPipeline] SD Pipeline 로드 완료")
 
+    def _load_segface(self) -> None:
+        """SegFace (Swin-B) 모델 로드"""
+        if self._segface is not None:
+            return
+
+        from models.segface.models.segface_celeb import SegFaceCeleb
+        from huggingface_hub import hf_hub_download
+
+        logger.info("[SDPipeline] SegFace (Swin-B) 로드 중...")
+        segface = SegFaceCeleb(input_resolution=512, model="swin_base")
+        
+        ckpt_path = hf_hub_download(
+            repo_id="kartiknarayan/SegFace", 
+            filename="swinb_celeba_512/model_299.pt"
+        )
+        
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        segface.load_state_dict(ckpt)
+        segface.to(self.device).eval()
+        self._segface = segface
+        logger.info("[SDPipeline] SegFace 로드 완료")
+
     # ──────────────────────────────────────────────────────────────────────────
-    # Segmentation: BiSeNet + SAM2
+    # Segmentation: SegFace + SAM2
     # ──────────────────────────────────────────────────────────────────────────
 
     def _detect_face(
@@ -413,39 +436,81 @@ class MirrAISDPipeline:
         y2 = min(H, int((bb.ymin + bb.height) * H))
         return (x1, y1, x2, y2)
 
-    def _bisenet_hair_mask(self, img_rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _segface_hair_mask(self, img_rgb: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Tuple[np.ndarray, np.ndarray]:
         """
-        BiSeNet으로 머리카락 + 얼굴 영역 마스크 생성.
-        입력: H×W×3 RGB (any resolution)
-        출력:
-            hair_mask  H×W float32 [0, 1]
-            face_mask  H×W float32 [0, 1]  (skin/눈/코/입 등 얼굴 내부 픽셀)
+        SegFace로 머리카락 + 얼굴 영역 마스크 생성.
+        얼굴 bbox를 기준으로 여유 있게 크롭한 뒤 512x512로 리사이즈하여 SegFace에 입력.
+        이후 원본 해상도의 전체 영역으로 다시 복원하여 출력.
         """
         H, W = img_rgb.shape[:2]
-
-        # BiSeNet 입력: 512×512, [-1, 1] 정규화
-        inp_np = cv2.resize(img_rgb, (512, 512), interpolation=cv2.INTER_AREA)
-        inp_t = torch.from_numpy(inp_np).float().permute(2, 0, 1).unsqueeze(0)
-        inp_t = inp_t / 127.5 - 1.0
+        x1, y1, x2, y2 = face_bbox
+        bw, bh = x2 - x1, y2 - y1
+        cx, cy = x1 + bw // 2, y1 + bh // 2
+        
+        # CelebA-HQ 스타일 크롭: 얼굴 bbox 기준 박스 크기를 약 2.5~3배로 키워서 머리카락 전체를 포함
+        box_size = int(max(bw, bh) * 2.8)
+        # 윗머리가 잘리지 않도록 크롭 중심을 얼굴보다 조금 위로 (10%) 올림
+        cy = max(0, cy - int(box_size * 0.1))
+        
+        crop_x1 = max(0, cx - box_size // 2)
+        crop_y1 = max(0, cy - box_size // 2)
+        crop_x2 = min(W, crop_x1 + box_size)
+        crop_y2 = min(H, crop_y1 + box_size)
+        
+        cw = crop_x2 - crop_x1
+        ch = crop_y2 - crop_y1
+        
+        # 정사각형 형태로 패딩해서 512x512 로 만들기 위한 준비
+        crop_max = max(cw, ch)
+        pad_bottom = crop_max - ch
+        pad_right = crop_max - cw
+        
+        # 크롭
+        crop_img = img_rgb[crop_y1:crop_y2, crop_x1:crop_x2]
+        # 패딩 (검은 배경)
+        if pad_bottom > 0 or pad_right > 0:
+            crop_img = cv2.copyMakeBorder(crop_img, 0, pad_bottom, 0, pad_right, cv2.BORDER_CONSTANT, value=(0,0,0))
+            
+        crop_h, crop_w = crop_img.shape[:2]
+        
+        # 512x512 변환
+        inp_np = cv2.resize(crop_img, (512, 512), interpolation=cv2.INTER_AREA)
+        
+        # SegFace 입력 형식: [0, 1]로 Normalize (ImageNet mean/std 사용)
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        inp_t = (inp_np / 255.0 - mean) / std
+        inp_t = torch.from_numpy(inp_t).float().permute(2, 0, 1).unsqueeze(0)
+        
         if self.dtype == torch.float16:
             inp_t = inp_t.half()
         inp_t = inp_t.to(self.device)
 
         with torch.no_grad():
-            output = self._bisenet(inp_t)
-            # BiSeNet.forward()는 (magnify(feat_out)[1024×1024], feat_out[256×256]) 튜플을 반환.
-            # feat_out[1] 이 실제 분류 logit (입력의 1/2 해상도, AdaptiveAvgPool로 blurred되지 않음).
-            if isinstance(output, (list, tuple)):
-                logits = output[1]   # feat_out — 실제 분류 logit
-            else:
-                logits = output
+            DUMMY_LABELS = None
+            DUMMY_DATASET = None
+            logits = self._segface(inp_t, DUMMY_LABELS, DUMMY_DATASET)
+            # logits: [1, 19, 512, 512]
             parsing = logits.argmax(dim=1).squeeze(0).cpu().numpy()
 
         hair_512 = (parsing == HAIR_CLASS_IDX).astype(np.float32)
         face_512 = np.isin(parsing, list(FACE_CLASS_IDXS)).astype(np.float32)
 
-        hair_orig = cv2.resize(hair_512, (W, H), interpolation=cv2.INTER_LINEAR)
-        face_orig = cv2.resize(face_512, (W, H), interpolation=cv2.INTER_LINEAR)
+        # 1. 원본 비율 (crop_w, crop_h) 해상도로 다시 리사이즈
+        hair_crop = cv2.resize(hair_512, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+        face_crop = cv2.resize(face_512, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+        
+        # 2. 패딩 부분 잘라내기
+        hair_crop = hair_crop[:ch, :cw]
+        face_crop = face_crop[:ch, :cw]
+        
+        # 3. 원본 HxW 해상도에 덮어쓰기
+        hair_orig = np.zeros((H, W), dtype=np.float32)
+        face_orig = np.zeros((H, W), dtype=np.float32)
+        
+        hair_orig[crop_y1:crop_y2, crop_x1:crop_x2] = hair_crop
+        face_orig[crop_y1:crop_y2, crop_x1:crop_x2] = face_crop
+
         return (hair_orig > 0.5).astype(np.float32), (face_orig > 0.5).astype(np.float32)
 
     def _refine_with_sam2(
@@ -456,7 +521,7 @@ class MirrAISDPipeline:
         prompt_text: str,
     ) -> Tuple[np.ndarray, str]:
         """
-        SAM2로 BiSeNet 마스크를 정밀 보정.
+        SAM2로 SegFace 마스크를 정밀 보정.
 
         Returns:
             (refined_mask H×W float32, source_name)
