@@ -468,46 +468,74 @@ class MirrAISDPipeline:
             H, W = img_rgb.shape[:2]
             x1, y1, x2, y2 = face_bbox
 
-            # SAM2 bbox: 얼굴 영역 + 위쪽 확장 (머리카락 포함)
             bw = x2 - x1
             bh = y2 - y1
-            sam_bbox = np.array([
-                max(0, x1 - int(bw * 0.15)),
-                max(0, y1 - int(bh * 0.4)),    # 머리 위까지 확장
-                min(W - 1, x2 + int(bw * 0.15)),
-                min(H - 1, y2 + int(bh * 0.08)),
-            ], dtype=np.float32)
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-            # Positive points: BiSeNet hair mask 중심부
+            # SAM2 bbox: BiSeNet hair mask의 실제 범위로 tight하게 설정
             hair_coords = np.argwhere(base_mask > 0.5)  # (N, 2) [row, col]
             if len(hair_coords) > 0:
-                # 상위 3개 대표점 (상단, 중간, 좌우)
-                pos_pts = self._sample_mask_points(hair_coords, n=3)
+                hr_min, hc_min = hair_coords.min(axis=0)
+                hr_max, hc_max = hair_coords.max(axis=0)
+                sam_bbox = np.array([
+                    max(0,     hc_min - 10),
+                    max(0,     hr_min - 10),
+                    min(W - 1, hc_max + 10),
+                    min(H - 1, hr_max + 10),
+                ], dtype=np.float32)
             else:
-                cx = (x1 + x2) // 2
+                sam_bbox = np.array([
+                    max(0, x1 - int(bw * 0.2)),
+                    max(0, y1 - int(bh * 0.5)),
+                    min(W - 1, x2 + int(bw * 0.2)),
+                    min(H - 1, y2 + int(bh * 0.1)),
+                ], dtype=np.float32)
+
+            # Positive points: BiSeNet hair 영역 상단 5점 (얼굴과 거리 먼 곳)
+            if len(hair_coords) > 0:
+                # 상단 30% 픽셀에서만 샘플링 → 얼굴과 겹치는 하단 제외
+                top_cutoff = hr_min + int((hr_max - hr_min) * 0.3)
+                top_coords = hair_coords[hair_coords[:, 0] <= top_cutoff]
+                if len(top_coords) < 3:
+                    top_coords = hair_coords
+                pos_pts = self._sample_mask_points(top_coords, n=5)
+            else:
                 pos_pts = np.array([[cx, max(0, y1 - int(bh * 0.3))]], dtype=np.float32)
 
-            # Negative points: 얼굴 중심, 귀 근처
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            # Negative points: 얼굴 전체에 격자 분포 (9점) + 목/배경
             neg_pts = np.array([
-                [cx, cy],               # 얼굴 중심
-                [x1 + int(bw * 0.1), cy],  # 왼쪽 뺨
-                [x2 - int(bw * 0.1), cy],  # 오른쪽 뺨
+                # 얼굴 상단부
+                [x1 + int(bw * 0.25), y1 + int(bh * 0.15)],  # 왼쪽 이마
+                [cx,                   y1 + int(bh * 0.15)],  # 중앙 이마
+                [x2 - int(bw * 0.25), y1 + int(bh * 0.15)],  # 오른쪽 이마
+                # 얼굴 중앙부 (눈/코)
+                [x1 + int(bw * 0.25), cy],                    # 왼쪽 뺨
+                [cx,                   cy],                    # 얼굴 중심
+                [x2 - int(bw * 0.25), cy],                    # 오른쪽 뺨
+                # 얼굴 하단부 (입/턱)
+                [x1 + int(bw * 0.25), y2 - int(bh * 0.15)],  # 왼쪽 아래
+                [cx,                   y2 - int(bh * 0.15)],  # 턱
+                [x2 - int(bw * 0.25), y2 - int(bh * 0.15)],  # 오른쪽 아래
+                # 목
+                [cx,                   y2 + int(bh * 0.2)],   # 목 중앙
             ], dtype=np.float32)
+            # 이미지 범위 클램프
+            neg_pts[:, 0] = np.clip(neg_pts[:, 0], 0, W - 1)
+            neg_pts[:, 1] = np.clip(neg_pts[:, 1], 0, H - 1)
 
             point_coords = np.concatenate([pos_pts, neg_pts], axis=0)
             point_labels = np.concatenate([
-                np.ones(len(pos_pts), dtype=np.int32),
+                np.ones(len(pos_pts),  dtype=np.int32),
                 np.zeros(len(neg_pts), dtype=np.int32),
             ])
 
-            # SAM2 predict
+            # SAM2 predict (multimask=True → 가장 face overlap 적은 마스크 선택)
             predictor.set_image(img_rgb)
             prediction = predictor.predict(
                 point_coords=point_coords,
                 point_labels=point_labels,
                 box=sam_bbox[None, :],
-                multimask_output=False,
+                multimask_output=True,
             )
 
             # predict() 반환 형태: dict | (masks, scores, logits) tuple
@@ -530,18 +558,44 @@ class MirrAISDPipeline:
                     masks_np = np.asarray(masks)
 
                 # shape 정규화: (N,H,W) or (H,W)
-                if masks_np.ndim == 3 and masks_np.shape[0] > 0:
-                    refined_np = masks_np[0].astype(np.float32)
-                elif masks_np.ndim == 2:
-                    refined_np = masks_np.astype(np.float32)
-                else:
-                    logger.warning("[SDPipeline] SAM2 마스크 shape 이상: %s", masks_np.shape)
+                if masks_np.ndim == 2:
+                    masks_np = masks_np[np.newaxis]  # → (1,H,W)
+                elif masks_np.ndim != 3 or masks_np.shape[0] == 0:
                     raise ValueError(f"Unexpected SAM2 mask shape: {masks_np.shape}")
 
-                refined_np = (refined_np > 0.5).astype(np.float32)
-                if refined_np.shape != (H, W):
-                    refined_np = cv2.resize(refined_np, (W, H), interpolation=cv2.INTER_LINEAR)
-                    refined_np = (refined_np > 0.5).astype(np.float32)
+                # multimask: BiSeNet face_region과 overlap 가장 적은 마스크 선택
+                bisenet_dilated = self._dilate_mask(base_mask)
+
+                # face 영역을 bbox 기반으로 빠르게 근사
+                face_approx = np.zeros((H, W), dtype=np.float32)
+                fy1 = max(0, int(y1 + bh * 0.1))
+                fy2 = min(H, int(y2 - bh * 0.05))
+                fx1 = max(0, int(x1 + bw * 0.05))
+                fx2 = min(W, int(x2 - bw * 0.05))
+                face_approx[fy1:fy2, fx1:fx2] = 1.0
+
+                best_mask = None
+                best_score = -1.0
+                for m in masks_np:
+                    m_f = (m > 0.5).astype(np.float32)
+                    if m_f.shape != (H, W):
+                        m_f = cv2.resize(m_f, (W, H), interpolation=cv2.INTER_LINEAR)
+                        m_f = (m_f > 0.5).astype(np.float32)
+                    # score = hair coverage - face penalty
+                    hair_hit  = (m_f * bisenet_dilated).sum()
+                    face_hit  = (m_f * face_approx).sum()
+                    score = hair_hit - face_hit * 2.0   # face overlap에 2배 패널티
+                    if score > best_score:
+                        best_score = score
+                        best_mask = m_f
+
+                refined_np = best_mask
+                # BiSeNet hair 영역 교집합으로 얼굴 내부 완전 제거
+                refined_np = np.clip(refined_np * bisenet_dilated, 0.0, 1.0)
+                if refined_np.sum() < 300:
+                    logger.warning("[SDPipeline] SAM2∩BiSeNet 결과가 너무 작아 BiSeNet으로 폴백")
+                    return self._dilate_mask(base_mask), "bisenet"
+
                 return self._dilate_mask(refined_np), "sam2"
 
         except Exception as e:
