@@ -68,6 +68,12 @@ COPY utils/                    utils/
 COPY models/face_parsing/      models/face_parsing/
 COPY data/                     data/
 
+# ── git 초기화 (entrypoint에서 git pull로 코드 최신화) ────────────────────────
+# .py 파일 변경은 Docker 재빌드 없이 RunPod 재시작만으로 반영됨
+RUN git init && \
+    git remote add origin https://github.com/PracLee/hair_swap_model.git && \
+    git config --global --add safe.directory /app
+
 RUN chmod +x entrypoint.sh && \
     mkdir -p /app/output/runpod_inputs
 
