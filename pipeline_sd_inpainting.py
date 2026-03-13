@@ -31,6 +31,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import random
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -100,10 +101,8 @@ class SDInpaintConfig:
     # IP-Adapter 얼굴 crop padding 비율
     face_crop_padding: float = 0.25
 
-    # 씨드 리스트 (top_k 개 결과용)
-    seeds: List[int] = dataclasses.field(
-        default_factory=lambda: [42, 1234, 9999, 7777, 314]
-    )
+    # 씨드 리스트 — None 이면 요청마다 랜덤 생성 (권장), 고정값 지정도 가능
+    seeds: Optional[List[int]] = None
 
     # 디바이스 / dtype
     device: str = "cuda"
@@ -200,8 +199,12 @@ class MirrAISDPipeline:
         if not self._loaded:
             self.load()
 
-        top_k = min(top_k, len(self.config.seeds))
-        seeds = self.config.seeds[:top_k]
+        # 시드 결정: config에 고정값 있으면 사용, 없으면 매 요청마다 랜덤 생성
+        if self.config.seeds:
+            seeds = self.config.seeds[:top_k]
+        else:
+            seeds = [random.randint(0, 2**31 - 1) for _ in range(top_k)]
+        logger.info(f"[SDPipeline] seeds={seeds}")
 
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         H, W = image.shape[:2]
@@ -746,31 +749,38 @@ class MirrAISDPipeline:
         guidance_scale: float,
         seeds: List[int],
     ) -> List[Image.Image]:
-        """각 seed로 SD inpainting 실행 → PIL 이미지 리스트"""
-        results: List[Image.Image] = []
+        """
+        모든 seed를 단일 배치 forward pass로 생성 (순차 대비 ~절반 시간).
 
-        for seed in seeds:
-            gen = torch.Generator(device=self.device).manual_seed(seed)
-            with torch.inference_mode():
-                out = self._sd_pipe(
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    image=img_512,
-                    mask_image=mask_512,
-                    control_image=canny_512,
-                    ip_adapter_image=[face_crop_pil],
-                    height=SD_SIZE,
-                    width=SD_SIZE,
-                    num_inference_steps=self.config.num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    controlnet_conditioning_scale=self.config.controlnet_conditioning_scale,
-                    num_images_per_prompt=1,
-                    generator=gen,
-                    strength=1.0,
-                )
-            results.append(out.images[0])
-            logger.info(f"[SDPipeline] seed={seed} 생성 완료")
-        return results
+        diffusers는 generator를 리스트로 받으면 num_images_per_prompt 개의
+        이미지를 각자 다른 seed로 한 번의 파이프라인 실행에 처리함.
+        """
+        n = len(seeds)
+        generators = [
+            torch.Generator(device=self.device).manual_seed(s) for s in seeds
+        ]
+        logger.info(f"[SDPipeline] 배치 생성 시작 (n={n}, seeds={seeds})")
+
+        with torch.inference_mode():
+            out = self._sd_pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                image=img_512,
+                mask_image=mask_512,
+                control_image=canny_512,
+                ip_adapter_image=[face_crop_pil],
+                height=SD_SIZE,
+                width=SD_SIZE,
+                num_inference_steps=self.config.num_inference_steps,
+                guidance_scale=guidance_scale,
+                controlnet_conditioning_scale=self.config.controlnet_conditioning_scale,
+                num_images_per_prompt=n,
+                generator=generators,
+                strength=1.0,
+            )
+
+        logger.info(f"[SDPipeline] 배치 생성 완료 → {len(out.images)}장")
+        return out.images
 
     # ──────────────────────────────────────────────────────────────────────────
     # Compositing
