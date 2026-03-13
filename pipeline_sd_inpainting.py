@@ -412,7 +412,11 @@ class MirrAISDPipeline:
         )
         
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        segface.load_state_dict(ckpt)
+        # SegFace의 체크포인트 구조에 맞게 state_dict_backbone만 추출하여 로드
+        if "state_dict_backbone" in ckpt:
+            segface.load_state_dict(ckpt["state_dict_backbone"], strict=False)
+        else:
+            segface.load_state_dict(ckpt, strict=False)
         segface.to(self.device).eval()
         self._segface = segface
         logger.info("[SDPipeline] SegFace 로드 완료")
