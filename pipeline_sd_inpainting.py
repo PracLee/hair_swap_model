@@ -588,10 +588,10 @@ class MirrAISDPipeline:
                         best_mask = m_f
 
                 refined_np = best_mask
-                # BiSeNet hair 영역 교집합으로 얼굴 내부 완전 제거
-                refined_np = np.clip(refined_np * bisenet_dilated, 0.0, 1.0)
+                # BiSeNet AND 교집합 제거 — BiSeNet이 hair를 일부만 감지하면 SAM2 결과도 잘려버림
+                # 얼굴 제거는 run()의 face_region_mask 빼기(line 251)에서 처리
                 if refined_np.sum() < 300:
-                    logger.warning("[SDPipeline] SAM2∩BiSeNet 결과가 너무 작아 BiSeNet으로 폴백")
+                    logger.warning("[SDPipeline] SAM2 결과가 너무 작아 BiSeNet으로 폴백")
                     return self._dilate_mask(base_mask), "bisenet"
 
                 return self._dilate_mask(refined_np), "sam2"
