@@ -132,6 +132,7 @@ class SDInpaintResult:
     rank: int
     mask_used: str          # "sam2" | "bisenet"
     clip_score: float = 0.0 # CLIP 점수 (현재는 rank 순서, 향후 CLIP 랭킹 확장용)
+    mask: Optional[np.ndarray] = None  # H×W float32 디버그용 마스크
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -277,6 +278,7 @@ class MirrAISDPipeline:
                 seed=seed,
                 rank=rank,
                 mask_used=mask_source,
+                mask=hair_mask,
             ))
 
         return results

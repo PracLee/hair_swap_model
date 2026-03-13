@@ -242,6 +242,11 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             }
             if return_base64:
                 item["image_base64"] = _image_to_base64(r.image)
+                # 디버그용 마스크 (흰=마스킹 영역, 검=보존 영역)
+                if r.mask is not None:
+                    mask_uint8 = (r.mask * 255).astype(np.uint8)
+                    mask_rgb = cv2.cvtColor(mask_uint8, cv2.COLOR_GRAY2BGR)
+                    item["mask_base64"] = _image_to_base64(mask_rgb)
 
             output_results.append(item)
 

@@ -138,6 +138,15 @@ def save_results(output: dict, out_dir: Path) -> list[Path]:
         out_path = out_dir / fname
         img.save(out_path, format="JPEG", quality=95)
 
+        # 디버그용 마스크 저장
+        mask_b64 = item.get("mask_base64")
+        if mask_b64:
+            mask_bytes = base64.b64decode(mask_b64)
+            mask_img = Image.open(io.BytesIO(mask_bytes)).convert("RGB")
+            mask_fname = f"mask_rank{rank}_seed{seed}_{mask_used}.jpg"
+            mask_img.save(out_dir / mask_fname, format="JPEG", quality=95)
+            print(f"[save]   mask → {mask_fname}")
+
         print(f"[save]   rank={rank}  seed={seed}  clip={clip_score:.3f}  "
               f"mask={mask_used}  → {out_path.name}")
         saved.append(out_path)
