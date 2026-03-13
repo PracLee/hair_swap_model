@@ -135,7 +135,8 @@ class SDInpaintResult:
     rank: int
     mask_used: str          # "sam2" | "bisenet"
     clip_score: float = 0.0 # CLIP 점수 (현재는 rank 순서, 향후 CLIP 랭킹 확장용)
-    mask: Optional[np.ndarray] = None  # H×W float32 디버그용 마스크
+    mask: Optional[np.ndarray] = None       # H×W float32 디버그용 마스크
+    face_bbox: Optional[Tuple[int, int, int, int]] = None  # (x1, y1, x2, y2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,6 +289,7 @@ class MirrAISDPipeline:
                 rank=rank,
                 mask_used=mask_source,
                 mask=hair_mask,
+                face_bbox=face_bbox,
             ))
 
         return results
@@ -472,50 +474,56 @@ class MirrAISDPipeline:
             bh = y2 - y1
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-            # SAM2 bbox: face bbox 기준으로 머리카락 예상 범위 계산
-            hair_coords = np.argwhere(base_mask > 0.5)  # (N, 2) BiSeNet 보조 힌트용
+            # SAM2 bbox: 긴 머리 고려해서 하단을 BiSeNet hair 최하단까지 확장
+            hair_coords = np.argwhere(base_mask > 0.5)  # (N,2) [row, col]
+            if len(hair_coords) > 0:
+                hair_bottom = int(hair_coords[:, 0].max())
+                bbox_bottom = min(H - 1, max(hair_bottom + 20, y2 + int(bh * 0.2)))
+            else:
+                bbox_bottom = min(H - 1, y2 + int(bh * 0.6))  # fallback: 얼굴 높이 60% 아래
+
             sam_bbox = np.array([
-                max(0,     x1 - int(bw * 0.5)),   # 양 옆 머리카락 포함
-                max(0,     y1 - int(bh * 0.6)),   # 정수리 포함
-                min(W - 1, x2 + int(bw * 0.5)),
-                min(H - 1, y2 + int(bh * 0.15)), # 턱 조금 아래까지
+                max(0,     x1 - int(bw * 0.6)),
+                max(0,     y1 - int(bh * 0.6)),
+                min(W - 1, x2 + int(bw * 0.6)),
+                bbox_bottom,
             ], dtype=np.float32)
 
-            # Positive points: face bbox 기준으로 머리카락 위치 추정
-            # → 이미지 상단 클리핑 방지: y1이 작을 때 너무 위로 올라가지 않도록 제한
-            hair_top_y = max(5, y1 - int(bh * 0.25))   # 정수리 (이마보다 위, 하늘은 아님)
-            side_y     = max(5, y1 - int(bh * 0.05))   # 귀 위쪽 (얼굴 상단 근처)
+            # Positive points: 정수리/옆머리 + 긴 머리 흘러내리는 옆쪽
+            hair_top_y  = max(5, y1 - int(bh * 0.25))   # 정수리
+            side_y      = max(5, y1 - int(bh * 0.05))   # 귀 위쪽
+            long_hair_y = min(H - 5, y2 + int(bh * 0.4)) # 턱 아래 긴 머리
             pos_pts = np.array([
-                [cx,                   hair_top_y],         # 정수리 중앙
-                [cx - int(bw * 0.25),  hair_top_y],         # 정수리 왼쪽
-                [cx + int(bw * 0.25),  hair_top_y],         # 정수리 오른쪽
-                [x1 - int(bw * 0.05),  side_y],             # 왼쪽 옆머리
-                [x2 + int(bw * 0.05),  side_y],             # 오른쪽 옆머리
+                [cx,                    hair_top_y],   # 정수리 중앙
+                [cx - int(bw * 0.25),   hair_top_y],   # 정수리 왼쪽
+                [cx + int(bw * 0.25),   hair_top_y],   # 정수리 오른쪽
+                [x1 - int(bw * 0.05),   side_y],       # 왼쪽 옆머리
+                [x2 + int(bw * 0.05),   side_y],       # 오른쪽 옆머리
+                [x1 - int(bw * 0.2),    long_hair_y],  # 왼쪽 긴 머리
+                [x2 + int(bw * 0.2),    long_hair_y],  # 오른쪽 긴 머리
             ], dtype=np.float32)
             pos_pts[:, 0] = np.clip(pos_pts[:, 0], 0, W - 1)
             pos_pts[:, 1] = np.clip(pos_pts[:, 1], 0, H - 1)
 
-            # BiSeNet hair coords가 충분하면 추가 힌트로 보완
-            if len(hair_coords) > 50:
-                extra = self._sample_mask_points(hair_coords, n=3)
-                pos_pts = np.concatenate([pos_pts, extra], axis=0)
-
-            # Negative points: 얼굴 전체에 격자 분포 (9점) + 목/배경
+            # Negative points: 얼굴 격자 9점 + 목/상체 중앙 (몸통 잡지 않도록)
+            neck_y   = min(H - 5, y2 + int(bh * 0.15))
+            body_y   = min(H - 5, y2 + int(bh * 0.5))
             neg_pts = np.array([
-                # 얼굴 상단부 (이마 안쪽 — 앞머리 침범 방지로 y1+25% 사용)
-                [x1 + int(bw * 0.25), y1 + int(bh * 0.25)],  # 왼쪽 이마
-                [cx,                   y1 + int(bh * 0.25)],  # 중앙 이마
-                [x2 - int(bw * 0.25), y1 + int(bh * 0.25)],  # 오른쪽 이마
+                # 얼굴 상단부 (이마)
+                [x1 + int(bw * 0.25), y1 + int(bh * 0.25)],
+                [cx,                   y1 + int(bh * 0.25)],
+                [x2 - int(bw * 0.25), y1 + int(bh * 0.25)],
                 # 얼굴 중앙부 (눈/코)
-                [x1 + int(bw * 0.25), cy],                    # 왼쪽 뺨
-                [cx,                   cy],                    # 얼굴 중심
-                [x2 - int(bw * 0.25), cy],                    # 오른쪽 뺨
+                [x1 + int(bw * 0.25), cy],
+                [cx,                   cy],
+                [x2 - int(bw * 0.25), cy],
                 # 얼굴 하단부 (입/턱)
-                [x1 + int(bw * 0.25), y2 - int(bh * 0.15)],  # 왼쪽 아래
-                [cx,                   y2 - int(bh * 0.15)],  # 턱
-                [x2 - int(bw * 0.25), y2 - int(bh * 0.15)],  # 오른쪽 아래
-                # 목
-                [cx,                   y2 + int(bh * 0.2)],   # 목 중앙
+                [x1 + int(bw * 0.25), y2 - int(bh * 0.15)],
+                [cx,                   y2 - int(bh * 0.15)],
+                [x2 - int(bw * 0.25), y2 - int(bh * 0.15)],
+                # 목/상체 중앙 (긴 머리가 옆으로 흘러도 몸통 중앙은 제외)
+                [cx,  neck_y],
+                [cx,  body_y],
             ], dtype=np.float32)
             # 이미지 범위 클램프
             neg_pts[:, 0] = np.clip(neg_pts[:, 0], 0, W - 1)
@@ -561,13 +569,22 @@ class MirrAISDPipeline:
                 elif masks_np.ndim != 3 or masks_np.shape[0] == 0:
                     raise ValueError(f"Unexpected SAM2 mask shape: {masks_np.shape}")
 
-                # multimask: BiSeNet face_region과 overlap 가장 적은 마스크 선택
-                bisenet_dilated = self._dilate_mask(base_mask)
+                # multimask: 얼굴 overlap 가장 적고 hair 영역 많은 마스크 선택
+                # hair_approx: 얼굴 위쪽 + 얼굴 옆/아래 측면 (긴 머리 포함)
+                hair_approx = np.zeros((H, W), dtype=np.float32)
+                # 정수리 영역
+                hair_approx[max(0, y1 - int(bh*0.8)):min(H, y1 + int(bh*0.1)),
+                            max(0, x1 - int(bw*0.5)):min(W, x2 + int(bw*0.5))] = 1.0
+                # 얼굴 옆 + 아래쪽 측면 (긴 머리 흘러내리는 구간)
+                hair_approx[y1:min(H, y2 + int(bh*1.2)),
+                            max(0, x1 - int(bw*0.6)):max(0, x1 - int(bw*0.05))] = 1.0  # 왼쪽
+                hair_approx[y1:min(H, y2 + int(bh*1.2)),
+                            min(W, x2 + int(bw*0.05)):min(W, x2 + int(bw*0.6))] = 1.0  # 오른쪽
 
-                # face 영역을 bbox 기반으로 빠르게 근사
+                # face 영역 근사 (페널티용)
                 face_approx = np.zeros((H, W), dtype=np.float32)
                 fy1 = max(0, int(y1 + bh * 0.1))
-                fy2 = min(H, int(y2 - bh * 0.05))
+                fy2 = min(H, int(y2))
                 fx1 = max(0, int(x1 + bw * 0.05))
                 fx2 = min(W, int(x2 - bw * 0.05))
                 face_approx[fy1:fy2, fx1:fx2] = 1.0
@@ -579,10 +596,10 @@ class MirrAISDPipeline:
                     if m_f.shape != (H, W):
                         m_f = cv2.resize(m_f, (W, H), interpolation=cv2.INTER_LINEAR)
                         m_f = (m_f > 0.5).astype(np.float32)
-                    # score = hair coverage - face penalty
-                    hair_hit  = (m_f * bisenet_dilated).sum()
-                    face_hit  = (m_f * face_approx).sum()
-                    score = hair_hit - face_hit * 2.0   # face overlap에 2배 패널티
+                    # 얼굴 위쪽 hair 영역 hit - 얼굴 overlap 2배 패널티
+                    hair_hit = (m_f * hair_approx).sum()
+                    face_hit = (m_f * face_approx).sum()
+                    score = hair_hit - face_hit * 2.0
                     if score > best_score:
                         best_score = score
                         best_mask = m_f

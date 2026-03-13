@@ -67,6 +67,7 @@ COPY runtime_download.py       ./
 COPY utils/                    utils/
 COPY models/face_parsing/      models/face_parsing/
 COPY data/                     data/
+COPY images/                   images/
 
 # ── git 초기화 (entrypoint에서 git pull로 코드 최신화) ────────────────────────
 # .py 파일 변경은 Docker 재빌드 없이 RunPod 재시작만으로 반영됨

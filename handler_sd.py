@@ -247,6 +247,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     mask_uint8 = (r.mask * 255).astype(np.uint8)
                     mask_rgb = cv2.cvtColor(mask_uint8, cv2.COLOR_GRAY2BGR)
                     item["mask_base64"] = _image_to_base64(mask_rgb)
+                if r.face_bbox is not None:
+                    x1, y1, x2, y2 = r.face_bbox
+                    item["face_bbox"] = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
 
             output_results.append(item)
 
