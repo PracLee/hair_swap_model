@@ -54,6 +54,8 @@ IP_ADAPTER_WEIGHT     = "ip-adapter-plus-face_sd15.bin"
 # ── BiSeNet 설정 ───────────────────────────────────────────────────────────────
 HAIR_CLASS_IDX   = 10
 BISENET_CLASSES  = 16
+# 얼굴 내부 클래스 (skin/nose/eye_g/eyes/brows/ears/mouth/lips) - hair(10) 제거에 활용
+FACE_CLASS_IDXS  = frozenset([1, 2, 3, 4, 5, 6, 7, 8, 9])
 
 # ── SD 생성 해상도 ─────────────────────────────────────────────────────────────
 SD_SIZE = 512   # SD 1.5 native resolution
@@ -96,7 +98,7 @@ class SDInpaintConfig:
     canny_high: int = 200
 
     # hair mask dilate (SD 입력용 — 경계 확장, 잔머리 커버용으로 넉넉하게)
-    # 얼굴/목/눈 보호는 _exclude_face_interior() 에서 별도 처리함
+    # 얼굴 내부 보호는 BiSeNet face_region_mask 로 픽셀 단위 처리함
     mask_dilate_px: int = 30
 
     # IP-Adapter 얼굴 crop padding 비율
@@ -218,8 +220,8 @@ class MirrAISDPipeline:
         face_bbox = face_obs  # (x1, y1, x2, y2)
         logger.info(f"[SDPipeline] 얼굴 검출: {face_bbox}")
 
-        # ── Step 2: BiSeNet base hair mask ───────────────────────────────────
-        hair_mask_base = self._bisenet_hair_mask(img_rgb)  # H×W float32
+        # ── Step 2: BiSeNet base hair mask + 얼굴 픽셀 마스크 ───────────────────
+        hair_mask_base, face_region_mask = self._bisenet_hair_mask(img_rgb)
 
         # ── Step 3: SAM2 refinement ───────────────────────────────────────────
         hair_mask, mask_source = self._refine_with_sam2(
@@ -245,10 +247,10 @@ class MirrAISDPipeline:
                 f"pixels={hair_mask.sum():.0f}"
             )
 
-        # ── Step 3-c: 얼굴 내부 보호 (눈/코/입/목 영역 마스크 제거) ────────────
-        hair_mask = self._exclude_face_interior(hair_mask, face_bbox, H, W)
+        # ── Step 3-c: BiSeNet 얼굴 픽셀 제거 (bbox 직사각형 대신 픽셀 단위 보정) ─
+        hair_mask = np.clip(hair_mask - face_region_mask, 0.0, 1.0)
         logger.info(
-            f"[SDPipeline] 얼굴 내부 보호 완료, pixels={hair_mask.sum():.0f}"
+            f"[SDPipeline] 얼굴 픽셀 제거 완료, pixels={hair_mask.sum():.0f}"
         )
 
         # ── Step 4: SD 입력 준비 ─────────────────────────────────────────────
@@ -409,11 +411,13 @@ class MirrAISDPipeline:
         y2 = min(H, int((bb.ymin + bb.height) * H))
         return (x1, y1, x2, y2)
 
-    def _bisenet_hair_mask(self, img_rgb: np.ndarray) -> np.ndarray:
+    def _bisenet_hair_mask(self, img_rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        BiSeNet으로 머리카락 마스크 생성.
+        BiSeNet으로 머리카락 + 얼굴 영역 마스크 생성.
         입력: H×W×3 RGB (any resolution)
-        출력: H×W float32 [0, 1]
+        출력:
+            hair_mask  H×W float32 [0, 1]
+            face_mask  H×W float32 [0, 1]  (skin/눈/코/입 등 얼굴 내부 픽셀)
         """
         H, W = img_rgb.shape[:2]
 
@@ -436,8 +440,11 @@ class MirrAISDPipeline:
             parsing = logits.argmax(dim=1).squeeze(0).cpu().numpy()
 
         hair_512 = (parsing == HAIR_CLASS_IDX).astype(np.float32)
+        face_512 = np.isin(parsing, list(FACE_CLASS_IDXS)).astype(np.float32)
+
         hair_orig = cv2.resize(hair_512, (W, H), interpolation=cv2.INTER_LINEAR)
-        return (hair_orig > 0.5).astype(np.float32)
+        face_orig = cv2.resize(face_512, (W, H), interpolation=cv2.INTER_LINEAR)
+        return (hair_orig > 0.5).astype(np.float32), (face_orig > 0.5).astype(np.float32)
 
     def _refine_with_sam2(
         self,
@@ -700,47 +707,6 @@ class MirrAISDPipeline:
             expanded[row, max(0, c_min):min(W, c_max + 1)] = 1.0
 
         return expanded
-
-    def _exclude_face_interior(
-        self,
-        hair_mask: np.ndarray,
-        face_bbox: Tuple[int, int, int, int],
-        H: int,
-        W: int,
-    ) -> np.ndarray:
-        """
-        얼굴 내부(눈/코/입)와 목 영역을 마스크에서 명시적으로 제거.
-
-        - 이마 상단(y1 ~ y1+20%)는 헤어가 있을 수 있으므로 유지
-        - 눈/코/입 영역(y1+25% ~ y2-5%, x1+10% ~ x2-10%): 제거
-        - 턱 아래 ~ 목 영역(y2 ~ y2+face_h*0.5, 얼굴 폭 기준): 제거
-        """
-        x1, y1, x2, y2 = face_bbox
-        face_h = max(y2 - y1, 1)
-        face_w = max(x2 - x1, 1)
-        protected = hair_mask.copy()
-
-        # 얼굴 내부 (눈/코/입): 이마 아래 ~ 턱 위
-        eye_y1 = int(y1 + face_h * 0.25)
-        eye_y2 = int(y2 - face_h * 0.05)
-        eye_x1 = int(x1 + face_w * 0.10)
-        eye_x2 = int(x2 - face_w * 0.10)
-        protected[
-            max(0, eye_y1):min(H, eye_y2),
-            max(0, eye_x1):min(W, eye_x2),
-        ] = 0.0
-
-        # 목 영역: 턱 아래 ~ 얼굴 높이 50% 아래, 얼굴 폭 중앙부
-        neck_y1 = y2
-        neck_y2 = int(y2 + face_h * 0.5)
-        neck_x1 = int(x1 + face_w * 0.15)
-        neck_x2 = int(x2 - face_w * 0.15)
-        protected[
-            max(0, neck_y1):min(H, neck_y2),
-            max(0, neck_x1):min(W, neck_x2),
-        ] = 0.0
-
-        return protected
 
     # ──────────────────────────────────────────────────────────────────────────
     # Prompt
