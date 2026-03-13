@@ -115,7 +115,8 @@ def _coerce_bool(v: Any, default: bool = False) -> bool:
 
 def _load_image_from_input(inp: Dict[str, Any]) -> "np.ndarray":
     """image 필드(base64 or URL or image_path)에서 BGR numpy array 반환"""
-    # image_path 지원 (컨테이너 로컬 경로)
+
+    # 1) 로컬 파일 경로
     image_path = inp.get("image_path")
     if image_path:
         img = cv2.imread(str(image_path))
@@ -123,24 +124,35 @@ def _load_image_from_input(inp: Dict[str, Any]) -> "np.ndarray":
             raise FileNotFoundError(f"이미지를 읽을 수 없습니다: {image_path}")
         return _resize_if_needed(img)
 
-    raw = inp.get("image") or inp.get("image_url") or inp.get("image_base64")
-    if not raw:
-        raise ValueError("'image', 'image_url', 'image_base64', 'image_path' 중 하나 필요")
+    # 2) URL (image_url 키 → 반드시 HTTP 다운로드)
+    image_url = inp.get("image_url")
+    if image_url:
+        if not isinstance(image_url, str) or not image_url.startswith(("http://", "https://")):
+            raise ValueError(f"image_url이 유효한 URL이 아닙니다: {image_url!r}")
+        img_bytes = _download_url(image_url)
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            raise ValueError("URL 이미지 디코딩 실패")
+        return _resize_if_needed(img_bgr)
 
-    if isinstance(raw, str) and raw.startswith(("http://", "https://")):
-        img_bytes = _download_url(raw)
-    else:
-        # base64 (data URI 포함)
-        if isinstance(raw, str) and "," in raw:
-            raw = raw.split(",", 1)[1]
-        img_bytes = base64.b64decode(raw)
+    # 3) base64 (image 또는 image_base64 키)
+    raw = inp.get("image_base64") or inp.get("image")
+    if raw:
+        if isinstance(raw, str) and raw.startswith(("http://", "https://")):
+            # image 키에 URL이 들어온 경우도 처리
+            img_bytes = _download_url(raw)
+        else:
+            if isinstance(raw, str) and "," in raw:
+                raw = raw.split(",", 1)[1]
+            img_bytes = base64.b64decode(raw)
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            raise ValueError("이미지 디코딩 실패 (지원 형식: JPEG, PNG, WEBP)")
+        return _resize_if_needed(img_bgr)
 
-    arr = np.frombuffer(img_bytes, dtype=np.uint8)
-    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        raise ValueError("이미지 디코딩 실패 (지원 형식: JPEG, PNG, WEBP)")
-
-    return _resize_if_needed(img_bgr)
+    raise ValueError("'image_url', 'image', 'image_base64', 'image_path' 중 하나 필요")
 
 
 def _resize_if_needed(img_bgr: "np.ndarray") -> "np.ndarray":
