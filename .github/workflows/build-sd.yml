@@ -9,6 +9,8 @@ on:
       - 'Dockerfile.sd'
       - 'requirements-sd.txt'
       - 'entrypoint_sd.sh'
+      - 'pipeline_sd_inpainting.py'
+      - 'models/**'
   workflow_dispatch: # GitHub 웹사이트에서 수동 실행 버튼 활성화
     inputs:
       version:
