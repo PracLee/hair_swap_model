@@ -284,16 +284,43 @@ class MirrAISDPipeline:
                 f"gen_px={gen_mask.sum():.0f}, cutoff_y={cutoff_y}"
             )
 
-            # 단계 1: cv2.inpaint로 긴 머리 하단 제거 → 배경/피부로 자연스럽게 채움
+            # 단계 1: cv2.inpaint → seamlessClone 으로 긴 머리 자연스럽게 제거
             if removal_mask.sum() > 50:
                 removal_u8 = (removal_mask > 0.5).astype(np.uint8) * 255
                 # dilate로 경계 잔여 머리카락까지 커버
                 k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-                removal_u8 = cv2.dilate(removal_u8, k, iterations=1)
-                img_rgb_cleaned = cv2.inpaint(
-                    img_rgb, removal_u8, inpaintRadius=7, flags=cv2.INPAINT_TELEA
+                removal_u8_dilated = cv2.dilate(removal_u8, k, iterations=1)
+
+                # 1차: INPAINT_NS (Navier-Stokes) — 배경/피부 복원에 더 부드러움
+                img_rgb_filled = cv2.inpaint(
+                    img_rgb, removal_u8_dilated, inpaintRadius=15, flags=cv2.INPAINT_NS
                 )
-                logger.info("[SDPipeline] cv2.inpaint 긴머리 제거 완료")
+
+                # 2차: seamlessClone (Poisson blending)
+                #   채워진 이미지를 원본 위에 Poisson blend → 경계 색상/밝기 자동 매칭
+                try:
+                    # seamlessClone 마스크: dilated removal 영역만
+                    clone_mask = removal_u8_dilated
+                    # 마스크 중심점 계산
+                    ys, xs = np.where(clone_mask > 0)
+                    if len(xs) > 0 and len(ys) > 0:
+                        cx_clone = int(xs.mean())
+                        cy_clone = int(ys.mean())
+                        # BGR로 변환 (seamlessClone은 BGR)
+                        src_bgr  = cv2.cvtColor(img_rgb_filled, cv2.COLOR_RGB2BGR)
+                        dst_bgr  = cv2.cvtColor(img_rgb,        cv2.COLOR_RGB2BGR)
+                        blended_bgr = cv2.seamlessClone(
+                            src_bgr, dst_bgr, clone_mask,
+                            (cx_clone, cy_clone), cv2.NORMAL_CLONE
+                        )
+                        img_rgb_cleaned = cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB)
+                    else:
+                        img_rgb_cleaned = img_rgb_filled
+                except Exception as e:
+                    logger.warning(f"[SDPipeline] seamlessClone 실패, inpaint만 사용: {e}")
+                    img_rgb_cleaned = img_rgb_filled
+
+                logger.info("[SDPipeline] cv2.inpaint + seamlessClone 긴머리 제거 완료")
             else:
                 img_rgb_cleaned = img_rgb
 
@@ -1069,14 +1096,32 @@ class MirrAISDPipeline:
         # 원본 해상도로 upscale
         gen_orig = cv2.resize(gen_cropped, (W, H), interpolation=cv2.INTER_LANCZOS4)
 
-        # alpha 블렌딩 (경계 gaussian smoothing)
-        alpha = cv2.GaussianBlur(hair_mask, (0, 0), sigmaX=4.0, sigmaY=4.0)
+        # alpha 블렌딩: 경계를 충분히 feather해서 자연스러운 합성
+        # sigmaX를 크게 → 경계 그라디언트가 넓어져 경계선 안 보임
+        alpha = cv2.GaussianBlur(hair_mask, (0, 0), sigmaX=8.0, sigmaY=8.0)
         alpha = np.clip(alpha, 0.0, 1.0)[..., np.newaxis]   # H×W×1
 
         orig_f = orig_rgb.astype(np.float32)
         gen_f  = gen_orig.astype(np.float32)
         blend  = gen_f * alpha + orig_f * (1.0 - alpha)
         blend  = np.clip(blend, 0, 255).astype(np.uint8)
+
+        # seamlessClone으로 최종 경계 색상/밝기 자동 매칭
+        try:
+            mask_u8 = (hair_mask > 0.1).astype(np.uint8) * 255
+            ys, xs  = np.where(mask_u8 > 0)
+            if len(xs) > 0:
+                cx_f = int(xs.mean())
+                cy_f = int(ys.mean())
+                blend_bgr = cv2.cvtColor(blend, cv2.COLOR_RGB2BGR)
+                base_bgr  = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2BGR)
+                result_bgr = cv2.seamlessClone(
+                    blend_bgr, base_bgr, mask_u8,
+                    (cx_f, cy_f), cv2.NORMAL_CLONE
+                )
+                return result_bgr
+        except Exception:
+            pass  # seamlessClone 실패 시 alpha blend 결과 그대로 사용
 
         return cv2.cvtColor(blend, cv2.COLOR_RGB2BGR)
 
