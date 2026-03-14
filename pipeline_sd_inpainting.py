@@ -257,21 +257,59 @@ class MirrAISDPipeline:
             f"[SDPipeline] 옷 픽셀 제거 완료, pixels={hair_mask.sum():.0f}"
         )
 
-        # ── Step 3-e: 숏컷/중단발일 때 마스크 하단 확장 ──────────────────────
-        # cloth 제거 후 expand → 확장된 영역이 cloth에 의해 날아가지 않음
+        # ── Step 3-e: 숏컷/중단발 — 2단계 전략 ──────────────────────────────
+        # 단발/숏컷 변환은 단순 SD inpainting으로 불가능:
+        #   SD는 마스크 주변에 긴 머리가 보이면 계속 긴 머리를 생성함.
+        # 해결: ① cv2.inpaint로 긴 머리 먼저 제거(배경/피부로 채움)
+        #        ② 제거된 이미지 위에 SD로 새 숏컷 생성 (머리 없는 주변 맥락)
         if hair_length in ("short", "medium"):
-            hair_mask = self._expand_mask_for_short_hair(
-                hair_mask, face_bbox, H, W, hair_length
-            )
+            # 숏컷 기준선 계산 (이 아래 머리는 제거 대상)
+            x1f, y1f, x2f, y2f = face_bbox
+            face_h = max(y2f - y1f, 1)
+            if hair_length == "short":
+                cutoff_y = int(y2f + face_h * 0.05)   # 턱 바로 아래
+            else:
+                cutoff_y = int(y2f + face_h * 0.60)   # 어깨 위
+
+            # 제거 마스크: cutoff_y 아래 + 원본 hair_mask 교집합
+            removal_mask = hair_mask.copy()
+            removal_mask[:cutoff_y, :] = 0.0           # 기준선 위는 제거 안 함 (새 숏컷 생성)
+
+            # 생성 마스크: cutoff_y 위쪽 머리 영역 (SD가 새 숏컷을 그릴 곳)
+            gen_mask = hair_mask.copy()
+            gen_mask[cutoff_y:, :] = 0.0
+
             logger.info(
-                f"[SDPipeline] 마스크 하단 확장 완료 ({hair_length}), "
-                f"pixels={hair_mask.sum():.0f}"
+                f"[SDPipeline] 2단계 숏컷: removal_px={removal_mask.sum():.0f}, "
+                f"gen_px={gen_mask.sum():.0f}, cutoff_y={cutoff_y}"
             )
 
+            # 단계 1: cv2.inpaint로 긴 머리 하단 제거 → 배경/피부로 자연스럽게 채움
+            if removal_mask.sum() > 50:
+                removal_u8 = (removal_mask > 0.5).astype(np.uint8) * 255
+                # dilate로 경계 잔여 머리카락까지 커버
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                removal_u8 = cv2.dilate(removal_u8, k, iterations=1)
+                img_rgb_cleaned = cv2.inpaint(
+                    img_rgb, removal_u8, inpaintRadius=7, flags=cv2.INPAINT_TELEA
+                )
+                logger.info("[SDPipeline] cv2.inpaint 긴머리 제거 완료")
+            else:
+                img_rgb_cleaned = img_rgb
+
+            # 단계 2: SD에는 cleaned 이미지 + gen_mask(위쪽만) 전달
+            hair_mask_for_sd = gen_mask
+            img_rgb_for_sd   = img_rgb_cleaned
+        else:
+            # long 헤어는 기존 단일 패스 유지
+            hair_mask_for_sd = hair_mask
+            img_rgb_for_sd   = img_rgb
+            img_rgb_cleaned  = img_rgb
+
         # ── Step 4: SD 입력 준비 ─────────────────────────────────────────────
-        img_pil = Image.fromarray(img_rgb)
+        img_pil = Image.fromarray(img_rgb_cleaned)
         img_512, mask_512, canny_512, scale, pad = self._prepare_sd_inputs(
-            img_rgb, hair_mask
+            img_rgb_for_sd, hair_mask_for_sd
         )
 
         # ── Step 5: 얼굴 crop (IP-Adapter) ───────────────────────────────────
@@ -292,10 +330,16 @@ class MirrAISDPipeline:
         )
 
         # ── Step 8: Composite → 원본 해상도 ───────────────────────────────────
+        # composite base: short/medium은 cv2.inpaint된 이미지 사용
+        #   → 긴머리 제거된 상태에서 새 숏컷을 얹음
+        composite_base_rgb = img_rgb_cleaned
+        composite_base_bgr = cv2.cvtColor(composite_base_rgb, cv2.COLOR_RGB2BGR)
+
         results: List[SDInpaintResult] = []
         for rank, (gen_pil, seed) in enumerate(zip(gen_images, seeds)):
             composited_bgr = self._composite(
-                image, img_rgb, gen_pil, hair_mask, scale, pad, (W, H)
+                composite_base_bgr, composite_base_rgb,
+                gen_pil, hair_mask_for_sd, scale, pad, (W, H)
             )
             results.append(SDInpaintResult(
                 image=composited_bgr,
