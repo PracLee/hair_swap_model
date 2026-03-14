@@ -92,8 +92,8 @@ class SDInpaintConfig:
     # SD 생성 파라미터
     num_inference_steps: int = 30
     guidance_scale: float = 7.5
-    controlnet_conditioning_scale: float = 0.5
-    ip_adapter_scale: float = 0.6
+    controlnet_conditioning_scale: float = 0.3   # 낮춰야 텍스트 프롬프트가 먹힘
+    ip_adapter_scale: float = 0.35               # 너무 강하면 원본 헤어 유지해버림
 
     # Canny edge 파라미터
     canny_low: int  = 80
@@ -757,11 +757,12 @@ class MirrAISDPipeline:
         msk_canvas = np.zeros((SD_SIZE, SD_SIZE), dtype=np.float32)
         msk_canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = msk_rs
 
-        # ── Canny edge (hair 영역은 약화 → SD가 자유롭게 생성)
+        # ── Canny edge (hair 마스크 영역은 완전히 제거 → SD가 자유롭게 헤어 생성)
         gray = cv2.cvtColor(canvas, cv2.COLOR_RGB2GRAY)
         canny = cv2.Canny(gray, self.config.canny_low, self.config.canny_high)
-        hair_soft = cv2.GaussianBlur(msk_canvas, (0, 0), sigmaX=7)
-        canny_f = canny.astype(np.float32) * (1.0 - hair_soft * 0.8)
+        # 마스크 영역 내부 엣지 완전 제거 (0.8 약화 → 완전 소거로 변경)
+        hair_hard = (msk_canvas > 0.5).astype(np.float32)
+        canny_f = canny.astype(np.float32) * (1.0 - hair_hard)
         canny_rgb = cv2.cvtColor(canny_f.astype(np.uint8), cv2.COLOR_GRAY2RGB)
 
         img_512   = Image.fromarray(canvas)
