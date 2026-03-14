@@ -56,7 +56,8 @@ HAIR_CLASS_IDX   = 14
 # 0: bg, 1: neck, 2: face, 3: cloth, 4: r_ear, 5: l_ear, 6: r_bro, 7: l_bro, 
 # 8: r_eye, 9: l_eye, 10: nose, 11: inner_mouth, 12: lower_lip, 13: upper_lip
 # 얼굴 내부 및 목/귀 클래스 포함
-FACE_CLASS_IDXS  = frozenset([1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+FACE_CLASS_IDXS  = frozenset([1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17, 18])
+# 17: earring, 18: necklace → SD가 귀걸이/목걸이 임의 생성하는 문제 방지
 CLOTH_CLASS_IDX  = 3   # SegFace class 3 = cloth → hair mask에서 제거해 옷 영역 보호
 
 # ── SD 생성 해상도 ─────────────────────────────────────────────────────────────
@@ -238,17 +239,9 @@ class MirrAISDPipeline:
         if hair_mask.sum() < 300:
             raise ValueError("머리카락 영역이 너무 작습니다.")
 
-        # ── Step 3-b: 헤어 길이 분류 + 단발/숏컷일 때 마스크 하단 확장 ────────
+        # ── Step 3-b: 헤어 길이 분류 ─────────────────────────────────────────
         hair_length = self._classify_hair_length(hairstyle_text)
         logger.info(f"[SDPipeline] 헤어 길이 분류: {hair_length}")
-        if hair_length in ("short", "medium"):
-            hair_mask = self._expand_mask_for_short_hair(
-                hair_mask, face_bbox, H, W, hair_length
-            )
-            logger.info(
-                f"[SDPipeline] 마스크 하단 확장 완료 ({hair_length}), "
-                f"pixels={hair_mask.sum():.0f}"
-            )
 
         # ── Step 3-c: SegFace 얼굴 픽셀 제거 (bbox 직사각형 대신 픽셀 단위 보정) ─
         hair_mask = np.clip(hair_mask - face_region_mask, 0.0, 1.0)
@@ -257,12 +250,23 @@ class MirrAISDPipeline:
         )
 
         # ── Step 3-d: SegFace 옷 픽셀 제거 (옷이 바뀌는 문제 방지) ────────────
-        # cloth_mask도 dilate하여 경계까지 보호 (머리카락이 옷 위로 걸칠 때 대비)
+        # expand 전에 먼저 제거해야 옷 영역이 마스크 확장에 영향받지 않음
         cloth_mask_dilated = self._dilate_mask(cloth_mask)
         hair_mask = np.clip(hair_mask - cloth_mask_dilated, 0.0, 1.0)
         logger.info(
             f"[SDPipeline] 옷 픽셀 제거 완료, pixels={hair_mask.sum():.0f}"
         )
+
+        # ── Step 3-e: 숏컷/중단발일 때 마스크 하단 확장 ──────────────────────
+        # cloth 제거 후 expand → 확장된 영역이 cloth에 의해 날아가지 않음
+        if hair_length in ("short", "medium"):
+            hair_mask = self._expand_mask_for_short_hair(
+                hair_mask, face_bbox, H, W, hair_length
+            )
+            logger.info(
+                f"[SDPipeline] 마스크 하단 확장 완료 ({hair_length}), "
+                f"pixels={hair_mask.sum():.0f}"
+            )
 
         # ── Step 4: SD 입력 준비 ─────────────────────────────────────────────
         img_pil = Image.fromarray(img_rgb)
@@ -283,7 +287,8 @@ class MirrAISDPipeline:
 
         # ── Step 7: SD Inpainting ─────────────────────────────────────────────
         gen_images = self._generate(
-            img_512, mask_512, canny_512, face_crop_pil, prompt, neg_prompt, guidance, seeds
+            img_512, mask_512, canny_512, face_crop_pil, prompt, neg_prompt, guidance, seeds,
+            hair_length=hair_length,
         )
 
         # ── Step 8: Composite → 원본 해상도 ───────────────────────────────────
@@ -776,15 +781,24 @@ class MirrAISDPipeline:
         img_pil: Image.Image,
         face_bbox: Tuple[int, int, int, int],
     ) -> Image.Image:
-        """IP-Adapter용 얼굴 crop (padding + 224×224 resize)"""
+        """IP-Adapter용 얼굴 crop (얼굴만 — 머리카락 최소화)
+
+        padding을 아래쪽은 넉넉히(턱/목 포함), 위쪽/옆은 최소화(머리카락 제외)
+        IP-Adapter가 원본 헤어 스타일을 conditioning하면 숏컷 변환이 안 됨.
+        """
         x1, y1, x2, y2 = face_bbox
         W, H = img_pil.size
         bw, bh = x2 - x1, y2 - y1
-        px = int(bw * self.config.face_crop_padding)
-        py = int(bh * self.config.face_crop_padding)
+        # 위/옆은 패딩 최소화(0.05) → 머리카락 포함 억제
+        # 아래는 패딩 넉넉히(0.2) → 턱/목 포함 → 얼굴 identity 안정화
+        pad_side = int(bw * 0.05)
+        pad_top  = int(bh * 0.05)
+        pad_bot  = int(bh * 0.20)
         crop = img_pil.crop((
-            max(0, x1 - px), max(0, y1 - py),
-            min(W, x2 + px), min(H, y2 + py),
+            max(0, x1 - pad_side),
+            max(0, y1 - pad_top),
+            min(W, x2 + pad_side),
+            min(H, y2 + pad_bot),
         ))
         return crop.resize((224, 224), Image.LANCZOS)
 
@@ -831,18 +845,22 @@ class MirrAISDPipeline:
             cutoff_y = int(y2 + face_h * 0.60)
         cutoff_y = max(0, min(cutoff_y, H - 1))
 
-        # 기존 머리카락의 최하단 행
-        hair_rows = np.any(hair_mask > 0.5, axis=1)
-        if not np.any(hair_rows):
-            return hair_mask
-        lowest_hair_y = int(np.max(np.where(hair_rows)))
-
         # 마스크 확장 한계: 어깨 아래(얼굴 높이 2배)를 넘지 않도록 제한 (옷 보호)
         max_expand_y = int(y2 + face_h * 2.0)
-        lowest_hair_y = min(lowest_hair_y, max_expand_y)
+        max_expand_y = min(max_expand_y, H - 1)
+
+        # SAM2가 한쪽만 끊기는 문제 보정: 좌/우 각각 최하단을 구해서 더 긴 쪽에 맞춤
+        cx = (x1 + x2) // 2
+        left_rows  = np.any(hair_mask[:, :cx] > 0.5, axis=1)
+        right_rows = np.any(hair_mask[:, cx:] > 0.5, axis=1)
+
+        left_bottom  = int(np.max(np.where(left_rows)))  if np.any(left_rows)  else cutoff_y
+        right_bottom = int(np.max(np.where(right_rows))) if np.any(right_rows) else cutoff_y
+
+        # 좌우 중 더 긴 쪽을 기준으로 반대쪽도 같은 높이까지 확장 (대칭 보정)
+        lowest_hair_y = min(max(left_bottom, right_bottom), max_expand_y)
 
         if lowest_hair_y <= cutoff_y:
-            # 이미 요청한 길이보다 짧음 → 확장 불필요
             return hair_mask
 
         # cutoff_y ~ lowest_hair_y 구간을 마스크에 추가
@@ -860,7 +878,6 @@ class MirrAISDPipeline:
             if len(row_hair_cols) > 0:
                 c_min, c_max = int(row_hair_cols.min()), int(row_hair_cols.max())
             else:
-                # 헤어 없는 행: 위에서 추정한 헤어 열 범위로만 채움 (얼굴/목 제외)
                 c_min, c_max = default_c_min, default_c_max
             expanded[row, max(0, c_min):min(W, c_max + 1)] = 1.0
 
@@ -930,6 +947,7 @@ class MirrAISDPipeline:
         negative_prompt: str,
         guidance_scale: float,
         seeds: List[int],
+        hair_length: str = "long",
     ) -> List[Image.Image]:
         """
         모든 seed를 단일 배치 forward pass로 생성 (순차 대비 ~절반 시간).
@@ -937,6 +955,18 @@ class MirrAISDPipeline:
         diffusers는 generator를 리스트로 받으면 num_images_per_prompt 개의
         이미지를 각자 다른 seed로 한 번의 파이프라인 실행에 처리함.
         """
+        # 숏컷/중단발 변환 시 IP-Adapter scale을 낮춤
+        # → 원본 긴머리 identity가 생성에 과도하게 영향주는 것 방지
+        if hair_length == "short":
+            ip_scale = 0.15   # 얼굴 identity만 최소 유지, 헤어는 텍스트 따름
+        elif hair_length == "medium":
+            ip_scale = 0.25
+        else:
+            ip_scale = self.config.ip_adapter_scale  # long은 기본값 유지
+
+        self._sd_pipe.set_ip_adapter_scale(ip_scale)
+        logger.info(f"[SDPipeline] ip_adapter_scale={ip_scale} (hair_length={hair_length})")
+
         n = len(seeds)
         generators = [
             torch.Generator(device=self.device).manual_seed(s) for s in seeds

@@ -259,6 +259,17 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     mask_uint8 = (r.mask * 255).astype(np.uint8)
                     mask_rgb = cv2.cvtColor(mask_uint8, cv2.COLOR_GRAY2BGR)
                     item["mask_base64"] = _image_to_base64(mask_rgb)
+
+                    # 오버레이: 원본 위에 마스크 영역을 반투명 빨간색으로 표시
+                    orig_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                    overlay = orig_rgb.copy()
+                    red_layer = np.zeros_like(overlay)
+                    red_layer[:, :, 0] = 255  # R채널만
+                    alpha = r.mask[..., np.newaxis]  # H×W×1
+                    overlay = (overlay * (1 - 0.5 * alpha) + red_layer * 0.5 * alpha).astype(np.uint8)
+                    overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+                    item["mask_overlay_base64"] = _image_to_base64(overlay_bgr)
+
                 if r.face_bbox is not None:
                     x1, y1, x2, y2 = r.face_bbox
                     item["face_bbox"] = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
