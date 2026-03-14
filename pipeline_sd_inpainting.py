@@ -67,7 +67,8 @@ SD_SIZE = 512   # SD 1.5 native resolution
 _NEGATIVE_BASE = (
     "ugly, deformed, blurry, low quality, bad anatomy, distorted face, "
     "distorted hair, bald patch, artifacts, watermark, signature, "
-    "cartoon, anime, illustration, painting, drawing"
+    "cartoon, anime, illustration, painting, drawing, "
+    "earrings, earring, jewelry, necklace, accessories, piercings"
 )
 
 # ── 헤어 길이 키워드 ────────────────────────────────────────────────────────────
@@ -124,6 +125,11 @@ class SDInpaintConfig:
     use_clip_ranking: bool = False   # 향후 CLIP 랭킹 확장용
     use_color_match:  bool = False   # 향후 LAB 색상 매칭 확장용
     use_poisson_blend: bool = False  # 향후 Poisson blend 확장용
+
+    # 배경 채우기 모드 (short/medium 변환 시 긴머리 제거 방법)
+    #   "cv2" : cv2.inpaint + seamlessClone (기본, 빠름)
+    #   "sd"  : SD 2-pass (배경을 SD로 생성 → 품질 높음, 시간 2배)
+    bg_fill_mode: str = "cv2"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -284,28 +290,69 @@ class MirrAISDPipeline:
                 f"gen_px={gen_mask.sum():.0f}, cutoff_y={cutoff_y}"
             )
 
-            # 단계 1: cv2.inpaint → seamlessClone 으로 긴 머리 자연스럽게 제거
+            # 단계 1: 긴 머리 제거 — bg_fill_mode에 따라 방법 분기
+            bg_mode = self.config.bg_fill_mode
+            logger.info(f"[SDPipeline] bg_fill_mode={bg_mode}")
+
             if removal_mask.sum() > 50:
                 removal_u8 = (removal_mask > 0.5).astype(np.uint8) * 255
-                # dilate로 경계 잔여 머리카락까지 커버
                 k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
                 removal_u8_dilated = cv2.dilate(removal_u8, k, iterations=1)
 
-                # INPAINT_NS (Navier-Stokes) — 배경/피부 복원에 부드러움
-                # seamlessClone은 고스트/색번짐 유발 → 사용하지 않음
-                img_rgb_filled = cv2.inpaint(
-                    img_rgb, removal_u8_dilated, inpaintRadius=15, flags=cv2.INPAINT_NS
-                )
+                if bg_mode == "sd":
+                    # ── SD 2-pass: 배경을 SD로 생성 (품질 높음, 시간 2배) ────
+                    logger.info("[SDPipeline] bg_fill_mode=sd: 배경 SD 생성 시작")
+                    bg_prompt = (
+                        "natural background, skin, neck, shoulder, no hair, "
+                        "photorealistic, high quality, clean background"
+                    )
+                    bg_neg = "hair, long hair, bald, wig, " + _NEGATIVE_BASE
+                    bg_img_512, bg_mask_512, bg_canny_512, bg_scale, bg_pad = \
+                        self._prepare_sd_inputs(img_rgb, removal_mask)
+                    # 배경 생성은 seed 1개만 (모든 top-k에 동일 배경 적용)
+                    bg_seed = seeds[0] if seeds else 42
+                    bg_gen = self._generate(
+                        bg_img_512, bg_mask_512, bg_canny_512,
+                        self._crop_face(Image.fromarray(img_rgb), face_bbox),
+                        bg_prompt, bg_neg, 7.5,
+                        [bg_seed], hair_length="long",  # scale은 long(기본값) 사용
+                    )
+                    # composite: 배경 영역만 교체
+                    img_rgb_cleaned = cv2.cvtColor(
+                        self._composite(
+                            cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), img_rgb,
+                            bg_gen[0], removal_mask, bg_scale, bg_pad, (W, H)
+                        ),
+                        cv2.COLOR_BGR2RGB,
+                    )
+                    logger.info("[SDPipeline] bg_fill_mode=sd: 배경 SD 생성 완료")
 
-                # inpaint 경계를 soft-blend로 원본에 합성 (hard edge 방지)
-                soft_alpha = removal_u8_dilated.astype(np.float32) / 255.0
-                soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=5.0)[..., np.newaxis]
-                img_rgb_cleaned = (
-                    img_rgb_filled.astype(np.float32) * soft_alpha
-                    + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
-                ).clip(0, 255).astype(np.uint8)
-
-                logger.info("[SDPipeline] cv2.inpaint + soft-blend 긴머리 제거 완료")
+                else:
+                    # ── cv2 (기본): cv2.inpaint + seamlessClone ──────────────
+                    img_rgb_filled = cv2.inpaint(
+                        img_rgb, removal_u8_dilated, inpaintRadius=15, flags=cv2.INPAINT_NS
+                    )
+                    try:
+                        ys, xs = np.where(removal_u8_dilated > 0)
+                        if len(xs) > 0:
+                            src_bgr = cv2.cvtColor(img_rgb_filled, cv2.COLOR_RGB2BGR)
+                            dst_bgr = cv2.cvtColor(img_rgb,        cv2.COLOR_RGB2BGR)
+                            blended_bgr = cv2.seamlessClone(
+                                src_bgr, dst_bgr, removal_u8_dilated,
+                                (int(xs.mean()), int(ys.mean())), cv2.NORMAL_CLONE
+                            )
+                            img_rgb_cleaned = cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB)
+                        else:
+                            img_rgb_cleaned = img_rgb_filled
+                    except Exception as e:
+                        logger.warning(f"[SDPipeline] seamlessClone 실패, soft-blend 사용: {e}")
+                        soft_alpha = removal_u8_dilated.astype(np.float32) / 255.0
+                        soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=5.0)[..., np.newaxis]
+                        img_rgb_cleaned = (
+                            img_rgb_filled.astype(np.float32) * soft_alpha
+                            + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
+                        ).clip(0, 255).astype(np.uint8)
+                    logger.info("[SDPipeline] bg_fill_mode=cv2: cv2.inpaint + seamlessClone 완료")
             else:
                 img_rgb_cleaned = img_rgb
 

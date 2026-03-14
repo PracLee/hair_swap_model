@@ -188,6 +188,8 @@ def main():
                         help="헤어 컬러 텍스트 (기본: 'ash brown')")
     parser.add_argument("--top-k",     default=3, type=int,
                         help="결과 수 (기본: 3, 최대: 5)")
+    parser.add_argument("--bg-fill",   default="cv2", choices=["cv2", "sd"],
+                        help="단발 변환 시 배경 채우기 방법: cv2=빠름(기본), sd=품질높음(2배시간)")
 
     # 기타
     parser.add_argument("--no-base64",    action="store_true",
@@ -216,6 +218,7 @@ def main():
             "color_text":     args.color,
             "top_k":          args.top_k,
             "return_base64":  not args.no_base64,
+            "bg_fill_mode":   args.bg_fill,
         }
 
         if args.image_url:

@@ -222,6 +222,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         color_text     = str(inp.get("color_text", "")).strip()
         top_k          = max(1, min(5, int(inp.get("top_k", 3))))
         return_base64  = _coerce_bool(inp.get("return_base64"), default=True)
+        bg_fill_mode   = str(inp.get("bg_fill_mode", "cv2")).strip()  # "cv2" | "sd"
 
         if not hairstyle_text and not color_text:
             return {"error": "hairstyle_text 또는 color_text 중 하나 이상 필요합니다."}
@@ -236,6 +237,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # ── 파이프라인 실행 ───────────────────────────────────────────────────
         pipeline = _get_pipeline()
+        # bg_fill_mode를 런타임에 동적으로 설정 (빌드 없이 테스트 가능)
+        pipeline.config.bg_fill_mode = bg_fill_mode
+        logger.info(f"[handler_sd] bg_fill_mode={bg_fill_mode}")
         results = pipeline.run(
             image=img_bgr,
             hairstyle_text=hairstyle_text,
