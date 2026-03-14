@@ -426,7 +426,8 @@ class MirrAISDPipeline:
             segface.load_state_dict(ckpt["state_dict_backbone"], strict=False)
         else:
             segface.load_state_dict(ckpt, strict=False)
-        segface.to(self.device).eval()
+        # SegFace는 항상 float32로 실행 (내부에 dtype=torch.float32 하드코딩 있음)
+        segface.float().to(self.device).eval()
         self._segface = segface
         logger.info("[SDPipeline] SegFace 로드 완료")
 
@@ -500,9 +501,8 @@ class MirrAISDPipeline:
         inp_t = (inp_np / 255.0 - mean) / std
         inp_t = torch.from_numpy(inp_t).float().permute(2, 0, 1).unsqueeze(0)
         
-        if self.dtype == torch.float16:
-            inp_t = inp_t.half()
-        inp_t = inp_t.to(self.device)
+        # SegFace는 float32로 고정 실행 (모델 내부 float32 하드코딩 때문에 half 금지)
+        inp_t = inp_t.float().to(self.device)
 
         with torch.no_grad():
             DUMMY_LABELS = None
