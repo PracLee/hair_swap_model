@@ -398,7 +398,8 @@ class MirrAISDPipeline:
         for rank, (gen_pil, seed) in enumerate(zip(gen_images, seeds)):
             composited_bgr = self._composite(
                 composite_base_bgr, composite_base_rgb,
-                gen_pil, hair_mask_for_sd, scale, pad, (W, H)
+                gen_pil, hair_mask_for_sd, scale, pad, (W, H),
+                protect_mask=face_region_mask,   # 얼굴 영역 alpha 침범 방지
             )
             results.append(SDInpaintResult(
                 image=composited_bgr,
@@ -1110,11 +1111,12 @@ class MirrAISDPipeline:
         scale: float,
         pad: Tuple[int, int],            # (pad_left, pad_top)
         original_size: Tuple[int, int],  # (W, H)
+        protect_mask: Optional[np.ndarray] = None,  # H×W float32: 이 영역은 alpha=0 강제 (얼굴 보호)
     ) -> np.ndarray:
         """
         SD 생성 이미지를 원본에 합성.
         - hair mask 영역: SD 생성 결과
-        - 그 외: 원본 (얼굴/배경 유지)
+        - 그 외 (+ protect_mask): 원본 (얼굴/배경 유지)
         """
         W, H = original_size
         pad_l, pad_t = pad
@@ -1129,9 +1131,18 @@ class MirrAISDPipeline:
         gen_orig = cv2.resize(gen_cropped, (W, H), interpolation=cv2.INTER_LANCZOS4)
 
         # alpha 블렌딩: Gaussian feather로 경계 자연스럽게 처리
-        # seamlessClone은 고스트/색번짐 유발 → 사용하지 않음
         alpha = cv2.GaussianBlur(hair_mask, (0, 0), sigmaX=6.0, sigmaY=6.0)
-        alpha = np.clip(alpha, 0.0, 1.0)[..., np.newaxis]   # H×W×1
+        alpha = np.clip(alpha, 0.0, 1.0)
+
+        # 얼굴/귀/눈 등 보호 영역: alpha를 0으로 강제
+        # → Gaussian blur가 얼굴 경계로 번지더라도 원본 픽셀 100% 유지
+        if protect_mask is not None:
+            # protect_mask도 살짝 dilate해서 경계까지 확실히 보호
+            protect_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            protect_dilated = cv2.dilate(protect_mask.astype(np.float32), protect_k)
+            alpha = alpha * (1.0 - np.clip(protect_dilated, 0.0, 1.0))
+
+        alpha = alpha[..., np.newaxis]   # H×W×1
 
         orig_f = orig_rgb.astype(np.float32)
         gen_f  = gen_orig.astype(np.float32)
