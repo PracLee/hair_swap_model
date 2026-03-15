@@ -269,28 +269,43 @@ class MirrAISDPipeline:
         # 해결: ① cv2.inpaint로 긴 머리 먼저 제거(배경/피부로 채움)
         #        ② 제거된 이미지 위에 SD로 새 숏컷 생성 (머리 없는 주변 맥락)
         if hair_length in ("short", "medium"):
-            # 숏컷 기준선 계산 (이 아래 머리는 제거 대상)
             x1f, y1f, x2f, y2f = face_bbox
+            face_w = max(x2f - x1f, 1)
             face_h = max(y2f - y1f, 1)
+
             if hair_length == "short":
                 cutoff_y = int(y2f + face_h * 0.05)   # 턱 바로 아래
             else:
                 cutoff_y = int(y2f + face_h * 0.60)   # 어깨 위
+            cutoff_y = min(cutoff_y, H - 1)
 
-            # 제거 마스크: cutoff_y 아래 + 원본 hair_mask 교집합
+            # ── 제거 마스크: cutoff_y 아래 hair_mask 전체 ──────────────────────
             removal_mask = hair_mask.copy()
-            removal_mask[:cutoff_y, :] = 0.0           # 기준선 위는 제거 안 함 (새 숏컷 생성)
+            removal_mask[:cutoff_y, :] = 0.0
 
-            # 생성 마스크: cutoff_y 위쪽 머리 영역 (SD가 새 숏컷을 그릴 곳)
-            gen_mask = hair_mask.copy()
-            gen_mask[cutoff_y:, :] = 0.0
+            # ── 생성 마스크: head box 기반 (아치형만이 아닌 머리 전체 공간) ─────
+            # 기존: hair_mask의 cutoff_y 위쪽 (아치형만 → 귀 옆 공간 없음)
+            # 변경: face_bbox 기반 head box → 귀 옆까지 포함해서 SD가 숏컷 생성
+            margin_x = int(face_w * 0.5)   # 얼굴 폭의 50% 여백 (양 옆 머리 공간)
+            head_x1  = max(0, x1f - margin_x)
+            head_x2  = min(W, x2f + margin_x)
+            head_y1  = max(0, y1f - int(face_h * 0.6))   # 정수리 위까지
+            head_y2  = cutoff_y
+
+            gen_mask = np.zeros((H, W), dtype=np.float32)
+            gen_mask[head_y1:head_y2, head_x1:head_x2] = 1.0
+            # 얼굴 내부(눈/코/입)는 inpaint 하지 않음
+            gen_mask = np.clip(gen_mask - face_region_mask, 0.0, 1.0)
+            # 옷도 보호
+            gen_mask = np.clip(gen_mask - cloth_mask_dilated, 0.0, 1.0)
 
             logger.info(
                 f"[SDPipeline] 2단계 숏컷: removal_px={removal_mask.sum():.0f}, "
-                f"gen_px={gen_mask.sum():.0f}, cutoff_y={cutoff_y}"
+                f"gen_px={gen_mask.sum():.0f}, cutoff_y={cutoff_y}, "
+                f"head_box=({head_x1},{head_y1})-({head_x2},{head_y2})"
             )
 
-            # 단계 1: 긴 머리 제거 — bg_fill_mode에 따라 방법 분기
+            # 단계 1: 긴 머리 제거 ─────────────────────────────────────────────
             bg_mode = self.config.bg_fill_mode
             logger.info(f"[SDPipeline] bg_fill_mode={bg_mode}")
 
@@ -300,7 +315,7 @@ class MirrAISDPipeline:
                 removal_u8_dilated = cv2.dilate(removal_u8, k, iterations=1)
 
                 if bg_mode == "sd":
-                    # ── SD 2-pass: 배경을 SD로 생성 (품질 높음, 시간 2배) ────
+                    # SD 2-pass: 배경을 SD로 생성
                     logger.info("[SDPipeline] bg_fill_mode=sd: 배경 SD 생성 시작")
                     bg_prompt = (
                         "natural background, skin, neck, shoulder, no hair, "
@@ -309,15 +324,12 @@ class MirrAISDPipeline:
                     bg_neg = "hair, long hair, bald, wig, " + _NEGATIVE_BASE
                     bg_img_512, bg_mask_512, bg_canny_512, bg_scale, bg_pad = \
                         self._prepare_sd_inputs(img_rgb, removal_mask)
-                    # 배경 생성은 seed 1개만 (모든 top-k에 동일 배경 적용)
                     bg_seed = seeds[0] if seeds else 42
                     bg_gen = self._generate(
                         bg_img_512, bg_mask_512, bg_canny_512,
                         self._crop_face(Image.fromarray(img_rgb), face_bbox),
-                        bg_prompt, bg_neg, 7.5,
-                        [bg_seed], hair_length="long",  # scale은 long(기본값) 사용
+                        bg_prompt, bg_neg, 7.5, [bg_seed], hair_length="long",
                     )
-                    # composite: 배경 영역만 교체
                     img_rgb_cleaned = cv2.cvtColor(
                         self._composite(
                             cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), img_rgb,
@@ -328,31 +340,18 @@ class MirrAISDPipeline:
                     logger.info("[SDPipeline] bg_fill_mode=sd: 배경 SD 생성 완료")
 
                 else:
-                    # ── cv2 (기본): cv2.inpaint + seamlessClone ──────────────
+                    # cv2.inpaint만 사용 — seamlessClone 제거 (큰 영역에서 고스트 유발)
                     img_rgb_filled = cv2.inpaint(
-                        img_rgb, removal_u8_dilated, inpaintRadius=15, flags=cv2.INPAINT_NS
+                        img_rgb, removal_u8_dilated, inpaintRadius=20, flags=cv2.INPAINT_NS
                     )
-                    try:
-                        ys, xs = np.where(removal_u8_dilated > 0)
-                        if len(xs) > 0:
-                            src_bgr = cv2.cvtColor(img_rgb_filled, cv2.COLOR_RGB2BGR)
-                            dst_bgr = cv2.cvtColor(img_rgb,        cv2.COLOR_RGB2BGR)
-                            blended_bgr = cv2.seamlessClone(
-                                src_bgr, dst_bgr, removal_u8_dilated,
-                                (int(xs.mean()), int(ys.mean())), cv2.NORMAL_CLONE
-                            )
-                            img_rgb_cleaned = cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB)
-                        else:
-                            img_rgb_cleaned = img_rgb_filled
-                    except Exception as e:
-                        logger.warning(f"[SDPipeline] seamlessClone 실패, soft-blend 사용: {e}")
-                        soft_alpha = removal_u8_dilated.astype(np.float32) / 255.0
-                        soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=5.0)[..., np.newaxis]
-                        img_rgb_cleaned = (
-                            img_rgb_filled.astype(np.float32) * soft_alpha
-                            + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
-                        ).clip(0, 255).astype(np.uint8)
-                    logger.info("[SDPipeline] bg_fill_mode=cv2: cv2.inpaint + seamlessClone 완료")
+                    # soft-blend로 경계 자연스럽게 (seamlessClone 없이)
+                    soft_alpha = removal_u8_dilated.astype(np.float32) / 255.0
+                    soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=8.0)[..., np.newaxis]
+                    img_rgb_cleaned = (
+                        img_rgb_filled.astype(np.float32) * soft_alpha
+                        + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
+                    ).clip(0, 255).astype(np.uint8)
+                    logger.info("[SDPipeline] bg_fill_mode=cv2: cv2.inpaint 완료")
             else:
                 img_rgb_cleaned = img_rgb
 
