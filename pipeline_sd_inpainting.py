@@ -279,9 +279,26 @@ class MirrAISDPipeline:
                 cutoff_y = int(y2f + face_h * 0.60)   # 어깨 위
             cutoff_y = min(cutoff_y, H - 1)
 
-            # ── 제거 마스크: cutoff_y 아래 hair_mask 전체 ──────────────────────
+            # ── 제거 마스크: SAM2 감지 영역 + 어깨 너비 직사각형 확장 ────────────
+            # SAM2가 한쪽 머리를 놓친 경우(오른쪽 등) 를 커버하기 위해
+            # cutoff_y 아래 전체 어깨 너비를 removal 영역으로 포함
             removal_mask = hair_mask.copy()
             removal_mask[:cutoff_y, :] = 0.0
+
+            # SAM2 감지 영역 너비 기준으로 직사각형 확장
+            # head box 너비(head_x1~head_x2)를 cutoff_y 아래에도 적용
+            hair_rows_below = np.any(hair_mask[cutoff_y:, :] > 0.5, axis=1)
+            if np.any(hair_rows_below):
+                max_hair_y = cutoff_y + int(np.max(np.where(hair_rows_below)))
+                max_hair_y = min(max_hair_y + 20, H - 1)
+                # 좌우 범위: head box 너비 기준
+                removal_mask[cutoff_y:max_hair_y, head_x1:head_x2] = 1.0
+                logger.info(
+                    f"[SDPipeline] removal_mask 직사각형 확장: "
+                    f"y={cutoff_y}~{max_hair_y}, x={head_x1}~{head_x2}"
+                )
+            # 옷 영역은 보호
+            removal_mask = np.clip(removal_mask - cloth_mask_dilated, 0.0, 1.0)
 
             # ── 생성 마스크: head box 기반 (아치형만이 아닌 머리 전체 공간) ─────
             # 기존: hair_mask의 cutoff_y 위쪽 (아치형만 → 귀 옆 공간 없음)
@@ -315,29 +332,24 @@ class MirrAISDPipeline:
                 removal_u8_dilated = cv2.dilate(removal_u8, k, iterations=1)
 
                 if bg_mode == "sd":
-                    # SD 2-pass: 배경을 SD로 생성
-                    logger.info("[SDPipeline] bg_fill_mode=sd: 배경 SD 생성 시작")
-                    bg_prompt = (
-                        "natural background, skin, neck, shoulder, no hair, "
-                        "photorealistic, high quality, clean background"
+                    # SD는 컨텍스트 기반이라 hair removal에 부적합
+                    # (마스크 주변 긴머리 보고 다시 머리 생성함)
+                    # → removal 단계는 항상 cv2.inpaint 사용
+                    # SD 2-pass의 차별점: gen_mask(head box) 크기와 이후 SD pass에서 발휘
+                    logger.info("[SDPipeline] bg_fill_mode=sd: removal은 cv2.inpaint 사용")
+                    img_rgb_filled = cv2.inpaint(
+                        img_rgb, removal_u8_dilated, inpaintRadius=20, flags=cv2.INPAINT_NS
                     )
-                    bg_neg = "hair, long hair, bald, wig, " + _NEGATIVE_BASE
-                    bg_img_512, bg_mask_512, bg_canny_512, bg_scale, bg_pad = \
-                        self._prepare_sd_inputs(img_rgb, removal_mask)
-                    bg_seed = seeds[0] if seeds else 42
-                    bg_gen = self._generate(
-                        bg_img_512, bg_mask_512, bg_canny_512,
-                        self._crop_face(Image.fromarray(img_rgb), face_bbox),
-                        bg_prompt, bg_neg, 7.5, [bg_seed], hair_length="long",
-                    )
-                    img_rgb_cleaned = cv2.cvtColor(
-                        self._composite(
-                            cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), img_rgb,
-                            bg_gen[0], removal_mask, bg_scale, bg_pad, (W, H)
-                        ),
-                        cv2.COLOR_BGR2RGB,
-                    )
-                    logger.info("[SDPipeline] bg_fill_mode=sd: 배경 SD 생성 완료")
+                    soft_alpha = removal_u8_dilated.astype(np.float32) / 255.0
+                    soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=8.0)[..., np.newaxis]
+                    img_rgb_cleaned = (
+                        img_rgb_filled.astype(np.float32) * soft_alpha
+                        + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
+                    ).clip(0, 255).astype(np.uint8)
+
+                    # SD pass2: gen_mask 영역에 새 숏컷 생성 (head box 전체)
+                    # → 이게 cv2 모드와의 차이 (gen_mask가 더 넓음)
+                    logger.info("[SDPipeline] bg_fill_mode=sd: head box SD 생성 시작")
 
                 else:
                     # cv2.inpaint만 사용 — seamlessClone 제거 (큰 영역에서 고스트 유발)
