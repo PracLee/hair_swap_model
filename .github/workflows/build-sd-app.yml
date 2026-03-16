@@ -50,6 +50,10 @@ jobs:
           df -h
           docker system df || true
 
+          # GitHub-hosted runner의 대형 사전 설치 패키지 제거
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true
+          sudo apt-get clean || true
+
           docker buildx prune -af || true
           docker builder prune -af || true
           docker system prune -af --volumes || true
@@ -115,22 +119,13 @@ jobs:
             echo "[build-sd-app] base image missing: ${{ steps.meta.outputs.BASE_IMAGE }}"
           fi
 
-      - name: Bootstrap base image when missing
+      - name: Stop when base image is missing
         if: steps.base_exists.outputs.value == 'false'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile.sd.base
-          platforms: linux/amd64
-          push: true
-          provenance: false
-          tags: |
-            ${{ steps.meta.outputs.BASE_IMAGE }}
-            ${{ secrets.DOCKER_USERNAME }}/sd:base-latest
-          cache-from: |
-            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache-base
-          cache-to: |
-            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache-base,mode=max
+        shell: bash
+        run: |
+          echo "::error::Base image is missing: ${{ steps.meta.outputs.BASE_IMAGE }}"
+          echo "::error::Run 'Build and Push SD Base Image' first, then rerun this workflow."
+          exit 1
 
       - name: Build and push SD app image
         uses: docker/build-push-action@v6
@@ -149,4 +144,4 @@ jobs:
           cache-from: |
             type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache
           cache-to: |
-            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache,mode=max
+            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache,mode=min
