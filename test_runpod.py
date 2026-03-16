@@ -46,6 +46,24 @@ RUNPOD_BASE_URL   = "https://api.runpod.ai/v2"
 POLL_INTERVAL_SEC = 5
 TIMEOUT_SEC       = 1200  # 20분: cold start 시 모델 다운로드(SD+ControlNet+IP-Adapter) 포함
 
+INTERMEDIATE_KEY_ALIASES = {
+    # legacy keys -> standardized keys
+    "input_image": "pipeline_input_image",
+    "hand_mask": "mediapipe_hand_mask",
+    "face_region_mask": "segface_face_region_mask",
+    "cloth_mask": "segface_cloth_mask",
+    "hair_mask_after_face_protect": "pipeline_hair_mask_face_protected",
+    "cloth_mask_dilated": "segface_cloth_mask_dilated",
+    "hair_mask_after_cloth_protect": "pipeline_hair_mask_cloth_protected",
+    "shoulder_protect_mask": "pipeline_shoulder_protect_mask",
+    "short_removal_mask": "pipeline_short_removal_mask",
+    "short_generation_mask": "pipeline_short_generation_mask",
+    "background_cleaned_rgb": "cv2_background_cleaned_rgb",
+    "sd_mask_512": "sd_inpaint_mask_512",
+    "canny_512": "controlnet_canny_512",
+    "generated_rank0_512": "sd_generated_rank0_512",
+}
+
 
 # ── RunPod API ─────────────────────────────────────────────────────────────────
 
@@ -171,6 +189,8 @@ def save_intermediates(output: dict, out_dir: Path) -> list[Path]:
         return []
 
     saved: list[Path] = []
+    result0 = (output.get("results") or [{}])[0] if isinstance(output.get("results"), list) else {}
+    mask_used = str((result0 or {}).get("mask_used", "pipeline")).strip().lower() or "pipeline"
     for key, b64 in intermediates.items():
         if not b64:
             continue
@@ -181,12 +201,25 @@ def save_intermediates(output: dict, out_dir: Path) -> list[Path]:
             print(f"[warn] intermediate decode 실패: {key} ({e})")
             continue
 
-        safe_key = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(key)).strip("_") or "unknown"
-        out_path = out_dir / f"intermediate_{safe_key}.jpg"
+        normalized_key = normalize_intermediate_key(key, mask_used=mask_used)
+        out_path = out_dir / f"intermediate_{normalized_key}.jpg"
         img.save(out_path, format="JPEG", quality=92)
         print(f"[save]   intermediate → {out_path.name}")
         saved.append(out_path)
     return saved
+
+
+def normalize_intermediate_key(key: str, mask_used: str = "pipeline") -> str:
+    norm = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(key)).strip("_").lower()
+    norm = norm.replace(".", "_").replace("-", "_")
+    norm = re.sub(r"_+", "_", norm).strip("_")
+    if norm == "refined_hair_mask":
+        source = re.sub(r"[^a-z0-9_]+", "_", (mask_used or "pipeline").lower()).strip("_")
+        norm = f"{source}_refined_hair_mask"
+    norm = INTERMEDIATE_KEY_ALIASES.get(norm, norm)
+    if "_" not in norm:
+        norm = f"pipeline_{norm}"
+    return norm or "pipeline_unknown"
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────

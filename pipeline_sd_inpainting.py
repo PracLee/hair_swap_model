@@ -242,7 +242,7 @@ class MirrAISDPipeline:
             debug_images_common[name] = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
 
         if debug_images_common is not None:
-            debug_images_common["input_image"] = image.copy()
+            debug_images_common["pipeline_input_image"] = image.copy()
 
         # ── Step 1: 얼굴 검출 ────────────────────────────────────────────────
         face_obs = self._detect_face(img_rgb)
@@ -253,13 +253,13 @@ class MirrAISDPipeline:
         hand_mask = self._detect_hand_mask(img_rgb)
         if hand_mask.sum() > 0:
             logger.info(f"[SDPipeline] 손 보호 마스크 검출: pixels={hand_mask.sum():.0f}")
-        _store_mask("hand_mask", hand_mask)
+        _store_mask("mediapipe_hand_mask", hand_mask)
 
         # ── Step 2: SegFace base hair mask + 얼굴 픽셀 마스크 + 옷 마스크 ──────
         hair_mask_base, face_region_mask, cloth_mask = self._segface_hair_mask(img_rgb, face_bbox)
         _store_mask("segface_hair_mask", hair_mask_base)
-        _store_mask("face_region_mask", face_region_mask)
-        _store_mask("cloth_mask", cloth_mask)
+        _store_mask("segface_face_region_mask", face_region_mask)
+        _store_mask("segface_cloth_mask", cloth_mask)
 
         # ── Step 3: SAM2 refinement ───────────────────────────────────────────
         hair_mask, mask_source = self._refine_with_sam2(
@@ -269,7 +269,7 @@ class MirrAISDPipeline:
             f"[SDPipeline] hair mask source={mask_source}, "
             f"pixels={hair_mask.sum():.0f}"
         )
-        _store_mask("refined_hair_mask", hair_mask)
+        _store_mask(f"{mask_source}_refined_hair_mask", hair_mask)
 
         if hair_mask.sum() < 300:
             raise ValueError("머리카락 영역이 너무 작습니다.")
@@ -283,7 +283,7 @@ class MirrAISDPipeline:
         # short/medium 긴머리 제거 단계에서는 "옷 위로 떨어진 머리카락"도 지워야 하므로
         # cloth 제거 전 마스크를 별도로 보관한다.
         hair_mask_for_removal = hair_mask.copy()
-        _store_mask("hair_mask_after_face_protect", hair_mask_for_removal)
+        _store_mask("pipeline_hair_mask_face_protected", hair_mask_for_removal)
         logger.info(
             f"[SDPipeline] 얼굴 픽셀 제거 완료, pixels={hair_mask.sum():.0f}"
         )
@@ -292,8 +292,8 @@ class MirrAISDPipeline:
         # expand 전에 먼저 제거해야 옷 영역이 마스크 확장에 영향받지 않음
         cloth_mask_dilated = self._dilate_mask(cloth_mask)
         hair_mask = np.clip(hair_mask - cloth_mask_dilated, 0.0, 1.0)
-        _store_mask("cloth_mask_dilated", cloth_mask_dilated)
-        _store_mask("hair_mask_after_cloth_protect", hair_mask)
+        _store_mask("segface_cloth_mask_dilated", cloth_mask_dilated)
+        _store_mask("pipeline_hair_mask_cloth_protected", hair_mask)
         logger.info(
             f"[SDPipeline] 옷 픽셀 제거 완료, pixels={hair_mask.sum():.0f}"
         )
@@ -327,7 +327,7 @@ class MirrAISDPipeline:
                     "[SDPipeline] 어깨 보호 마스크 적용: "
                     f"pixels={shoulder_protect_for_post.sum():.0f}"
                 )
-            _store_mask("shoulder_protect_mask", shoulder_protect_for_post)
+            _store_mask("pipeline_shoulder_protect_mask", shoulder_protect_for_post)
 
             # ── head box 계산 (removal_mask, gen_mask 양쪽에서 사용) ─────────────
             margin_x = int(face_w * 0.5)   # 얼굴 폭의 50% 여백 (양 옆 머리 공간)
@@ -400,8 +400,8 @@ class MirrAISDPipeline:
                     0.0,
                     1.0,
                 )
-            _store_mask("short_removal_mask", removal_mask)
-            _store_mask("short_generation_mask", gen_mask)
+            _store_mask("pipeline_short_removal_mask", removal_mask)
+            _store_mask("pipeline_short_generation_mask", gen_mask)
 
             logger.info(
                 f"[SDPipeline] 2단계 숏컷: removal_px={removal_mask.sum():.0f}, "
@@ -488,7 +488,7 @@ class MirrAISDPipeline:
                         f"[SDPipeline] cloth overlap 복원 적용: pixels={int((cloth_overlap > 0).sum())}"
                     )
                 logger.info("[SDPipeline] cv2.inpaint 2-way 블렌딩 완료")
-                _store_rgb("background_cleaned_rgb", img_rgb_cleaned)
+                _store_rgb("cv2_background_cleaned_rgb", img_rgb_cleaned)
 
                 if bg_mode == "sd":
                     # SD 보정 패스: 제거 영역의 배경/목/어깨 텍스처를 더 자연스럽게 정리
@@ -542,10 +542,10 @@ class MirrAISDPipeline:
             debug_images_common["sd_input_512"] = cv2.cvtColor(
                 np.array(img_512), cv2.COLOR_RGB2BGR
             )
-            debug_images_common["sd_mask_512"] = cv2.cvtColor(
+            debug_images_common["sd_inpaint_mask_512"] = cv2.cvtColor(
                 np.array(mask_512).astype(np.uint8), cv2.COLOR_GRAY2BGR
             )
-            debug_images_common["canny_512"] = cv2.cvtColor(
+            debug_images_common["controlnet_canny_512"] = cv2.cvtColor(
                 np.array(canny_512), cv2.COLOR_RGB2BGR
             )
 
@@ -575,7 +575,7 @@ class MirrAISDPipeline:
         results: List[SDInpaintResult] = []
         for rank, (gen_pil, seed) in enumerate(zip(gen_images, seeds)):
             if debug_images_common is not None and rank == 0:
-                debug_images_common["generated_rank0_512"] = cv2.cvtColor(
+                debug_images_common["sd_generated_rank0_512"] = cv2.cvtColor(
                     np.array(gen_pil), cv2.COLOR_RGB2BGR
                 )
             composited_bgr = self._composite(
