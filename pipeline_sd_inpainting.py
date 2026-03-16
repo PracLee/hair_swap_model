@@ -284,7 +284,7 @@ class MirrAISDPipeline:
             face_h = max(y2f - y1f, 1)
 
             if hair_length == "short":
-                cutoff_y = int(y2f + face_h * 0.05)   # 턱 바로 아래
+                cutoff_y = int(y2f + face_h * 0.12)   # 턱~윗목 사이 (하드컷 완화)
             else:
                 cutoff_y = int(y2f + face_h * 0.60)   # 어깨 위
             cutoff_y = min(cutoff_y, H - 1)
@@ -1146,8 +1146,8 @@ class MirrAISDPipeline:
 
         # 길이별 기준점: 어디부터 "머리카락이 없어야 하는가"
         if hair_length == "short":
-            # 턱 바로 아래 (얼굴 높이의 +5%)
-            cutoff_y = int(y2 + face_h * 0.05)
+            # 턱~윗목 사이 (얼굴 높이의 +12%)
+            cutoff_y = int(y2 + face_h * 0.12)
         else:  # medium
             # 어깨 위 (얼굴 높이의 +60%)
             cutoff_y = int(y2 + face_h * 0.60)
@@ -1215,14 +1215,16 @@ class MirrAISDPipeline:
         # ── 길이별 positive/negative 보강 ────────────────────────────────────
         if hair_length == "short":
             pos_suffix = (
-                ", very short haircut, chin-length bob, hair ends at or above chin, "
-                "clear neckline, visible neck, no hair below jawline"
+                ", short chin-length bob, soft layered ends, feathered tapered tips, "
+                "natural uneven hairline near jaw, clear neckline, visible neck, "
+                "mostly above jawline with a few natural wispy strands"
             )
             neg_prefix = (
-                "long hair, flowing hair, hair below jawline, hair below shoulders, "
-                "waist-length hair, side long locks, hair over chest, "
+                "very long hair, flowing long hair, hair below shoulders, "
+                "waist-length hair, side long locks over chest, "
+                "blunt horizontal cut line, helmet hair, bowl-shaped edge, "
             )
-            guidance = 11.0   # 숏컷 고정 강도 상향
+            guidance = 9.4
         elif hair_length == "medium":
             pos_suffix = (
                 ", medium length hair, shoulder-length hair, "
@@ -1473,6 +1475,10 @@ class MirrAISDPipeline:
         """
         H, W = img_rgb.shape[:2]
         cutoff_y = int(np.clip(cutoff_y, 0, H - 1))
+        _, y1, _, y2 = face_bbox
+        face_h = max(int(y2 - y1), 1)
+        soft_zone = max(10, int(face_h * 0.22))
+        soft_end = min(H - 1, cutoff_y + soft_zone)
 
         hair_now, _, _ = self._segface_hair_mask(img_rgb, face_bbox)
         residual = hair_now.copy()
@@ -1488,6 +1494,16 @@ class MirrAISDPipeline:
             if int((protect_u8 > 0).sum()) > 0:
                 residual_u8 = cv2.bitwise_and(residual_u8, cv2.bitwise_not(protect_u8))
 
+        # cutoff 바로 아래는 완만히 제거해 단발 끝선이 일자로 잘린 느낌을 완화
+        if soft_end > cutoff_y:
+            ramp = np.ones((H,), dtype=np.float32)
+            ramp[:cutoff_y] = 0.0
+            ramp[cutoff_y:soft_end + 1] = np.linspace(
+                0.0, 1.0, soft_end - cutoff_y + 1, dtype=np.float32
+            )
+            residual_soft = (residual_u8.astype(np.float32) / 255.0) * ramp[:, np.newaxis]
+            residual_u8 = (residual_soft > 0.50).astype(np.uint8) * 255
+
         if int((residual_u8 > 0).sum()) < 60:
             return img_rgb
 
@@ -1501,6 +1517,7 @@ class MirrAISDPipeline:
 
         alpha = residual_u8.astype(np.float32) / 255.0
         alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=4.0, sigmaY=4.0)[..., np.newaxis]
+        alpha = np.clip(alpha * 0.85, 0.0, 1.0)
 
         cleaned = (
             filled.astype(np.float32) * alpha
@@ -1523,9 +1540,21 @@ class MirrAISDPipeline:
         if removal_mask.shape != (H, W):
             return img_rgb
 
+        _, y1, _, y2 = face_bbox
+        face_h = max(int(y2 - y1), 1)
+        soft_zone = max(12, int(face_h * 0.25))
+
         force = removal_mask.copy().astype(np.float32)
         cutoff_y = int(np.clip(cutoff_y, 0, H - 1))
         force[:cutoff_y, :] = 0.0
+        soft_end = min(H - 1, cutoff_y + soft_zone)
+        if soft_end > cutoff_y:
+            ramp = np.ones((H,), dtype=np.float32)
+            ramp[:cutoff_y] = 0.0
+            ramp[cutoff_y:soft_end + 1] = np.linspace(
+                0.0, 1.0, soft_end - cutoff_y + 1, dtype=np.float32
+            )
+            force = force * ramp[:, np.newaxis]
 
         # 실제 남아있는 hair 픽셀과 교집합만 제거해 의상/배경 훼손 방지
         hair_now, _, _ = self._segface_hair_mask(img_rgb, face_bbox)
@@ -1535,7 +1564,7 @@ class MirrAISDPipeline:
             hair_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
             hair_now_u8 = cv2.dilate(hair_now_u8, hair_k, iterations=1)
 
-        force_u8 = ((force > 0.5).astype(np.uint8) * 255)
+        force_u8 = ((force > 0.60).astype(np.uint8) * 255)
         force_u8 = cv2.bitwise_and(force_u8, hair_now_u8)
         if shoulder_protect is not None and shoulder_protect.shape == (H, W):
             protect_u8 = (shoulder_protect > 0.22).astype(np.uint8) * 255
@@ -1554,6 +1583,7 @@ class MirrAISDPipeline:
 
         alpha = force_u8.astype(np.float32) / 255.0
         alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=4.0, sigmaY=4.0)[..., np.newaxis]
+        alpha = np.clip(alpha * 0.78, 0.0, 1.0)
         out = filled.astype(np.float32) * alpha + img_rgb.astype(np.float32) * (1.0 - alpha)
         return np.clip(out, 0, 255).astype(np.uint8)
 
