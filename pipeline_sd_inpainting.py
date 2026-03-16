@@ -34,7 +34,7 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -146,6 +146,7 @@ class SDInpaintResult:
     clip_score: float = 0.0 # CLIP 점수 (현재는 rank 순서, 향후 CLIP 랭킹 확장용)
     mask: Optional[np.ndarray] = None       # H×W float32 디버그용 마스크
     face_bbox: Optional[Tuple[int, int, int, int]] = None  # (x1, y1, x2, y2)
+    debug_images: Optional[Dict[str, np.ndarray]] = None    # 디버그용 중간 산출물 (BGR)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,6 +199,7 @@ class MirrAISDPipeline:
         hairstyle_text: str,
         color_text: str,
         top_k: int = 3,
+        return_intermediates: bool = False,
     ) -> List[SDInpaintResult]:
         """
         헤어 스타일 변환 실행.
@@ -207,6 +209,7 @@ class MirrAISDPipeline:
             hairstyle_text: 헤어스타일 텍스트 (트렌드 데이터 hairstyle_text)
             color_text:     헤어 컬러 텍스트 (트렌드 데이터 color_text)
             top_k:          반환 결과 수 (기본 3)
+            return_intermediates: 중간 산출물 디버그 이미지 포함 여부
 
         Returns:
             SDInpaintResult 리스트 (rank 0이 first)
@@ -223,6 +226,22 @@ class MirrAISDPipeline:
 
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         H, W = image.shape[:2]
+        debug_images_common: Optional[Dict[str, np.ndarray]] = {} if return_intermediates else None
+
+        def _store_mask(name: str, mask: np.ndarray) -> None:
+            if debug_images_common is None:
+                return
+            m = np.clip(mask, 0.0, 1.0)
+            m_u8 = (m * 255).astype(np.uint8)
+            debug_images_common[name] = cv2.cvtColor(m_u8, cv2.COLOR_GRAY2BGR)
+
+        def _store_rgb(name: str, rgb_img: np.ndarray) -> None:
+            if debug_images_common is None:
+                return
+            debug_images_common[name] = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+
+        if debug_images_common is not None:
+            debug_images_common["input_image"] = image.copy()
 
         # ── Step 1: 얼굴 검출 ────────────────────────────────────────────────
         face_obs = self._detect_face(img_rgb)
@@ -233,9 +252,13 @@ class MirrAISDPipeline:
         hand_mask = self._detect_hand_mask(img_rgb)
         if hand_mask.sum() > 0:
             logger.info(f"[SDPipeline] 손 보호 마스크 검출: pixels={hand_mask.sum():.0f}")
+        _store_mask("hand_mask", hand_mask)
 
         # ── Step 2: SegFace base hair mask + 얼굴 픽셀 마스크 + 옷 마스크 ──────
         hair_mask_base, face_region_mask, cloth_mask = self._segface_hair_mask(img_rgb, face_bbox)
+        _store_mask("segface_hair_mask", hair_mask_base)
+        _store_mask("face_region_mask", face_region_mask)
+        _store_mask("cloth_mask", cloth_mask)
 
         # ── Step 3: SAM2 refinement ───────────────────────────────────────────
         hair_mask, mask_source = self._refine_with_sam2(
@@ -245,6 +268,7 @@ class MirrAISDPipeline:
             f"[SDPipeline] hair mask source={mask_source}, "
             f"pixels={hair_mask.sum():.0f}"
         )
+        _store_mask("refined_hair_mask", hair_mask)
 
         if hair_mask.sum() < 300:
             raise ValueError("머리카락 영역이 너무 작습니다.")
@@ -258,6 +282,7 @@ class MirrAISDPipeline:
         # short/medium 긴머리 제거 단계에서는 "옷 위로 떨어진 머리카락"도 지워야 하므로
         # cloth 제거 전 마스크를 별도로 보관한다.
         hair_mask_for_removal = hair_mask.copy()
+        _store_mask("hair_mask_after_face_protect", hair_mask_for_removal)
         logger.info(
             f"[SDPipeline] 얼굴 픽셀 제거 완료, pixels={hair_mask.sum():.0f}"
         )
@@ -266,6 +291,8 @@ class MirrAISDPipeline:
         # expand 전에 먼저 제거해야 옷 영역이 마스크 확장에 영향받지 않음
         cloth_mask_dilated = self._dilate_mask(cloth_mask)
         hair_mask = np.clip(hair_mask - cloth_mask_dilated, 0.0, 1.0)
+        _store_mask("cloth_mask_dilated", cloth_mask_dilated)
+        _store_mask("hair_mask_after_cloth_protect", hair_mask)
         logger.info(
             f"[SDPipeline] 옷 픽셀 제거 완료, pixels={hair_mask.sum():.0f}"
         )
@@ -299,6 +326,7 @@ class MirrAISDPipeline:
                     "[SDPipeline] 어깨 보호 마스크 적용: "
                     f"pixels={shoulder_protect_for_post.sum():.0f}"
                 )
+            _store_mask("shoulder_protect_mask", shoulder_protect_for_post)
 
             # ── head box 계산 (removal_mask, gen_mask 양쪽에서 사용) ─────────────
             margin_x = int(face_w * 0.5)   # 얼굴 폭의 50% 여백 (양 옆 머리 공간)
@@ -371,6 +399,8 @@ class MirrAISDPipeline:
                     0.0,
                     1.0,
                 )
+            _store_mask("short_removal_mask", removal_mask)
+            _store_mask("short_generation_mask", gen_mask)
 
             logger.info(
                 f"[SDPipeline] 2단계 숏컷: removal_px={removal_mask.sum():.0f}, "
@@ -457,6 +487,7 @@ class MirrAISDPipeline:
                         f"[SDPipeline] cloth overlap 복원 적용: pixels={int((cloth_overlap > 0).sum())}"
                     )
                 logger.info("[SDPipeline] cv2.inpaint 2-way 블렌딩 완료")
+                _store_rgb("background_cleaned_rgb", img_rgb_cleaned)
 
                 if bg_mode == "sd":
                     # SD 보정 패스: 제거 영역의 배경/목/어깨 텍스처를 더 자연스럽게 정리
@@ -498,12 +529,24 @@ class MirrAISDPipeline:
             hair_mask_for_sd = hair_mask
             img_rgb_for_sd   = img_rgb
             img_rgb_cleaned  = img_rgb
+        _store_mask("sd_inpaint_mask", hair_mask_for_sd)
+        _store_rgb("sd_input_rgb", img_rgb_for_sd)
 
         # ── Step 4: SD 입력 준비 ─────────────────────────────────────────────
         img_pil = Image.fromarray(img_rgb_cleaned)
         img_512, mask_512, canny_512, scale, pad = self._prepare_sd_inputs(
             img_rgb_for_sd, hair_mask_for_sd
         )
+        if debug_images_common is not None:
+            debug_images_common["sd_input_512"] = cv2.cvtColor(
+                np.array(img_512), cv2.COLOR_RGB2BGR
+            )
+            debug_images_common["sd_mask_512"] = cv2.cvtColor(
+                np.array(mask_512).astype(np.uint8), cv2.COLOR_GRAY2BGR
+            )
+            debug_images_common["canny_512"] = cv2.cvtColor(
+                np.array(canny_512), cv2.COLOR_RGB2BGR
+            )
 
         # ── Step 5: 얼굴 crop (IP-Adapter) ───────────────────────────────────
         face_crop_pil = self._crop_face(img_pil, face_bbox)
@@ -530,6 +573,10 @@ class MirrAISDPipeline:
 
         results: List[SDInpaintResult] = []
         for rank, (gen_pil, seed) in enumerate(zip(gen_images, seeds)):
+            if debug_images_common is not None and rank == 0:
+                debug_images_common["generated_rank0_512"] = cv2.cvtColor(
+                    np.array(gen_pil), cv2.COLOR_RGB2BGR
+                )
             composited_bgr = self._composite(
                 composite_base_bgr, composite_base_rgb,
                 gen_pil, hair_mask_for_sd, scale, pad, (W, H),
@@ -573,6 +620,7 @@ class MirrAISDPipeline:
                 mask_used=mask_source,
                 mask=hair_mask,
                 face_bbox=face_bbox,
+                debug_images=debug_images_common if (debug_images_common is not None and rank == 0) else None,
             ))
 
         return results

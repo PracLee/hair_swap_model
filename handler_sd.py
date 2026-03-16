@@ -9,7 +9,8 @@ MirrAI SD Inpainting — RunPod Serverless Handler
     "hairstyle_text": "wolf cut, layered", // 헤어스타일 설명
     "color_text":     "auburn",            // 헤어 색상 (선택)
     "top_k":          3,                   // 결과 수 (1~5, 기본 3)
-    "return_base64":  true                 // true=base64, false=이미지 없이 메타만
+    "return_base64":  true,                // true=base64, false=이미지 없이 메타만
+    "return_intermediates": false          // true=중간 산출물(base64) 포함
   }
 }
 
@@ -25,6 +26,7 @@ MirrAI SD Inpainting — RunPod Serverless Handler
     },
     ...
   ],
+  "intermediates": { ... },   // return_intermediates=true 일 때
   "elapsed_seconds": 12.3
 }
 """
@@ -222,6 +224,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         color_text     = str(inp.get("color_text", "")).strip()
         top_k          = max(1, min(5, int(inp.get("top_k", 3))))
         return_base64  = _coerce_bool(inp.get("return_base64"), default=True)
+        return_intermediates = _coerce_bool(inp.get("return_intermediates"), default=False)
         bg_fill_mode   = str(inp.get("bg_fill_mode", "cv2")).strip()  # "cv2" | "sd"
 
         if not hairstyle_text and not color_text:
@@ -245,6 +248,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             hairstyle_text=hairstyle_text,
             color_text=color_text,
             top_k=top_k,
+            return_intermediates=return_intermediates,
         )
 
         # ── 결과 직렬화 ───────────────────────────────────────────────────────
@@ -280,13 +284,25 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
             output_results.append(item)
 
+        intermediates: Dict[str, str] = {}
+        if return_intermediates and results:
+            debug_images = results[0].debug_images or {}
+            for name, dbg_bgr in debug_images.items():
+                try:
+                    intermediates[name] = _image_to_base64(dbg_bgr, quality=90)
+                except Exception as e:
+                    logger.warning(f"[handler_sd] intermediate 직렬화 실패({name}): {e}")
+
         elapsed = time.time() - t0
         logger.info(f"[handler_sd] 완료: {elapsed:.1f}s, {len(results)}개 결과")
 
-        return {
+        response = {
             "results":         output_results,
             "elapsed_seconds": round(elapsed, 2),
         }
+        if intermediates:
+            response["intermediates"] = intermediates
+        return response
 
     except Exception as e:
         tb = traceback.format_exc()

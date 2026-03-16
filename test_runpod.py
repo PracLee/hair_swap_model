@@ -30,6 +30,7 @@ import base64
 import io
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -163,6 +164,31 @@ def save_results(output: dict, out_dir: Path) -> list[Path]:
     return saved
 
 
+def save_intermediates(output: dict, out_dir: Path) -> list[Path]:
+    """top-level intermediates(base64 dict) 저장"""
+    intermediates = output.get("intermediates") or {}
+    if not isinstance(intermediates, dict) or not intermediates:
+        return []
+
+    saved: list[Path] = []
+    for key, b64 in intermediates.items():
+        if not b64:
+            continue
+        try:
+            img_bytes = base64.b64decode(b64)
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        except Exception as e:
+            print(f"[warn] intermediate decode 실패: {key} ({e})")
+            continue
+
+        safe_key = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(key)).strip("_") or "unknown"
+        out_path = out_dir / f"intermediate_{safe_key}.jpg"
+        img.save(out_path, format="JPEG", quality=92)
+        print(f"[save]   intermediate → {out_path.name}")
+        saved.append(out_path)
+    return saved
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -194,6 +220,8 @@ def main():
     # 기타
     parser.add_argument("--no-base64",    action="store_true",
                         help="이미지 base64 응답 비활성화 (메타정보만)")
+    parser.add_argument("--return-intermediates", action="store_true",
+                        help="중간 산출물(base64)을 함께 요청/저장")
     parser.add_argument("--health-check", action="store_true",
                         help="헬스체크만 실행 (이미지 불필요)")
     parser.add_argument("--output-dir",   type=Path, default=PROJECT_ROOT,
@@ -218,6 +246,7 @@ def main():
             "color_text":     args.color,
             "top_k":          args.top_k,
             "return_base64":  not args.no_base64,
+            "return_intermediates": args.return_intermediates,
             "bg_fill_mode":   args.bg_fill,
         }
 
@@ -238,6 +267,7 @@ def main():
         print(f"Color    : {args.color}")
         print(f"Top-K    : {args.top_k}")
         print(f"BG Fill  : {args.bg_fill}")
+        print(f"Intermed : {'on' if args.return_intermediates else 'off'}")
     print(f"{'='*60}\n")
 
     # ── 1. Job 제출 ────────────────────────────────────────────────────────────
@@ -268,11 +298,16 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     saved = save_results(output, args.output_dir)
+    saved_intermediates = save_intermediates(output, args.output_dir)
 
     if saved:
         print(f"\n✅  {len(saved)}개 이미지 저장 완료")
         for p in saved:
             print(f"   {p}")
+        if saved_intermediates:
+            print(f"\n✅  중간 산출물 {len(saved_intermediates)}개 저장 완료")
+            for p in saved_intermediates:
+                print(f"   {p}")
     else:
         print("\n⚠️  저장된 이미지 없음")
         print(json.dumps(output, indent=2, ensure_ascii=False)[:2000])
