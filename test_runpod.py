@@ -188,8 +188,8 @@ def main():
                         help="헤어 컬러 텍스트 (기본: 'ash brown')")
     parser.add_argument("--top-k",     default=3, type=int,
                         help="결과 수 (기본: 3, 최대: 5)")
-    parser.add_argument("--bg-fill",   default="cv2", choices=["cv2", "sd"],
-                        help="단발 변환 시 배경 채우기 방법: cv2=빠름(기본), sd=품질높음(2배시간)")
+    parser.add_argument("--bg-fill",   default="sd", choices=["cv2", "sd"],
+                        help="단발 변환 시 배경 채우기 방법: sd=품질우선(기본), cv2=빠름")
 
     # 기타
     parser.add_argument("--no-base64",    action="store_true",
@@ -237,6 +237,7 @@ def main():
         print(f"Hairstyle: {args.hairstyle}")
         print(f"Color    : {args.color}")
         print(f"Top-K    : {args.top_k}")
+        print(f"BG Fill  : {args.bg_fill}")
     print(f"{'='*60}\n")
 
     # ── 1. Job 제출 ────────────────────────────────────────────────────────────
