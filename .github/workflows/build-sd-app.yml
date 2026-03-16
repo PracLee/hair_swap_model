@@ -15,7 +15,6 @@ on:
       - "models/__init__.py"
       - "models/face_parsing/**"
       - "models/segface/**"
-      - "pretrained_models/seg.pth"
       - "data/**"
       - ".dockerignore"
       - ".github/workflows/build-sd-app.yml"

@@ -1,7 +1,6 @@
 # ── 모델 파일 ──────────────────────────────────────────────────────────────
-# pretrained_models는 seg.pth만 포함 (나머지는 컨텍스트 제외)
+# pretrained_models는 컨텍스트에서 제외 (seg.pth는 런타임 다운로드)
 pretrained_models/*
-!pretrained_models/seg.pth
 
 # ── 런타임 산출물 ───────────────────────────────────────────────────────────
 output/
