@@ -380,13 +380,39 @@ class MirrAISDPipeline:
                 )
                 img_rgb_filled = cv2.addWeighted(img_rgb_ns, 0.25, img_rgb_telea, 0.75, 0.0)
 
-                # soft-blend는 core mask 기준으로만 feather → 사다리꼴 번짐 방지
-                soft_alpha = removal_u8.astype(np.float32) / 255.0
-                soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=3.2)[..., np.newaxis]
-                img_rgb_cleaned = (
-                    img_rgb_filled.astype(np.float32) * soft_alpha
-                    + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
-                ).clip(0, 255).astype(np.uint8)
+                # 작은/중간 영역은 seamlessClone으로 경계 접합을 자연스럽게 처리
+                # (큰 영역에서는 오히려 왜곡이 생길 수 있어 alpha blend로 폴백)
+                removal_px = int((removal_u8 > 0).sum())
+                max_clone_px = int(H * W * 0.18)
+                if 50 <= removal_px <= max_clone_px:
+                    ys, xs = np.where(removal_u8 > 0)
+                    c_x = int((xs.min() + xs.max()) * 0.5)
+                    c_y = int((ys.min() + ys.max()) * 0.5)
+                    src_bgr = cv2.cvtColor(img_rgb_filled, cv2.COLOR_RGB2BGR)
+                    dst_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                    try:
+                        cloned_bgr = cv2.seamlessClone(
+                            src_bgr, dst_bgr, removal_u8, (c_x, c_y), cv2.NORMAL_CLONE
+                        )
+                        img_rgb_cleaned = cv2.cvtColor(cloned_bgr, cv2.COLOR_BGR2RGB)
+                    except Exception:
+                        # fallback: alpha blend
+                        soft_alpha = removal_u8.astype(np.float32) / 255.0
+                        soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=1.2)[..., np.newaxis]
+                        soft_alpha = np.clip((soft_alpha - 0.28) / 0.72, 0.0, 1.0)
+                        img_rgb_cleaned = (
+                            img_rgb_filled.astype(np.float32) * soft_alpha
+                            + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
+                        ).clip(0, 255).astype(np.uint8)
+                else:
+                    # soft-blend는 core mask 기준으로만 feather → 사다리꼴 번짐 방지
+                    soft_alpha = removal_u8.astype(np.float32) / 255.0
+                    soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=1.2)[..., np.newaxis]
+                    soft_alpha = np.clip((soft_alpha - 0.28) / 0.72, 0.0, 1.0)
+                    img_rgb_cleaned = (
+                        img_rgb_filled.astype(np.float32) * soft_alpha
+                        + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
+                    ).clip(0, 255).astype(np.uint8)
                 logger.info("[SDPipeline] cv2.inpaint 2-way 블렌딩 완료")
 
                 if bg_mode == "sd":
