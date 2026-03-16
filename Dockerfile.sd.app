@@ -12,7 +12,7 @@ FROM ${BASE_IMAGE} AS runtime
 WORKDIR /app
 
 # SD 앱 코드만 복사
-COPY entrypoint_sd.sh          entrypoint.sh
+COPY --chmod=755 entrypoint_sd.sh entrypoint.sh
 COPY handler_sd.py             ./
 COPY pipeline_sd_inpainting.py ./
 COPY runtime_download.py       ./
@@ -21,14 +21,6 @@ COPY models/__init__.py        models/__init__.py
 COPY models/face_parsing/      models/face_parsing/
 COPY models/segface/           models/segface/
 COPY data/                     data/
-
-# 선택적 startup git pull을 위한 최소 git metadata
-RUN git init && \
-    git remote add origin https://github.com/PracLee/hair_swap_model.git && \
-    git config --global --add safe.directory /app
-
-RUN chmod +x entrypoint.sh && \
-    mkdir -p /app/output/runpod_inputs
 
 ENV PYTHONPATH=/app \
     PYTHONDONTWRITEBYTECODE=1 \
