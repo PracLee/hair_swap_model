@@ -277,6 +277,7 @@ class MirrAISDPipeline:
         #        ② 제거된 이미지 위에 SD로 새 숏컷 생성 (머리 없는 주변 맥락)
         cutoff_y_for_post: Optional[int] = None
         removal_mask_for_post: Optional[np.ndarray] = None
+        shoulder_protect_for_post: Optional[np.ndarray] = None
         if hair_length in ("short", "medium"):
             x1f, y1f, x2f, y2f = face_bbox
             face_w = max(x2f - x1f, 1)
@@ -288,6 +289,16 @@ class MirrAISDPipeline:
                 cutoff_y = int(y2f + face_h * 0.60)   # 어깨 위
             cutoff_y = min(cutoff_y, H - 1)
             cutoff_y_for_post = cutoff_y
+            shoulder_protect_for_post = self._build_shoulder_protect_mask(
+                cloth_mask=cloth_mask_dilated,
+                face_bbox=face_bbox,
+                cutoff_y=cutoff_y,
+            )
+            if shoulder_protect_for_post.sum() > 0:
+                logger.info(
+                    "[SDPipeline] 어깨 보호 마스크 적용: "
+                    f"pixels={shoulder_protect_for_post.sum():.0f}"
+                )
 
             # ── head box 계산 (removal_mask, gen_mask 양쪽에서 사용) ─────────────
             margin_x = int(face_w * 0.5)   # 얼굴 폭의 50% 여백 (양 옆 머리 공간)
@@ -353,6 +364,13 @@ class MirrAISDPipeline:
 
             # 제거 단계에서도 손/소품은 보호
             removal_mask = np.clip(removal_mask - hand_mask, 0.0, 1.0)
+            # 어깨 윤곽(옷 상단 경계)은 과도하게 지우지 않도록 보호
+            if shoulder_protect_for_post is not None:
+                removal_mask = np.clip(
+                    removal_mask - shoulder_protect_for_post * 0.85,
+                    0.0,
+                    1.0,
+                )
 
             logger.info(
                 f"[SDPipeline] 2단계 숏컷: removal_px={removal_mask.sum():.0f}, "
@@ -413,6 +431,31 @@ class MirrAISDPipeline:
                         img_rgb_filled.astype(np.float32) * soft_alpha
                         + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
                     ).clip(0, 255).astype(np.uint8)
+
+                # 옷(어깨/상체)과 겹친 제거 영역은 별도 복원해서
+                # 반투명 얼룩/패치가 남는 문제를 완화한다.
+                cloth_u8 = (cloth_mask_dilated > 0.45).astype(np.uint8) * 255
+                cloth_overlap = cv2.bitwise_and(removal_u8, cloth_u8)
+                protect_u8 = (((face_region_mask + hand_mask) > 0.2).astype(np.uint8) * 255)
+                cloth_overlap = cv2.bitwise_and(cloth_overlap, cv2.bitwise_not(protect_u8))
+                if int((cloth_overlap > 0).sum()) >= 80:
+                    cloth_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                    cloth_overlap = cv2.dilate(cloth_overlap, cloth_k, iterations=1)
+                    cloth_ns = cv2.inpaint(img_rgb, cloth_overlap, inpaintRadius=4, flags=cv2.INPAINT_NS)
+                    cloth_te = cv2.inpaint(img_rgb, cloth_overlap, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+                    cloth_refill = cv2.addWeighted(cloth_ns, 0.40, cloth_te, 0.60, 0.0)
+                    cloth_alpha = cloth_overlap.astype(np.float32) / 255.0
+                    cloth_alpha = cv2.GaussianBlur(
+                        cloth_alpha, (0, 0), sigmaX=2.2, sigmaY=2.2
+                    )[..., np.newaxis]
+                    cloth_alpha = np.clip(cloth_alpha * 0.92, 0.0, 1.0)
+                    img_rgb_cleaned = (
+                        cloth_refill.astype(np.float32) * cloth_alpha
+                        + img_rgb_cleaned.astype(np.float32) * (1.0 - cloth_alpha)
+                    ).clip(0, 255).astype(np.uint8)
+                    logger.info(
+                        f"[SDPipeline] cloth overlap 복원 적용: pixels={int((cloth_overlap > 0).sum())}"
+                    )
                 logger.info("[SDPipeline] cv2.inpaint 2-way 블렌딩 완료")
 
                 if bg_mode == "sd":
@@ -439,6 +482,7 @@ class MirrAISDPipeline:
                         img_rgb=img_rgb_cleaned,
                         face_bbox=face_bbox,
                         cutoff_y=cutoff_y,
+                        shoulder_protect=shoulder_protect_for_post,
                     )
                 except Exception as e:
                     logger.warning(f"[SDPipeline] residual hair 정리 실패(무시): {e}")
@@ -500,6 +544,7 @@ class MirrAISDPipeline:
                         img_rgb=post_rgb,
                         face_bbox=face_bbox,
                         cutoff_y=cutoff_y_for_post,
+                        shoulder_protect=shoulder_protect_for_post,
                     )
                     composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
                 except Exception as e:
@@ -514,6 +559,7 @@ class MirrAISDPipeline:
                         face_bbox=face_bbox,
                         removal_mask=removal_mask_for_post,
                         cutoff_y=cutoff_y_for_post,
+                        shoulder_protect=shoulder_protect_for_post,
                     )
                     composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
                 except Exception as e:
@@ -1353,11 +1399,74 @@ class MirrAISDPipeline:
         )
         return np.clip(refined, 0, 255).astype(np.uint8)
 
+    def _build_shoulder_protect_mask(
+        self,
+        cloth_mask: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        cutoff_y: int,
+    ) -> np.ndarray:
+        """
+        어깨선(옷 상단 경계) 보호 마스크 생성.
+        short/medium 후처리에서 어깨 라인 훼손을 줄이기 위해 사용한다.
+        """
+        H, W = cloth_mask.shape[:2]
+        if cloth_mask.shape != (H, W):
+            return np.zeros((H, W), dtype=np.float32)
+
+        x1, y1, x2, y2 = face_bbox
+        face_w = max(int(x2 - x1), 1)
+        face_h = max(int(y2 - y1), 1)
+        cx = int(0.5 * (x1 + x2))
+
+        cloth_u8 = (cloth_mask > 0.35).astype(np.uint8) * 255
+        if int((cloth_u8 > 0).sum()) < 40:
+            return np.zeros((H, W), dtype=np.float32)
+
+        y_start = max(0, int(cutoff_y - face_h * 0.08))
+        y_end = min(H, int(cutoff_y + face_h * 1.05))
+        band = np.zeros((H, W), dtype=np.uint8)
+        band[y_start:y_end, :] = cloth_u8[y_start:y_end, :]
+        if int((band > 0).sum()) < 20:
+            return np.zeros((H, W), dtype=np.float32)
+
+        edge_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        edge = cv2.morphologyEx(band, cv2.MORPH_GRADIENT, edge_k)
+        edge = cv2.dilate(
+            edge,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+            iterations=1,
+        )
+
+        x_min = max(0, int(x1 - face_w * 1.30))
+        x_max = min(W, int(x2 + face_w * 1.30))
+        if x_min >= x_max:
+            return np.zeros((H, W), dtype=np.float32)
+
+        corridor = np.zeros((H, W), dtype=np.uint8)
+        corridor[:, x_min:x_max] = 255
+        edge = cv2.bitwise_and(edge, corridor)
+
+        center_half = max(18, int(face_w * 0.45))
+        center_zone = np.zeros((H, W), dtype=np.uint8)
+        center_zone[:, max(0, cx - center_half):min(W, cx + center_half)] = 255
+        side_edge = cv2.bitwise_and(edge, cv2.bitwise_not(center_zone))
+        if int((side_edge > 0).sum()) < 20:
+            return np.zeros((H, W), dtype=np.float32)
+
+        side_edge = cv2.GaussianBlur(
+            side_edge.astype(np.float32) / 255.0,
+            (0, 0),
+            sigmaX=3.0,
+            sigmaY=3.0,
+        )
+        return np.clip(side_edge, 0.0, 1.0).astype(np.float32)
+
     def _remove_residual_hair_below_cutoff(
         self,
         img_rgb: np.ndarray,
         face_bbox: Tuple[int, int, int, int],
         cutoff_y: int,
+        shoulder_protect: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         short/medium 변환 후 cutoff 아래에 남은 머리카락을 재검출해 정리.
@@ -1373,6 +1482,11 @@ class MirrAISDPipeline:
         residual_u8 = (residual > 0.5).astype(np.uint8) * 255
         open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         residual_u8 = cv2.morphologyEx(residual_u8, cv2.MORPH_OPEN, open_k)
+
+        if shoulder_protect is not None and shoulder_protect.shape == (H, W):
+            protect_u8 = (shoulder_protect > 0.22).astype(np.uint8) * 255
+            if int((protect_u8 > 0).sum()) > 0:
+                residual_u8 = cv2.bitwise_and(residual_u8, cv2.bitwise_not(protect_u8))
 
         if int((residual_u8 > 0).sum()) < 60:
             return img_rgb
@@ -1400,6 +1514,7 @@ class MirrAISDPipeline:
         face_bbox: Tuple[int, int, int, int],
         removal_mask: np.ndarray,
         cutoff_y: int,
+        shoulder_protect: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         최종 결과에서 cutoff 아래 long-hair 제거 마스크 영역을 한 번 더 정리.
@@ -1422,6 +1537,10 @@ class MirrAISDPipeline:
 
         force_u8 = ((force > 0.5).astype(np.uint8) * 255)
         force_u8 = cv2.bitwise_and(force_u8, hair_now_u8)
+        if shoulder_protect is not None and shoulder_protect.shape == (H, W):
+            protect_u8 = (shoulder_protect > 0.22).astype(np.uint8) * 255
+            if int((protect_u8 > 0).sum()) > 0:
+                force_u8 = cv2.bitwise_and(force_u8, cv2.bitwise_not(protect_u8))
 
         if int((force_u8 > 0).sum()) < 40:
             return img_rgb
