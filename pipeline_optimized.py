@@ -1601,9 +1601,11 @@ class MirrAIOptimizedPipeline:
             cv2.MORPH_ELLIPSE, (max(3, kernel // 3), max(3, kernel // 3))
         )
         alpha_mask = cv2.dilate(alpha_mask, small_dilate, iterations=1)
-        # Smooth edges
-        sigma = max(1.5, kernel / 2.5)
+        # Smooth edges - sigma를 작게 유지해서 비헤어 영역(가슴 등)으로 bleeding 방지
+        sigma = max(1.5, kernel / 6.0)
         alpha_mask = cv2.GaussianBlur(alpha_mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        # 매우 낮은 alpha 값 제거: 헤어 경계 밖의 ghosting/blur bleeding 차단
+        alpha_mask = np.where(alpha_mask > 0.15, alpha_mask, 0.0)
         return np.clip(alpha_mask, 0.0, 1.0)
 
     def _color_match_hair(
