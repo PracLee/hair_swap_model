@@ -27,6 +27,7 @@ RunPod Serverless 테스트 스크립트 — SD Inpainting 파이프라인
 
 import argparse
 import base64
+import csv
 import io
 import json
 import os
@@ -209,6 +210,43 @@ def save_intermediates(output: dict, out_dir: Path) -> list[Path]:
     return saved
 
 
+def save_intermediate_data(output: dict, out_dir: Path) -> list[Path]:
+    """
+    top-level intermediate_data(JSON) 저장.
+    - intermediate_data.json
+    - (있으면) mediapipe_face_mesh 랜드마크 CSV
+    """
+    payload = output.get("intermediate_data")
+    if not isinstance(payload, dict) or not payload:
+        return []
+
+    saved: list[Path] = []
+
+    json_path = out_dir / "intermediate_data.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"[save]   intermediate_data → {json_path.name}")
+    saved.append(json_path)
+
+    mesh = payload.get("mediapipe_face_mesh")
+    if isinstance(mesh, dict):
+        lms_norm = mesh.get("landmarks_norm")
+        lms_px = mesh.get("landmarks_px")
+        if isinstance(lms_norm, list) and isinstance(lms_px, list) and len(lms_norm) == len(lms_px):
+            csv_path = out_dir / "intermediate_mediapipe_face_mesh_landmarks.csv"
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["index", "x_norm", "y_norm", "z_norm", "x_px", "y_px"])
+                for idx, (n, p) in enumerate(zip(lms_norm, lms_px)):
+                    if not isinstance(n, list) or len(n) < 3 or not isinstance(p, list) or len(p) < 2:
+                        continue
+                    writer.writerow([idx, n[0], n[1], n[2], p[0], p[1]])
+            print(f"[save]   intermediate_data → {csv_path.name}")
+            saved.append(csv_path)
+
+    return saved
+
+
 def normalize_intermediate_key(key: str, mask_used: str = "pipeline") -> str:
     norm = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(key)).strip("_").lower()
     norm = norm.replace(".", "_").replace("-", "_")
@@ -332,6 +370,7 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     saved = save_results(output, args.output_dir)
     saved_intermediates = save_intermediates(output, args.output_dir)
+    saved_intermediate_data = save_intermediate_data(output, args.output_dir)
 
     if saved:
         print(f"\n✅  {len(saved)}개 이미지 저장 완료")
@@ -340,6 +379,10 @@ def main():
         if saved_intermediates:
             print(f"\n✅  중간 산출물 {len(saved_intermediates)}개 저장 완료")
             for p in saved_intermediates:
+                print(f"   {p}")
+        if saved_intermediate_data:
+            print(f"\n✅  분석 데이터 {len(saved_intermediate_data)}개 저장 완료")
+            for p in saved_intermediate_data:
                 print(f"   {p}")
     else:
         print("\n⚠️  저장된 이미지 없음")

@@ -285,6 +285,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             output_results.append(item)
 
         intermediates: Dict[str, str] = {}
+        intermediate_data: Dict[str, Any] = {}
         if return_intermediates and results:
             debug_images = results[0].debug_images or {}
             for name, dbg_bgr in debug_images.items():
@@ -292,6 +293,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     intermediates[name] = _image_to_base64(dbg_bgr, quality=90)
                 except Exception as e:
                     logger.warning(f"[handler_sd] intermediate 직렬화 실패({name}): {e}")
+            debug_data = results[0].debug_data or {}
+            if isinstance(debug_data, dict) and debug_data:
+                intermediate_data = debug_data
 
         elapsed = time.time() - t0
         logger.info(f"[handler_sd] 완료: {elapsed:.1f}s, {len(results)}개 결과")
@@ -302,6 +306,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         }
         if intermediates:
             response["intermediates"] = intermediates
+        if intermediate_data:
+            response["intermediate_data"] = intermediate_data
         return response
 
     except Exception as e:

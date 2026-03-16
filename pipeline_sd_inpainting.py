@@ -34,7 +34,7 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -148,6 +148,7 @@ class SDInpaintResult:
     mask: Optional[np.ndarray] = None       # H×W float32 디버그용 마스크
     face_bbox: Optional[Tuple[int, int, int, int]] = None  # (x1, y1, x2, y2)
     debug_images: Optional[Dict[str, np.ndarray]] = None    # 디버그용 중간 산출물 (BGR)
+    debug_data: Optional[Dict[str, Any]] = None             # 디버그용 중간 메타데이터(JSON)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,6 +176,7 @@ class MirrAISDPipeline:
         self._sam2_factory = None  # SAM2 predictor factory (callable)
         self._sd_pipe    = None   # StableDiffusionControlNetInpaintPipeline
         self._mp_face    = None   # MediaPipe FaceDetection
+        self._mp_face_mesh = None # MediaPipe FaceMesh
         self._mp_hands   = None   # MediaPipe Hands
         self._loaded     = False
 
@@ -228,6 +230,7 @@ class MirrAISDPipeline:
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         H, W = image.shape[:2]
         debug_images_common: Optional[Dict[str, np.ndarray]] = {} if return_intermediates else None
+        debug_data_common: Optional[Dict[str, Any]] = {} if return_intermediates else None
 
         def _store_mask(name: str, mask: np.ndarray) -> None:
             if debug_images_common is None:
@@ -250,6 +253,18 @@ class MirrAISDPipeline:
             raise ValueError("얼굴을 검출할 수 없습니다.")
         face_bbox = face_obs  # (x1, y1, x2, y2)
         logger.info(f"[SDPipeline] 얼굴 검출: {face_bbox}")
+        mesh_norm, mesh_px = self._detect_face_mesh(img_rgb)
+        if mesh_norm is not None and mesh_px is not None:
+            logger.info(f"[SDPipeline] FaceMesh 검출: landmarks={len(mesh_norm)}")
+            if debug_images_common is not None:
+                mesh_images = self._render_face_mesh_debug_images(img_rgb, mesh_px)
+                debug_images_common.update(mesh_images)
+            if debug_data_common is not None:
+                debug_data_common["mediapipe_face_mesh"] = self._build_face_mesh_analysis(
+                    mesh_norm, mesh_px
+                )
+        elif debug_data_common is not None:
+            debug_data_common["mediapipe_face_mesh"] = {"detected": False}
         hand_mask = self._detect_hand_mask(img_rgb)
         if hand_mask.sum() > 0:
             logger.info(f"[SDPipeline] 손 보호 마스크 검출: pixels={hand_mask.sum():.0f}")
@@ -622,6 +637,7 @@ class MirrAISDPipeline:
                 mask=hair_mask,
                 face_bbox=face_bbox,
                 debug_images=debug_images_common if (debug_images_common is not None and rank == 0) else None,
+                debug_data=debug_data_common if (debug_data_common is not None and rank == 0) else None,
             ))
 
         return results
@@ -675,12 +691,18 @@ class MirrAISDPipeline:
         self._mp_face = mp.solutions.face_detection.FaceDetection(
             model_selection=1, min_detection_confidence=0.5
         )
+        self._mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+        )
         self._mp_hands = mp.solutions.hands.Hands(
             static_image_mode=True,
             max_num_hands=2,
             min_detection_confidence=0.5,
         )
-        logger.info("[SDPipeline] MediaPipe FaceDetection 로드 완료")
+        logger.info("[SDPipeline] MediaPipe FaceDetection/FaceMesh/Hands 로드 완료")
 
     def _load_sd_pipeline(self) -> None:
         from diffusers import (
@@ -811,6 +833,164 @@ class MirrAISDPipeline:
             hand_mask = np.clip(hand_mask, 0.0, 1.0).astype(np.float32)
 
         return hand_mask
+
+    def _detect_face_mesh(
+        self, img_rgb: np.ndarray
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        MediaPipe FaceMesh 랜드마크 검출.
+
+        Returns:
+            landmarks_norm: (N, 3) float32, normalized [0,1] 좌표
+            landmarks_px:   (N, 2) int32, 원본 픽셀 좌표
+        """
+        H, W = img_rgb.shape[:2]
+        if self._mp_face_mesh is None:
+            return None, None
+
+        result = self._mp_face_mesh.process(img_rgb)
+        if not result.multi_face_landmarks:
+            return None, None
+
+        lms = result.multi_face_landmarks[0].landmark
+        if not lms:
+            return None, None
+
+        landmarks_norm = np.asarray([[lm.x, lm.y, lm.z] for lm in lms], dtype=np.float32)
+        xs = np.clip(np.round(landmarks_norm[:, 0] * W), 0, W - 1).astype(np.int32)
+        ys = np.clip(np.round(landmarks_norm[:, 1] * H), 0, H - 1).astype(np.int32)
+        landmarks_px = np.stack([xs, ys], axis=1)
+        return landmarks_norm, landmarks_px
+
+    @staticmethod
+    def _build_face_mesh_analysis(
+        landmarks_norm: np.ndarray,
+        landmarks_px: np.ndarray,
+    ) -> Dict[str, Any]:
+        """
+        얼굴형 분석용 FaceMesh 메타데이터 생성.
+        """
+        n = int(landmarks_norm.shape[0])
+
+        def _safe_dist(i: int, j: int) -> Optional[float]:
+            if i >= n or j >= n:
+                return None
+            p = landmarks_px[i].astype(np.float32)
+            q = landmarks_px[j].astype(np.float32)
+            return float(np.linalg.norm(p - q))
+
+        face_height = _safe_dist(10, 152)    # forehead(top) ~ chin
+        cheekbone_width = _safe_dist(234, 454)
+        jaw_width = _safe_dist(172, 397)
+        temple_width = _safe_dist(127, 356)
+
+        ratios: Dict[str, Optional[float]] = {
+            "cheekbone_to_height": None,
+            "jaw_to_height": None,
+            "temple_to_height": None,
+            "jaw_to_cheekbone": None,
+        }
+        if face_height and face_height > 1e-6:
+            if cheekbone_width is not None:
+                ratios["cheekbone_to_height"] = cheekbone_width / face_height
+            if jaw_width is not None:
+                ratios["jaw_to_height"] = jaw_width / face_height
+            if temple_width is not None:
+                ratios["temple_to_height"] = temple_width / face_height
+        if cheekbone_width and cheekbone_width > 1e-6 and jaw_width is not None:
+            ratios["jaw_to_cheekbone"] = jaw_width / cheekbone_width
+
+        keypoints: Dict[str, Any] = {}
+        keypoint_map = {
+            "forehead_top": 10,
+            "chin": 152,
+            "left_cheekbone": 234,
+            "right_cheekbone": 454,
+            "left_jaw": 172,
+            "right_jaw": 397,
+            "left_temple": 127,
+            "right_temple": 356,
+        }
+        for name, idx in keypoint_map.items():
+            if idx < n:
+                keypoints[name] = {
+                    "index": idx,
+                    "norm": [
+                        float(landmarks_norm[idx, 0]),
+                        float(landmarks_norm[idx, 1]),
+                        float(landmarks_norm[idx, 2]),
+                    ],
+                    "px": [int(landmarks_px[idx, 0]), int(landmarks_px[idx, 1])],
+                }
+
+        return {
+            "landmarks_count": n,
+            "landmarks_norm": landmarks_norm.astype(float).round(6).tolist(),
+            "landmarks_px": landmarks_px.astype(int).tolist(),
+            "metrics_px": {
+                "face_height": face_height,
+                "cheekbone_width": cheekbone_width,
+                "jaw_width": jaw_width,
+                "temple_width": temple_width,
+            },
+            "ratios": ratios,
+            "keypoints": keypoints,
+        }
+
+    def _render_face_mesh_debug_images(
+        self,
+        img_rgb: np.ndarray,
+        landmarks_px: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
+        """
+        FaceMesh 디버그 이미지 생성 (BGR).
+        """
+        import mediapipe as mp
+
+        H, W = img_rgb.shape[:2]
+        base_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        points_bgr = base_bgr.copy()
+        tess_bgr = base_bgr.copy()
+        contour_bgr = base_bgr.copy()
+
+        # points
+        for x, y in landmarks_px:
+            cv2.circle(points_bgr, (int(x), int(y)), 1, (0, 255, 0), thickness=-1, lineType=cv2.LINE_AA)
+
+        # tessellation
+        for a, b in mp.solutions.face_mesh.FACEMESH_TESSELATION:
+            if a >= len(landmarks_px) or b >= len(landmarks_px):
+                continue
+            p1 = tuple(int(v) for v in landmarks_px[a])
+            p2 = tuple(int(v) for v in landmarks_px[b])
+            cv2.line(tess_bgr, p1, p2, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # contours
+        for a, b in mp.solutions.face_mesh.FACEMESH_CONTOURS:
+            if a >= len(landmarks_px) or b >= len(landmarks_px):
+                continue
+            p1 = tuple(int(v) for v in landmarks_px[a])
+            p2 = tuple(int(v) for v in landmarks_px[b])
+            cv2.line(contour_bgr, p1, p2, (255, 255, 0), 1, cv2.LINE_AA)
+
+        # face oval mask
+        oval_idxs = sorted(
+            {i for edge in mp.solutions.face_mesh.FACEMESH_FACE_OVAL for i in edge}
+        )
+        oval_mask = np.zeros((H, W), dtype=np.uint8)
+        if oval_idxs:
+            pts = np.asarray([landmarks_px[i] for i in oval_idxs if i < len(landmarks_px)], dtype=np.int32)
+            if len(pts) >= 3:
+                hull = cv2.convexHull(pts.reshape(-1, 1, 2))
+                cv2.fillConvexPoly(oval_mask, hull, 255)
+        oval_mask_bgr = cv2.cvtColor(oval_mask, cv2.COLOR_GRAY2BGR)
+
+        return {
+            "mediapipe_face_mesh_points": points_bgr,
+            "mediapipe_face_mesh_tessellation": tess_bgr,
+            "mediapipe_face_mesh_contours": contour_bgr,
+            "mediapipe_face_mesh_oval_mask": oval_mask_bgr,
+        }
 
     def _segface_hair_mask(self, img_rgb: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -1705,9 +1885,12 @@ class MirrAISDPipeline:
         self._sam2_factory = None
         if self._mp_face:
             self._mp_face.close()
+        if self._mp_face_mesh:
+            self._mp_face_mesh.close()
         if self._mp_hands:
             self._mp_hands.close()
         self._mp_face = None
+        self._mp_face_mesh = None
         self._mp_hands = None
         self._loaded = False
         gc.collect()
