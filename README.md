@@ -47,14 +47,14 @@ bash install_requirements.sh
 ### 1. 스타일 추천만 실행
 이미지를 분석하여 어울리는 헤어스타일 목록과 이유를 출력합니다.
 ```bash
-python pipeline_optimized.py --image images/1231.jpg --text "trendy" --recommend-only
+python pipeline_optimized.py --image images/1234.jpeg --text "trendy" --recommend-only
 ```
 
 ### 2. 스타일 생성 (기본)
 추천된 스타일 중 상위 1개를 생성합니다. (`--trend-limit`으로 개수 조절)
 ```bash
 python pipeline_optimized.py \
-  --image images/1231.jpg \
+  --image images/1234.jpeg \
   --text "trendy" \
   --trend-limit 1 \
   --output-dir output/
@@ -67,7 +67,7 @@ python pipeline_optimized.py \
 
 ```bash
 # 별도 옵션 없이도 정밀 마스킹이 적용됩니다. (JSON 결과에서 source: "birefnet" 확인)
-python pipeline_optimized.py --image images/1231.jpg --text "chic style" --output-dir output/
+python pipeline_optimized.py --image images/1234.jpeg --text "chic style" --output-dir output/
 ```
 
 ### 4. 마스킹 단독 테스트 및 디버깅

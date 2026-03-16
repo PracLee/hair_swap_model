@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import time
+from urllib.parse import unquote, urlparse
 from pathlib import Path
 
 import requests
@@ -46,6 +47,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 RUNPOD_BASE_URL   = "https://api.runpod.ai/v2"
 POLL_INTERVAL_SEC = 5
 TIMEOUT_SEC       = 1200  # 20분: cold start 시 모델 다운로드(SD+ControlNet+IP-Adapter) 포함
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 
 INTERMEDIATE_KEY_ALIASES = {
     # legacy keys -> standardized keys
@@ -131,7 +133,33 @@ def image_to_base64(path: Path) -> str:
         return base64.b64encode(f.read()).decode("utf-8")
 
 
-def save_results(output: dict, out_dir: Path) -> list[Path]:
+def sanitize_filename_token(text: str) -> str:
+    token = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(text)).strip("._-")
+    token = token.replace(".", "_")
+    token = re.sub(r"_+", "_", token).strip("_")
+    return token.lower()
+
+
+def infer_filename_prefix(image_path: Path | None, image_url: str | None) -> str:
+    if image_path:
+        return sanitize_filename_token(image_path.stem) or "input"
+
+    if image_url:
+        parsed = urlparse(image_url)
+        name = Path(unquote(parsed.path)).name
+        if name:
+            return sanitize_filename_token(Path(name).stem) or "input"
+    return "input"
+
+
+def prefixed_name(prefix: str, base_name: str) -> str:
+    clean_prefix = sanitize_filename_token(prefix)
+    if not clean_prefix:
+        return base_name
+    return f"{clean_prefix}_{base_name}"
+
+
+def save_results(output: dict, out_dir: Path, file_prefix: str) -> list[Path]:
     """결과 배열에서 image_base64 추출 → JPG 저장"""
     results = output.get("results", [])
     if not results:
@@ -154,7 +182,7 @@ def save_results(output: dict, out_dir: Path) -> list[Path]:
         img_bytes = base64.b64decode(b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
-        fname = f"result_rank{rank}_seed{seed}_clip{clip_score:.3f}_{mask_used}.jpg"
+        fname = prefixed_name(file_prefix, f"result_rank{rank}_seed{seed}_clip{clip_score:.3f}_{mask_used}.jpg")
         out_path = out_dir / fname
         img.save(out_path, format="JPEG", quality=95)
 
@@ -164,7 +192,7 @@ def save_results(output: dict, out_dir: Path) -> list[Path]:
             if mask_b64:
                 mask_bytes = base64.b64decode(mask_b64)
                 mask_img = Image.open(io.BytesIO(mask_bytes)).convert("RGB")
-                mask_fname = f"mask_{mask_used}.jpg"
+                mask_fname = prefixed_name(file_prefix, f"mask_{mask_used}.jpg")
                 mask_img.save(out_dir / mask_fname, format="JPEG", quality=95)
                 print(f"[save]   mask        → {mask_fname}")
 
@@ -172,7 +200,7 @@ def save_results(output: dict, out_dir: Path) -> list[Path]:
             if overlay_b64:
                 ov_bytes = base64.b64decode(overlay_b64)
                 ov_img = Image.open(io.BytesIO(ov_bytes)).convert("RGB")
-                ov_fname = f"mask_overlay_{mask_used}.jpg"
+                ov_fname = prefixed_name(file_prefix, f"mask_overlay_{mask_used}.jpg")
                 ov_img.save(out_dir / ov_fname, format="JPEG", quality=95)
                 print(f"[save]   mask_overlay → {ov_fname}")
 
@@ -183,7 +211,7 @@ def save_results(output: dict, out_dir: Path) -> list[Path]:
     return saved
 
 
-def save_intermediates(output: dict, out_dir: Path) -> list[Path]:
+def save_intermediates(output: dict, out_dir: Path, file_prefix: str) -> list[Path]:
     """top-level intermediates(base64 dict) 저장"""
     intermediates = output.get("intermediates") or {}
     if not isinstance(intermediates, dict) or not intermediates:
@@ -203,14 +231,14 @@ def save_intermediates(output: dict, out_dir: Path) -> list[Path]:
             continue
 
         normalized_key = normalize_intermediate_key(key, mask_used=mask_used)
-        out_path = out_dir / f"intermediate_{normalized_key}.jpg"
+        out_path = out_dir / prefixed_name(file_prefix, f"intermediate_{normalized_key}.jpg")
         img.save(out_path, format="JPEG", quality=92)
         print(f"[save]   intermediate → {out_path.name}")
         saved.append(out_path)
     return saved
 
 
-def save_intermediate_data(output: dict, out_dir: Path) -> list[Path]:
+def save_intermediate_data(output: dict, out_dir: Path, file_prefix: str) -> list[Path]:
     """
     top-level intermediate_data(JSON) 저장.
     - intermediate_data.json
@@ -222,7 +250,7 @@ def save_intermediate_data(output: dict, out_dir: Path) -> list[Path]:
 
     saved: list[Path] = []
 
-    json_path = out_dir / "intermediate_data.json"
+    json_path = out_dir / prefixed_name(file_prefix, "intermediate_data.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     print(f"[save]   intermediate_data → {json_path.name}")
@@ -233,7 +261,7 @@ def save_intermediate_data(output: dict, out_dir: Path) -> list[Path]:
         lms_norm = mesh.get("landmarks_norm")
         lms_px = mesh.get("landmarks_px")
         if isinstance(lms_norm, list) and isinstance(lms_px, list) and len(lms_norm) == len(lms_px):
-            csv_path = out_dir / "intermediate_mediapipe_face_mesh_landmarks.csv"
+            csv_path = out_dir / prefixed_name(file_prefix, "intermediate_mediapipe_face_mesh_landmarks.csv")
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(["index", "x_norm", "y_norm", "z_norm", "x_px", "y_px"])
@@ -295,8 +323,10 @@ def main():
                         help="중간 산출물(base64)을 함께 요청/저장")
     parser.add_argument("--health-check", action="store_true",
                         help="헬스체크만 실행 (이미지 불필요)")
-    parser.add_argument("--output-dir",   type=Path, default=PROJECT_ROOT,
-                        help="결과 이미지 저장 디렉토리 (기본: 현재 폴더)")
+    parser.add_argument("--output-dir",   type=Path, default=DEFAULT_OUTPUT_DIR,
+                        help="결과 이미지 저장 디렉토리 (기본: output/)")
+    parser.add_argument("--filename-prefix", default=None,
+                        help="저장 파일명 접두어 (기본: 입력 이미지 파일명)")
     parser.add_argument("--timeout",      type=int, default=TIMEOUT_SEC,
                         help=f"최대 대기 시간(초) (기본: {TIMEOUT_SEC}, cold start 시 넉넉히)")
 
@@ -367,10 +397,11 @@ def main():
     if elapsed:
         print(f"\n[perf]   서버 처리 시간: {elapsed:.1f}s")
 
+    file_prefix = args.filename_prefix or infer_filename_prefix(args.image, args.image_url)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    saved = save_results(output, args.output_dir)
-    saved_intermediates = save_intermediates(output, args.output_dir)
-    saved_intermediate_data = save_intermediate_data(output, args.output_dir)
+    saved = save_results(output, args.output_dir, file_prefix=file_prefix)
+    saved_intermediates = save_intermediates(output, args.output_dir, file_prefix=file_prefix)
+    saved_intermediate_data = save_intermediate_data(output, args.output_dir, file_prefix=file_prefix)
 
     if saved:
         print(f"\n✅  {len(saved)}개 이미지 저장 완료")

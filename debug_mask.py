@@ -12,7 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipeline_sd_inpainting import MirrAISDPipeline, SDInpaintConfig
 
-IMAGE_PATH = str(PROJECT_ROOT / "images" / "1231.jpg")
+IMAGE_PATH = str(PROJECT_ROOT / "images" / "1234.jpeg")
 OUTPUT_DIR = PROJECT_ROOT
 
 
@@ -46,7 +46,7 @@ def main():
     print(f"BiSeNet hair pixels: {hair_mask.sum():.0f}")
     print(f"BiSeNet face pixels: {face_mask.sum():.0f}")
 
-    # ── 얼굴 bbox (1231.jpg 기준 하드코딩, 1000x1000)
+    # ── 얼굴 bbox (1234.jpeg 기준 하드코딩, 1000x1000)
     x1, y1, x2, y2 = 310, 90, 620, 430
     face_bbox = (x1, y1, x2, y2)
     bw, bh = x2 - x1, y2 - y1
