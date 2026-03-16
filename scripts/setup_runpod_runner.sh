@@ -39,9 +39,32 @@ fi
 
 # Start docker daemon when needed (common on RunPod container environments).
 if ! docker info >/dev/null 2>&1; then
-  echo "[runner] docker daemon is not running. starting dockerd..."
+  echo "[runner] docker daemon is not running. starting dockerd (default mode)..."
   nohup dockerd >/tmp/dockerd.log 2>&1 &
-  for i in {1..30}; do
+  for i in {1..25}; do
+    if docker info >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+fi
+
+# RunPod/컨테이너 환경에서는 overlay2, iptables, bridge 권한 문제로
+# 기본 dockerd 기동이 실패할 수 있어 저권한 fallback 모드를 시도한다.
+if ! docker info >/dev/null 2>&1; then
+  echo "[runner] default dockerd failed. retrying with fallback flags..."
+  pkill -f dockerd >/dev/null 2>&1 || true
+  mkdir -p /tmp/docker-data
+  nohup dockerd \
+    --host=unix:///var/run/docker.sock \
+    --data-root=/tmp/docker-data \
+    --storage-driver=vfs \
+    --iptables=false \
+    --ip-masq=false \
+    --bridge=none \
+    >/tmp/dockerd.log 2>&1 &
+
+  for i in {1..35}; do
     if docker info >/dev/null 2>&1; then
       break
     fi
@@ -50,7 +73,9 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 if ! docker info >/dev/null 2>&1; then
-  echo "[runner] docker daemon failed to start. check /tmp/dockerd.log"
+  echo "[runner] docker daemon failed to start."
+  echo "[runner] last 120 lines of /tmp/dockerd.log:"
+  tail -n 120 /tmp/dockerd.log || true
   exit 1
 fi
 
@@ -88,4 +113,3 @@ fi
 
 echo "[runner] configured. starting runner..."
 exec ./run.sh
-
