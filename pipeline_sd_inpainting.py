@@ -68,7 +68,8 @@ _NEGATIVE_BASE = (
     "ugly, deformed, blurry, low quality, bad anatomy, distorted face, "
     "distorted hair, bald patch, artifacts, watermark, signature, "
     "cartoon, anime, illustration, painting, drawing, "
-    "earrings, earring, jewelry, necklace, accessories, piercings"
+    "earrings, earring, dangling earrings, hoop earrings, pearl earrings, "
+    "jewelry, necklace, pendant, choker, accessories, piercings, ear accessories"
 )
 
 # ── 헤어 길이 키워드 ────────────────────────────────────────────────────────────
@@ -1271,6 +1272,8 @@ class MirrAISDPipeline:
                 "very long hair, flowing long hair, hair below shoulders, "
                 "waist-length hair, side long locks over chest, "
                 "blunt horizontal cut line, helmet hair, bowl-shaped edge, "
+                "earrings, earring, dangling earrings, hoop earrings, pearl earrings, "
+                "jewelry, necklace, pendant, choker, accessories, piercings, "
             )
             guidance = 9.4
         elif hair_length == "medium":
@@ -1389,6 +1392,8 @@ class MirrAISDPipeline:
         fill_negative = (
             "long hair, hair below chin, hair below shoulders, loose hair strands, "
             "wavy hair, straight long hair, wig, ponytail, braid, bangs, side locks, "
+            "earrings, earring, dangling earrings, hoop earrings, pearl earrings, "
+            "jewelry, necklace, pendant, choker, accessories, piercings, "
             "deformed neck, artifacts, blurry, cartoon, painting"
         )
 
