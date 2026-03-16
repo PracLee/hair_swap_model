@@ -1,0 +1,43 @@
+# =============================================================================
+# MirrAI SD Base Image (Dependencies only)
+# byoungj/sd:base-*
+#
+# - 앱 코드는 포함하지 않음
+# - requirements 변경 시에만 재빌드
+# =============================================================================
+
+FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git \
+        libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# requirements 파일 먼저 복사 (의존성 레이어 캐시 재사용)
+COPY requirements-sd.txt ./
+
+# Step A: 기본 패키지 (torch/torchvision/extra-index-url/opencv/xformers 제외)
+RUN pip install --upgrade pip && \
+    grep -vE "^torch|^torchvision|^--extra-index-url|^opencv|^xformers" \
+        requirements-sd.txt > /tmp/req_base.txt && \
+    pip install -r /tmp/req_base.txt
+
+# Step B: torchvision CUDA 버전 강제 고정
+RUN pip install --force-reinstall --no-deps \
+    "torchvision==0.19.1+cu124" \
+    --extra-index-url https://download.pytorch.org/whl/cu124
+
+# Step C: xformers
+RUN pip install "xformers==0.0.27.post2"
+
+# Step D: opencv headless (mediapipe 충돌 방지)
+RUN pip install --force-reinstall "opencv-python-headless==4.10.0.84"
+
