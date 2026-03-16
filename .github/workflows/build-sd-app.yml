@@ -38,7 +38,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: [self-hosted, linux, x64, vm, sd-builder]
+    runs-on: [self-hosted, linux, x64, sd-builder]
     timeout-minutes: 180
 
     steps:
