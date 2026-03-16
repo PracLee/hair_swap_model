@@ -188,8 +188,8 @@ def main():
                         help="헤어 컬러 텍스트 (기본: 'ash brown')")
     parser.add_argument("--top-k",     default=3, type=int,
                         help="결과 수 (기본: 3, 최대: 5)")
-    parser.add_argument("--bg-fill",   default="sd", choices=["cv2", "sd"],
-                        help="단발 변환 시 배경 채우기 방법: sd=품질우선(기본), cv2=빠름")
+    parser.add_argument("--bg-fill",   default="cv2", choices=["cv2", "sd"],
+                        help="단발 변환 시 배경 채우기 방법: cv2=기본(짧은길이 안정), sd=배경 품질 실험")
 
     # 기타
     parser.add_argument("--no-base64",    action="store_true",

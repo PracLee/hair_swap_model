@@ -271,6 +271,8 @@ class MirrAISDPipeline:
         #   SD는 마스크 주변에 긴 머리가 보이면 계속 긴 머리를 생성함.
         # 해결: ① cv2.inpaint로 긴 머리 먼저 제거(배경/피부로 채움)
         #        ② 제거된 이미지 위에 SD로 새 숏컷 생성 (머리 없는 주변 맥락)
+        cutoff_y_for_post: Optional[int] = None
+        removal_mask_for_post: Optional[np.ndarray] = None
         if hair_length in ("short", "medium"):
             x1f, y1f, x2f, y2f = face_bbox
             face_w = max(x2f - x1f, 1)
@@ -281,6 +283,7 @@ class MirrAISDPipeline:
             else:
                 cutoff_y = int(y2f + face_h * 0.60)   # 어깨 위
             cutoff_y = min(cutoff_y, H - 1)
+            cutoff_y_for_post = cutoff_y
 
             # ── head box 계산 (removal_mask, gen_mask 양쪽에서 사용) ─────────────
             margin_x = int(face_w * 0.5)   # 얼굴 폭의 50% 여백 (양 옆 머리 공간)
@@ -295,22 +298,24 @@ class MirrAISDPipeline:
             removal_mask = hair_mask_for_removal.copy()
             removal_mask[:cutoff_y, :] = 0.0
 
-            # SAM2 감지 영역 너비 기준으로 직사각형 확장
-            # head box 너비(head_x1~head_x2)를 cutoff_y 아래에도 적용
-            hair_rows_below = np.any(hair_mask_for_removal[cutoff_y:, :] > 0.5, axis=1)
-            if np.any(hair_rows_below):
-                max_hair_y = cutoff_y + int(np.max(np.where(hair_rows_below)))
-                max_hair_y = min(max_hair_y + 20, H - 1)
-                # 좌우 범위: head box 너비 기준
-                removal_mask[cutoff_y:max_hair_y, head_x1:head_x2] = 1.0
+            # 실제 hair 픽셀 기반으로만 확장 (직사각형 전체 확장 시 옷 패치 훼손 유발)
+            hair_below = (hair_mask_for_removal > 0.5).astype(np.uint8)
+            hair_below[:cutoff_y, :] = 0
+            hair_below[:, :max(0, head_x1 - 20)] = 0
+            hair_below[:, min(W, head_x2 + 20):] = 0
+            if int((hair_below > 0).sum()) > 0:
+                expand_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 13))
+                hair_below_expanded = cv2.dilate(hair_below, expand_k, iterations=1).astype(np.float32)
+                removal_mask = np.maximum(removal_mask, hair_below_expanded)
                 logger.info(
-                    f"[SDPipeline] removal_mask 직사각형 확장: "
-                    f"y={cutoff_y}~{max_hair_y}, x={head_x1}~{head_x2}"
+                    f"[SDPipeline] removal_mask hair기반 확장: "
+                    f"pixels={removal_mask.sum():.0f}"
                 )
             # 작은 구멍 제거 및 끊긴 구간 연결
             remove_close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
             removal_mask = cv2.morphologyEx(removal_mask, cv2.MORPH_CLOSE, remove_close_k)
             removal_mask = np.clip(removal_mask, 0.0, 1.0).astype(np.float32)
+            removal_mask_for_post = removal_mask.copy()
 
             # ── 생성 마스크: head box 기반 (아치형만이 아닌 머리 전체 공간) ─────
             # 기존: hair_mask의 cutoff_y 위쪽 (아치형만 → 귀 옆 공간 없음)
@@ -365,6 +370,7 @@ class MirrAISDPipeline:
                         img_rgb_cleaned = self._sd_refine_removed_region(
                             base_rgb=img_rgb_cleaned,
                             removal_mask=removal_mask,
+                            face_bbox=face_bbox,
                             face_crop_pil=face_crop_fill,
                             protect_mask=face_region_mask,
                             seed=fill_seed,
@@ -372,11 +378,23 @@ class MirrAISDPipeline:
                         logger.info("[SDPipeline] bg_fill_mode=sd: 제거 영역 SD 보정 완료")
                     except Exception as e:
                         logger.warning(f"[SDPipeline] bg_fill_mode=sd 실패, cv2 결과 사용: {e}")
+
+                # SD/cv2 제거 단계 이후에도 아래쪽 장발이 남거나 다시 생길 수 있어
+                # cutoff 아래 hair를 한 번 더 검출해서 얇게 정리한다.
+                try:
+                    img_rgb_cleaned = self._remove_residual_hair_below_cutoff(
+                        img_rgb=img_rgb_cleaned,
+                        face_bbox=face_bbox,
+                        cutoff_y=cutoff_y,
+                    )
+                except Exception as e:
+                    logger.warning(f"[SDPipeline] residual hair 정리 실패(무시): {e}")
             else:
                 img_rgb_cleaned = img_rgb
 
-            # 단계 2: SD에는 cleaned 이미지 + gen_mask(위쪽만) 전달
-            hair_mask_for_sd = gen_mask
+            # 단계 2: SD 생성은 head box 중심(위쪽)으로 제한해 배경/의상 훼손을 줄임.
+            # 아래쪽 장발 잔존은 final cleanup에서 선택적으로 제거한다.
+            hair_mask_for_sd = gen_mask.astype(np.float32)
             img_rgb_for_sd   = img_rgb_cleaned
         else:
             # long 헤어는 기존 단일 패스 유지
@@ -420,6 +438,34 @@ class MirrAISDPipeline:
                 gen_pil, hair_mask_for_sd, scale, pad, (W, H),
                 protect_mask=face_region_mask,   # 얼굴 영역 alpha 침범 방지
             )
+
+            # 최종 결과 기준으로 cutoff 아래 장발 잔존이 있으면 한 번 더 정리
+            if cutoff_y_for_post is not None:
+                try:
+                    post_rgb = cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)
+                    post_rgb = self._remove_residual_hair_below_cutoff(
+                        img_rgb=post_rgb,
+                        face_bbox=face_bbox,
+                        cutoff_y=cutoff_y_for_post,
+                    )
+                    composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
+                except Exception as e:
+                    logger.warning(f"[SDPipeline] final residual hair 정리 실패(무시): {e}")
+
+            # short/medium: 원본 long-hair 제거 마스크 기반으로 최종 하드 컷
+            if cutoff_y_for_post is not None and removal_mask_for_post is not None:
+                try:
+                    post_rgb = cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)
+                    post_rgb = self._final_cutoff_cleanup(
+                        img_rgb=post_rgb,
+                        face_bbox=face_bbox,
+                        removal_mask=removal_mask_for_post,
+                        cutoff_y=cutoff_y_for_post,
+                    )
+                    composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
+                except Exception as e:
+                    logger.warning(f"[SDPipeline] final cutoff cleanup 실패(무시): {e}")
+
             results.append(SDInpaintResult(
                 image=composited_bgr,
                 image_pil=Image.fromarray(cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)),
@@ -1030,11 +1076,14 @@ class MirrAISDPipeline:
         # ── 길이별 positive/negative 보강 ────────────────────────────────────
         if hair_length == "short":
             pos_suffix = (
-                ", short hairstyle, hair length above shoulders, "
-                "visible neck, bare neck, short hair ends at chin or above"
+                ", very short haircut, chin-length bob, hair ends at or above chin, "
+                "clear neckline, visible neck, no hair below jawline"
             )
-            neg_prefix = "long hair, long flowing hair, hair below shoulders, wavy long hair, "
-            guidance = 9.5   # 프롬프트 추종 강화
+            neg_prefix = (
+                "long hair, flowing hair, hair below jawline, hair below shoulders, "
+                "waist-length hair, side long locks, hair over chest, "
+            )
+            guidance = 11.0   # 숏컷 고정 강도 상향
         elif hair_length == "medium":
             pos_suffix = (
                 ", medium length hair, shoulder-length hair, "
@@ -1081,14 +1130,20 @@ class MirrAISDPipeline:
         # 숏컷/중단발 변환 시 IP-Adapter scale을 낮춤
         # → 원본 긴머리 identity가 생성에 과도하게 영향주는 것 방지
         if hair_length == "short":
-            ip_scale = 0.15   # 얼굴 identity만 최소 유지, 헤어는 텍스트 따름
+            ip_scale = 0.05
+            control_scale = min(self.config.controlnet_conditioning_scale, 0.12)
         elif hair_length == "medium":
-            ip_scale = 0.25
+            ip_scale = 0.18
+            control_scale = min(self.config.controlnet_conditioning_scale, 0.20)
         else:
             ip_scale = self.config.ip_adapter_scale  # long은 기본값 유지
+            control_scale = self.config.controlnet_conditioning_scale
 
         self._sd_pipe.set_ip_adapter_scale(ip_scale)
-        logger.info(f"[SDPipeline] ip_adapter_scale={ip_scale} (hair_length={hair_length})")
+        logger.info(
+            f"[SDPipeline] ip_adapter_scale={ip_scale}, "
+            f"controlnet_scale={control_scale} (hair_length={hair_length})"
+        )
 
         n = len(seeds)
         generators = [
@@ -1108,7 +1163,7 @@ class MirrAISDPipeline:
                 width=SD_SIZE,
                 num_inference_steps=self.config.num_inference_steps,
                 guidance_scale=guidance_scale,
-                controlnet_conditioning_scale=self.config.controlnet_conditioning_scale,
+                controlnet_conditioning_scale=control_scale,
                 num_images_per_prompt=n,
                 generator=generators,
                 strength=1.0,
@@ -1121,6 +1176,7 @@ class MirrAISDPipeline:
         self,
         base_rgb: np.ndarray,          # H×W×3 RGB (cv2 inpaint 1차 결과)
         removal_mask: np.ndarray,      # H×W float32 (긴머리 제거 영역)
+        face_bbox: Tuple[int, int, int, int],
         face_crop_pil: Image.Image,    # IP-Adapter conditioning face
         protect_mask: Optional[np.ndarray],  # H×W float32 (얼굴 보호)
         seed: int,
@@ -1137,16 +1193,18 @@ class MirrAISDPipeline:
         img_512, mask_512, canny_512, scale, pad = self._prepare_sd_inputs(base_rgb, fill_mask)
 
         fill_prompt = (
-            "professional portrait photo, clean neck and shoulder area, natural skin texture, "
-            "natural clothing texture continuity, photorealistic, no loose hair strands"
+            "professional portrait photo, clean neck and shoulders, visible neck, "
+            "natural skin and clothing texture continuity, no hair below chin, "
+            "no loose hair strands, photorealistic"
         )
         fill_negative = (
-            "long hair, hair below shoulders, loose hair strands, wig, ponytail, braid, "
+            "long hair, hair below chin, hair below shoulders, loose hair strands, "
+            "wavy hair, straight long hair, wig, ponytail, braid, bangs, side locks, "
             "deformed neck, artifacts, blurry, cartoon, painting"
         )
 
         # 배경 복원은 identity 영향이 과하면 긴머리가 다시 생길 수 있어 scale을 낮춘다.
-        self._sd_pipe.set_ip_adapter_scale(0.15)
+        self._sd_pipe.set_ip_adapter_scale(0.0)
         generator = torch.Generator(device=self.device).manual_seed(int(seed))
 
         with torch.inference_mode():
@@ -1160,8 +1218,8 @@ class MirrAISDPipeline:
                 height=SD_SIZE,
                 width=SD_SIZE,
                 num_inference_steps=max(20, self.config.num_inference_steps - 8),
-                guidance_scale=6.5,
-                controlnet_conditioning_scale=min(self.config.controlnet_conditioning_scale, 0.25),
+                guidance_scale=9.0,
+                controlnet_conditioning_scale=min(self.config.controlnet_conditioning_scale, 0.10),
                 num_images_per_prompt=1,
                 generator=generator,
                 strength=1.0,
@@ -1179,6 +1237,16 @@ class MirrAISDPipeline:
         alpha = cv2.GaussianBlur(fill_mask, (0, 0), sigmaX=8.0, sigmaY=8.0)
         alpha = np.clip(alpha, 0.0, 1.0)
 
+        # SD 보정은 중앙(목/상체) 위주로 적용하고 좌우 사이드는 cv2 결과를 유지
+        # → side 영역에서 장발이 다시 생성되는 현상 완화
+        x1, y1, x2, y2 = face_bbox
+        cx = 0.5 * (x1 + x2)
+        face_w = max(float(x2 - x1), 1.0)
+        sigma_x = max(face_w * 0.9, 24.0)
+        xs = np.arange(W, dtype=np.float32)
+        center_weight = np.exp(-0.5 * ((xs - cx) / sigma_x) ** 2)
+        alpha = alpha * center_weight[np.newaxis, :]
+
         # 얼굴은 기존 픽셀 고정
         if protect_mask is not None:
             protect_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
@@ -1191,6 +1259,91 @@ class MirrAISDPipeline:
             + base_rgb.astype(np.float32) * (1.0 - alpha)
         )
         return np.clip(refined, 0, 255).astype(np.uint8)
+
+    def _remove_residual_hair_below_cutoff(
+        self,
+        img_rgb: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        cutoff_y: int,
+    ) -> np.ndarray:
+        """
+        short/medium 변환 후 cutoff 아래에 남은 머리카락을 재검출해 정리.
+        """
+        H, W = img_rgb.shape[:2]
+        cutoff_y = int(np.clip(cutoff_y, 0, H - 1))
+
+        hair_now, _, _ = self._segface_hair_mask(img_rgb, face_bbox)
+        residual = hair_now.copy()
+        residual[:cutoff_y, :] = 0.0
+
+        # 작은 노이즈 제거
+        residual_u8 = (residual > 0.5).astype(np.uint8) * 255
+        open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        residual_u8 = cv2.morphologyEx(residual_u8, cv2.MORPH_OPEN, open_k)
+
+        if int((residual_u8 > 0).sum()) < 60:
+            return img_rgb
+
+        dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        residual_u8 = cv2.dilate(residual_u8, dilate_k, iterations=1)
+
+        # 잔존 hair 영역만 얇게 inpaint
+        filled_ns = cv2.inpaint(img_rgb, residual_u8, inpaintRadius=8, flags=cv2.INPAINT_NS)
+        filled_te = cv2.inpaint(img_rgb, residual_u8, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+        filled = cv2.addWeighted(filled_ns, 0.6, filled_te, 0.4, 0.0)
+
+        alpha = residual_u8.astype(np.float32) / 255.0
+        alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=4.0, sigmaY=4.0)[..., np.newaxis]
+
+        cleaned = (
+            filled.astype(np.float32) * alpha
+            + img_rgb.astype(np.float32) * (1.0 - alpha)
+        )
+        return np.clip(cleaned, 0, 255).astype(np.uint8)
+
+    def _final_cutoff_cleanup(
+        self,
+        img_rgb: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        removal_mask: np.ndarray,
+        cutoff_y: int,
+    ) -> np.ndarray:
+        """
+        최종 결과에서 cutoff 아래 long-hair 제거 마스크 영역을 한 번 더 정리.
+        """
+        H, W = img_rgb.shape[:2]
+        if removal_mask.shape != (H, W):
+            return img_rgb
+
+        force = removal_mask.copy().astype(np.float32)
+        cutoff_y = int(np.clip(cutoff_y, 0, H - 1))
+        force[:cutoff_y, :] = 0.0
+
+        # 실제 남아있는 hair 픽셀과 교집합만 제거해 의상/배경 훼손 방지
+        hair_now, _, _ = self._segface_hair_mask(img_rgb, face_bbox)
+        hair_now[:cutoff_y, :] = 0.0
+        hair_now_u8 = (hair_now > 0.5).astype(np.uint8) * 255
+        if int((hair_now_u8 > 0).sum()) > 0:
+            hair_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            hair_now_u8 = cv2.dilate(hair_now_u8, hair_k, iterations=1)
+
+        force_u8 = ((force > 0.5).astype(np.uint8) * 255)
+        force_u8 = cv2.bitwise_and(force_u8, hair_now_u8)
+
+        if int((force_u8 > 0).sum()) < 40:
+            return img_rgb
+
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        force_u8 = cv2.dilate(force_u8, k, iterations=1)
+
+        filled_ns = cv2.inpaint(img_rgb, force_u8, inpaintRadius=8, flags=cv2.INPAINT_NS)
+        filled_te = cv2.inpaint(img_rgb, force_u8, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+        filled = cv2.addWeighted(filled_ns, 0.6, filled_te, 0.4, 0.0)
+
+        alpha = force_u8.astype(np.float32) / 255.0
+        alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=4.0, sigmaY=4.0)[..., np.newaxis]
+        out = filled.astype(np.float32) * alpha + img_rgb.astype(np.float32) * (1.0 - alpha)
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Compositing
