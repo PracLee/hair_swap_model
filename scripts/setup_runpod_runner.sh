@@ -17,10 +17,6 @@ if [[ -z "${GITHUB_REPO:-}" ]]; then
   echo "GITHUB_REPO is required"
   exit 1
 fi
-if [[ -z "${GITHUB_RUNNER_PAT:-}" ]]; then
-  echo "GITHUB_RUNNER_PAT is required"
-  exit 1
-fi
 
 RUNNER_VERSION="${RUNNER_VERSION:-2.325.0}"
 RUNNER_HOME="${RUNNER_HOME:-/opt/actions-runner}"
@@ -83,6 +79,17 @@ if [[ ! -f "./config.sh" ]]; then
     "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
   tar xzf actions-runner.tar.gz
   rm -f actions-runner.tar.gz
+fi
+
+# 이미 등록된 runner라면 재등록 없이 바로 실행
+if [[ -f "./.runner" ]]; then
+  echo "[runner] existing runner configuration detected. starting runner without reconfiguration..."
+  exec ./run.sh
+fi
+
+if [[ -z "${GITHUB_RUNNER_PAT:-}" ]]; then
+  echo "GITHUB_RUNNER_PAT is required for first-time runner registration"
+  exit 1
 fi
 
 REG_TOKEN="$(
