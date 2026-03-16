@@ -26,6 +26,9 @@ jobs:
   build:
     runs-on: [self-hosted, linux, x64, runpod, sd-builder]
     timeout-minutes: 180
+    env:
+      DOCKER_BUILDKIT: "0"
+      COMPOSE_DOCKER_CLI_BUILD: "0"
 
     steps:
       - name: Checkout repository
@@ -35,12 +38,6 @@ jobs:
         run: |
           docker version
           docker info
-          docker buildx version
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: network=host
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -63,19 +60,9 @@ jobs:
           echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push SD base image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile.sd.base
-          platforms: linux/amd64
-          push: true
-          provenance: false
-          tags: |
-            ${{ secrets.DOCKER_USERNAME }}/sd:base-${{ steps.meta.outputs.VERSION }}
-            ${{ secrets.DOCKER_USERNAME }}/sd:base-latest
-          cache-from: |
-            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache-base
-            type=gha,scope=sd-base
-          cache-to: |
-            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache-base,mode=max
-            type=gha,mode=max,scope=sd-base
+        run: |
+          BASE_TAG="${{ secrets.DOCKER_USERNAME }}/sd:base-${{ steps.meta.outputs.VERSION }}"
+          LATEST_TAG="${{ secrets.DOCKER_USERNAME }}/sd:base-latest"
+          docker build -f Dockerfile.sd.base -t "${BASE_TAG}" -t "${LATEST_TAG}" .
+          docker push "${BASE_TAG}"
+          docker push "${LATEST_TAG}"

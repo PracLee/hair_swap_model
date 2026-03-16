@@ -40,6 +40,9 @@ jobs:
   build:
     runs-on: [self-hosted, linux, x64, runpod, sd-builder]
     timeout-minutes: 180
+    env:
+      DOCKER_BUILDKIT: "0"
+      COMPOSE_DOCKER_CLI_BUILD: "0"
 
     steps:
       - name: Checkout repository
@@ -49,12 +52,6 @@ jobs:
         run: |
           docker version
           docker info
-          docker buildx version
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: network=host
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -88,7 +85,7 @@ jobs:
         id: base_exists
         shell: bash
         run: |
-          if docker buildx imagetools inspect "${{ steps.meta.outputs.BASE_IMAGE }}" >/dev/null 2>&1; then
+          if docker manifest inspect "${{ steps.meta.outputs.BASE_IMAGE }}" >/dev/null 2>&1; then
             echo "value=true" >> "$GITHUB_OUTPUT"
             echo "[build-sd-app] base image found: ${{ steps.meta.outputs.BASE_IMAGE }}"
           else
@@ -98,40 +95,19 @@ jobs:
 
       - name: Bootstrap base image when missing
         if: steps.base_exists.outputs.value == 'false'
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile.sd.base
-          platforms: linux/amd64
-          push: true
-          provenance: false
-          tags: |
-            ${{ steps.meta.outputs.BASE_IMAGE }}
-            ${{ secrets.DOCKER_USERNAME }}/sd:base-latest
-          cache-from: |
-            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache-base
-            type=gha,scope=sd-base
-          cache-to: |
-            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache-base,mode=max
-            type=gha,mode=max,scope=sd-base
+        run: |
+          docker build -f Dockerfile.sd.base \
+            -t "${{ steps.meta.outputs.BASE_IMAGE }}" \
+            -t "${{ secrets.DOCKER_USERNAME }}/sd:base-latest" .
+          docker push "${{ steps.meta.outputs.BASE_IMAGE }}"
+          docker push "${{ secrets.DOCKER_USERNAME }}/sd:base-latest"
 
       - name: Build and push SD app image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile.sd.app
-          build-args: |
-            BASE_IMAGE=${{ steps.meta.outputs.BASE_IMAGE }}
-          platforms: linux/amd64
-          pull: true
-          push: true
-          provenance: false
-          tags: |
-            ${{ secrets.DOCKER_USERNAME }}/sd:${{ steps.meta.outputs.VERSION }}
-            ${{ secrets.DOCKER_USERNAME }}/sd:latest
-          cache-from: |
-            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache
-            type=gha,scope=sd-app
-          cache-to: |
-            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache,mode=max
-            type=gha,mode=max,scope=sd-app
+        run: |
+          APP_TAG="${{ secrets.DOCKER_USERNAME }}/sd:${{ steps.meta.outputs.VERSION }}"
+          LATEST_TAG="${{ secrets.DOCKER_USERNAME }}/sd:latest"
+          docker build -f Dockerfile.sd.app \
+            --build-arg BASE_IMAGE="${{ steps.meta.outputs.BASE_IMAGE }}" \
+            -t "${APP_TAG}" -t "${LATEST_TAG}" .
+          docker push "${APP_TAG}"
+          docker push "${LATEST_TAG}"
