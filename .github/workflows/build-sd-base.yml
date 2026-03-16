@@ -28,9 +28,6 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
       - name: Free disk space on runner
         shell: bash
         run: |
@@ -51,6 +48,9 @@ jobs:
           echo "[disk] after cleanup"
           df -h
           docker system df || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
       - name: Docker preflight
         run: |
