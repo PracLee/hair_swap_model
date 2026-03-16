@@ -45,6 +45,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Free disk space on runner
+        shell: bash
+        run: |
+          set +e
+          echo "[disk] before cleanup"
+          df -h
+          docker system df || true
+
+          docker buildx prune -af || true
+          docker builder prune -af || true
+          docker system prune -af --volumes || true
+
+          # self-hosted runner 로그/임시 캐시 정리 (없으면 무시)
+          rm -rf /home/runner/actions-runner/cached/_diag/* 2>/dev/null || true
+          rm -rf /home/runner/actions-runner/_diag/* 2>/dev/null || true
+          rm -rf /home/runner/actions-runner/_work/_temp/* 2>/dev/null || true
+
+          echo "[disk] after cleanup"
+          df -h
+          docker system df || true
+
       - name: Docker preflight
         run: |
           docker version
@@ -108,10 +129,8 @@ jobs:
             ${{ secrets.DOCKER_USERNAME }}/sd:base-latest
           cache-from: |
             type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache-base
-            type=gha,scope=sd-base
           cache-to: |
             type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache-base,mode=max
-            type=gha,mode=max,scope=sd-base
 
       - name: Build and push SD app image
         uses: docker/build-push-action@v6
@@ -129,7 +148,5 @@ jobs:
             ${{ secrets.DOCKER_USERNAME }}/sd:latest
           cache-from: |
             type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache
-            type=gha,scope=sd-app
           cache-to: |
             type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache,mode=max
-            type=gha,mode=max,scope=sd-app

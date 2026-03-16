@@ -303,16 +303,18 @@ class MirrAISDPipeline:
             hair_below[:cutoff_y, :] = 0
             hair_below[:, :max(0, head_x1 - 20)] = 0
             hair_below[:, min(W, head_x2 + 20):] = 0
-            if int((hair_below > 0).sum()) > 0:
+            if int((hair_below > 0).sum()) > 0 and hair_length != "short":
+                # medium은 어깨선까지 자연스럽게 지우기 위해 약간 확장
                 expand_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 13))
                 hair_below_expanded = cv2.dilate(hair_below, expand_k, iterations=1).astype(np.float32)
                 removal_mask = np.maximum(removal_mask, hair_below_expanded)
                 logger.info(
-                    f"[SDPipeline] removal_mask hair기반 확장: "
+                    f"[SDPipeline] removal_mask hair기반 확장(medium): "
                     f"pixels={removal_mask.sum():.0f}"
                 )
-            # 작은 구멍 제거 및 끊긴 구간 연결
-            remove_close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+            # short는 최소 연결만, medium은 조금 더 강하게 연결
+            close_size = 5 if hair_length == "short" else 11
+            remove_close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size))
             removal_mask = cv2.morphologyEx(removal_mask, cv2.MORPH_CLOSE, remove_close_k)
             removal_mask = np.clip(removal_mask, 0.0, 1.0).astype(np.float32)
             removal_mask_for_post = removal_mask.copy()
@@ -340,22 +342,23 @@ class MirrAISDPipeline:
 
             if removal_mask.sum() > 50:
                 removal_u8 = (removal_mask > 0.5).astype(np.uint8) * 255
-                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                # inpaint 입력은 약하게만 확장해서 불필요한 배경/의상 훼손을 줄임
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
                 removal_u8_dilated = cv2.dilate(removal_u8, k, iterations=1)
 
                 # cv2.inpaint 2종(NS + TELEA) 혼합 → 어깨/목 texture 복원 안정화
-                inpaint_radius = 24 if hair_length == "short" else 20
+                inpaint_radius = 12 if hair_length == "short" else 10
                 img_rgb_ns = cv2.inpaint(
                     img_rgb, removal_u8_dilated, inpaintRadius=inpaint_radius, flags=cv2.INPAINT_NS
                 )
                 img_rgb_telea = cv2.inpaint(
-                    img_rgb, removal_u8_dilated, inpaintRadius=max(3, inpaint_radius - 6), flags=cv2.INPAINT_TELEA
+                    img_rgb, removal_u8_dilated, inpaintRadius=max(3, inpaint_radius - 4), flags=cv2.INPAINT_TELEA
                 )
                 img_rgb_filled = cv2.addWeighted(img_rgb_ns, 0.65, img_rgb_telea, 0.35, 0.0)
 
-                # soft-blend로 경계 자연스럽게
-                soft_alpha = removal_u8_dilated.astype(np.float32) / 255.0
-                soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=9.0)[..., np.newaxis]
+                # soft-blend는 core mask 기준으로만 feather → 사다리꼴 번짐 방지
+                soft_alpha = removal_u8.astype(np.float32) / 255.0
+                soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=3.2)[..., np.newaxis]
                 img_rgb_cleaned = (
                     img_rgb_filled.astype(np.float32) * soft_alpha
                     + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
