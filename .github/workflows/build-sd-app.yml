@@ -127,6 +127,13 @@ jobs:
           echo "::error::Run 'Build and Push SD Base Image' first, then rerun this workflow."
           exit 1
 
+      - name: Pre-build cleanup
+        shell: bash
+        run: |
+          docker buildx prune -af || true
+          docker builder prune -af || true
+          docker system prune -af --volumes || true
+
       - name: Build and push SD app image
         uses: docker/build-push-action@v6
         with:
@@ -143,5 +150,3 @@ jobs:
             ${{ secrets.DOCKER_USERNAME }}/sd:latest
           cache-from: |
             type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache
-          cache-to: |
-            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache,mode=min

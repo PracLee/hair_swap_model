@@ -4,9 +4,10 @@
 #
 # - 앱 코드는 포함하지 않음
 # - requirements 변경 시에만 재빌드
+# - CI 디스크 압박 완화를 위해 devel 대신 runtime 베이스 사용
 # =============================================================================
 
-FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel
+FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -40,4 +41,3 @@ RUN pip install "xformers==0.0.27.post2"
 
 # Step D: opencv headless (mediapipe 충돌 방지)
 RUN pip install --force-reinstall "opencv-python-headless==4.10.0.84"
-
