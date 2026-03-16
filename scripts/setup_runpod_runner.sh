@@ -31,6 +31,12 @@ RUNNER_WORKDIR="${RUNNER_WORKDIR:-_work}"
 echo "[runner] owner=${GITHUB_OWNER} repo=${GITHUB_REPO}"
 echo "[runner] name=${RUNNER_NAME} labels=${RUNNER_LABELS}"
 
+if [[ "$(id -u)" -eq 0 ]]; then
+  # GitHub runner는 root 실행 시 명시적 opt-in이 필요함.
+  export RUNNER_ALLOW_RUNASROOT=1
+  echo "[runner] running as root -> RUNNER_ALLOW_RUNASROOT=1"
+fi
+
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update
   apt-get install -y --no-install-recommends curl jq ca-certificates tar git docker.io
