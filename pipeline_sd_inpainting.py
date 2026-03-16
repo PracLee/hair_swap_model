@@ -279,6 +279,13 @@ class MirrAISDPipeline:
                 cutoff_y = int(y2f + face_h * 0.60)   # 어깨 위
             cutoff_y = min(cutoff_y, H - 1)
 
+            # ── head box 계산 (removal_mask, gen_mask 양쪽에서 사용) ─────────────
+            margin_x = int(face_w * 0.5)   # 얼굴 폭의 50% 여백 (양 옆 머리 공간)
+            head_x1  = max(0, x1f - margin_x)
+            head_x2  = min(W, x2f + margin_x)
+            head_y1  = max(0, y1f - int(face_h * 0.6))   # 정수리 위까지
+            head_y2  = cutoff_y
+
             # ── 제거 마스크: SAM2 감지 영역 + 어깨 너비 직사각형 확장 ────────────
             # SAM2가 한쪽 머리를 놓친 경우(오른쪽 등) 를 커버하기 위해
             # cutoff_y 아래 전체 어깨 너비를 removal 영역으로 포함
@@ -303,11 +310,6 @@ class MirrAISDPipeline:
             # ── 생성 마스크: head box 기반 (아치형만이 아닌 머리 전체 공간) ─────
             # 기존: hair_mask의 cutoff_y 위쪽 (아치형만 → 귀 옆 공간 없음)
             # 변경: face_bbox 기반 head box → 귀 옆까지 포함해서 SD가 숏컷 생성
-            margin_x = int(face_w * 0.5)   # 얼굴 폭의 50% 여백 (양 옆 머리 공간)
-            head_x1  = max(0, x1f - margin_x)
-            head_x2  = min(W, x2f + margin_x)
-            head_y1  = max(0, y1f - int(face_h * 0.6))   # 정수리 위까지
-            head_y2  = cutoff_y
 
             gen_mask = np.zeros((H, W), dtype=np.float32)
             gen_mask[head_y1:head_y2, head_x1:head_x2] = 1.0
