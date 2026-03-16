@@ -296,7 +296,8 @@ class SAM2Refiner:
             max(int(left - box_width * 0.15), 0),
             max(int(top - box_height * 0.25), 0),
             min(int(right + box_width * 0.15), width - 1),
-            min(int(bottom + box_height * 0.08), height - 1),
+            # 하단을 60%까지 확장: 긴 머리카락이 어깨까지 내려오는 경우 포착
+            min(int(bottom + box_height * 0.60), height - 1),
         )
 
 
@@ -435,12 +436,15 @@ class SAMMaskingPipeline:
             base_hair_mask=base.hair_mask,
             prompt=prompt,
         )
+        # SAM2가 놓친 영역도 유지: BiSeNet + SAM2 합집합(union) 사용
+        # SAM2만 쓰면 SAM2가 못잡은 가는 머리카락, 경계 등이 사라짐
+        refined_hair_union = ((refined_hair_mask > 0.5) | (base.hair_mask > 0.5)).float()
         refined_parsing_mask = base.parsing_mask.clone()
         refined_parsing_mask[base.parsing_mask == self.hair_class_index] = 0
-        refined_parsing_mask[refined_hair_mask > 0.5] = self.hair_class_index
+        refined_parsing_mask[refined_hair_union > 0.5] = self.hair_class_index
         return SegmentationResult(
             parsing_mask=refined_parsing_mask.long(),
-            hair_mask=(refined_hair_mask > 0.5).float(),
+            hair_mask=refined_hair_union,
             source="sam2",
             sam_refined=True,
             sam_prompt=sam_prompt,

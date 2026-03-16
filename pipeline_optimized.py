@@ -1587,10 +1587,12 @@ class MirrAIOptimizedPipeline:
         )
         alpha_mask = alpha_mask.squeeze().detach().cpu().numpy().astype(np.float32)
 
+        # 바이너리화 먼저: soft mask를 그대로 blur하면 경계가 넓게 번짐
+        alpha_mask = (alpha_mask > 0.5).astype(np.float32)
+
         # Use EROSION first to shrink the mask inward, pulling it away from
-        # face boundaries, then a small dilation for smooth edges.
+        # face/body boundaries, then a small dilation for smooth edges.
         kernel = scaled_mask_morph_kernel(int(max(alpha_mask.shape)))
-        morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel, kernel))
         # Erode to pull mask away from face-hair boundary
         erode_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (max(3, kernel // 2), max(3, kernel // 2))
@@ -1601,11 +1603,11 @@ class MirrAIOptimizedPipeline:
             cv2.MORPH_ELLIPSE, (max(3, kernel // 3), max(3, kernel // 3))
         )
         alpha_mask = cv2.dilate(alpha_mask, small_dilate, iterations=1)
-        # Smooth edges - sigma를 작게 유지해서 비헤어 영역(가슴 등)으로 bleeding 방지
-        sigma = max(1.5, kernel / 6.0)
+        # 아주 작은 blur만 적용 (anti-aliasing 수준) - body 영역으로의 bleeding 차단
+        sigma = max(1.0, kernel / 10.0)
         alpha_mask = cv2.GaussianBlur(alpha_mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
-        # 매우 낮은 alpha 값 제거: 헤어 경계 밖의 ghosting/blur bleeding 차단
-        alpha_mask = np.where(alpha_mask > 0.15, alpha_mask, 0.0)
+        # 낮은 alpha 제거: 헤어 경계 밖 ghosting 차단
+        alpha_mask = np.where(alpha_mask > 0.2, alpha_mask, 0.0)
         return np.clip(alpha_mask, 0.0, 1.0)
 
     def _color_match_hair(
