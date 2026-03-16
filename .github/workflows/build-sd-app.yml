@@ -19,11 +19,6 @@ on:
       - "data/**"
       - ".dockerignore"
       - ".github/workflows/build-sd-app.yml"
-  workflow_run:
-    workflows:
-      - Build and Push SD Base Image
-    types:
-      - completed
   workflow_dispatch:
     inputs:
       version:
@@ -43,7 +38,6 @@ concurrency:
 
 jobs:
   build:
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -81,6 +75,37 @@ jobs:
           echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "BASE_IMAGE=${BASE_IMAGE}" >> "$GITHUB_OUTPUT"
 
+      - name: Check base image existence
+        id: base_exists
+        shell: bash
+        run: |
+          if docker buildx imagetools inspect "${{ steps.meta.outputs.BASE_IMAGE }}" >/dev/null 2>&1; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+            echo "[build-sd-app] base image found: ${{ steps.meta.outputs.BASE_IMAGE }}"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+            echo "[build-sd-app] base image missing: ${{ steps.meta.outputs.BASE_IMAGE }}"
+          fi
+
+      - name: Bootstrap base image when missing
+        if: steps.base_exists.outputs.value == 'false'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.sd.base
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.meta.outputs.BASE_IMAGE }}
+            ${{ secrets.DOCKER_USERNAME }}/sd:base-latest
+          cache-from: |
+            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache-base
+            type=gha,scope=sd-base
+          cache-to: |
+            type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache-base,mode=max
+            type=gha,mode=max,scope=sd-base
+
       - name: Build and push SD app image
         uses: docker/build-push-action@v5
         with:
@@ -101,4 +126,3 @@ jobs:
           cache-to: |
             type=registry,ref=${{ secrets.DOCKER_USERNAME }}/sd:buildcache,mode=max
             type=gha,mode=max,scope=sd-app
-
