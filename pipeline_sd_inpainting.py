@@ -173,6 +173,7 @@ class MirrAISDPipeline:
         self._sam2_factory = None  # SAM2 predictor factory (callable)
         self._sd_pipe    = None   # StableDiffusionControlNetInpaintPipeline
         self._mp_face    = None   # MediaPipe FaceDetection
+        self._mp_hands   = None   # MediaPipe Hands
         self._loaded     = False
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -229,6 +230,9 @@ class MirrAISDPipeline:
             raise ValueError("얼굴을 검출할 수 없습니다.")
         face_bbox = face_obs  # (x1, y1, x2, y2)
         logger.info(f"[SDPipeline] 얼굴 검출: {face_bbox}")
+        hand_mask = self._detect_hand_mask(img_rgb)
+        if hand_mask.sum() > 0:
+            logger.info(f"[SDPipeline] 손 보호 마스크 검출: pixels={hand_mask.sum():.0f}")
 
         # ── Step 2: SegFace base hair mask + 얼굴 픽셀 마스크 + 옷 마스크 ──────
         hair_mask_base, face_region_mask, cloth_mask = self._segface_hair_mask(img_rgb, face_bbox)
@@ -295,7 +299,22 @@ class MirrAISDPipeline:
             # ── 제거 마스크: SAM2 감지 영역 + 어깨 너비 직사각형 확장 ────────────
             # SAM2가 한쪽 머리를 놓친 경우(오른쪽 등) 를 커버하기 위해
             # cutoff_y 아래 전체 어깨 너비를 removal 영역으로 포함
-            removal_mask = hair_mask_for_removal.copy()
+            # short에서는 SAM2 과검출(손/소품/배경 포함) 억제를 위해
+            # SegFace 기반 hair prior와 교집합을 우선 사용한다.
+            if hair_length == "short":
+                base_prior = np.clip(hair_mask_base - face_region_mask, 0.0, 1.0).astype(np.float32)
+                prior_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+                base_prior = cv2.dilate((base_prior > 0.5).astype(np.uint8) * 255, prior_k, iterations=1)
+                base_prior = (base_prior > 0).astype(np.float32)
+
+                removal_seed = np.clip(hair_mask_for_removal * base_prior, 0.0, 1.0)
+                # 교집합이 과도하게 작으면 기존 SAM 기반 마스크로 폴백
+                if removal_seed.sum() > 120:
+                    removal_mask = removal_seed
+                else:
+                    removal_mask = hair_mask_for_removal.copy()
+            else:
+                removal_mask = hair_mask_for_removal.copy()
             removal_mask[:cutoff_y, :] = 0.0
 
             # 실제 hair 픽셀 기반으로만 확장 (직사각형 전체 확장 시 옷 패치 훼손 유발)
@@ -329,6 +348,11 @@ class MirrAISDPipeline:
             gen_mask = np.clip(gen_mask - face_region_mask, 0.0, 1.0)
             # 옷도 보호
             gen_mask = np.clip(gen_mask - cloth_mask_dilated, 0.0, 1.0)
+            # 손/소품도 보호
+            gen_mask = np.clip(gen_mask - hand_mask, 0.0, 1.0)
+
+            # 제거 단계에서도 손/소품은 보호
+            removal_mask = np.clip(removal_mask - hand_mask, 0.0, 1.0)
 
             logger.info(
                 f"[SDPipeline] 2단계 숏컷: removal_px={removal_mask.sum():.0f}, "
@@ -347,14 +371,14 @@ class MirrAISDPipeline:
                 removal_u8_dilated = cv2.dilate(removal_u8, k, iterations=1)
 
                 # cv2.inpaint 2종(NS + TELEA) 혼합 → 어깨/목 texture 복원 안정화
-                inpaint_radius = 12 if hair_length == "short" else 10
+                inpaint_radius = 8 if hair_length == "short" else 10
                 img_rgb_ns = cv2.inpaint(
                     img_rgb, removal_u8_dilated, inpaintRadius=inpaint_radius, flags=cv2.INPAINT_NS
                 )
                 img_rgb_telea = cv2.inpaint(
-                    img_rgb, removal_u8_dilated, inpaintRadius=max(3, inpaint_radius - 4), flags=cv2.INPAINT_TELEA
+                    img_rgb, removal_u8_dilated, inpaintRadius=max(3, inpaint_radius), flags=cv2.INPAINT_TELEA
                 )
-                img_rgb_filled = cv2.addWeighted(img_rgb_ns, 0.65, img_rgb_telea, 0.35, 0.0)
+                img_rgb_filled = cv2.addWeighted(img_rgb_ns, 0.25, img_rgb_telea, 0.75, 0.0)
 
                 # soft-blend는 core mask 기준으로만 feather → 사다리꼴 번짐 방지
                 soft_alpha = removal_u8.astype(np.float32) / 255.0
@@ -530,6 +554,11 @@ class MirrAISDPipeline:
         self._mp_face = mp.solutions.face_detection.FaceDetection(
             model_selection=1, min_detection_confidence=0.5
         )
+        self._mp_hands = mp.solutions.hands.Hands(
+            static_image_mode=True,
+            max_num_hands=2,
+            min_detection_confidence=0.5,
+        )
         logger.info("[SDPipeline] MediaPipe FaceDetection 로드 완료")
 
     def _load_sd_pipeline(self) -> None:
@@ -626,6 +655,41 @@ class MirrAISDPipeline:
         x2 = min(W, int((bb.xmin + bb.width) * W))
         y2 = min(H, int((bb.ymin + bb.height) * H))
         return (x1, y1, x2, y2)
+
+    def _detect_hand_mask(self, img_rgb: np.ndarray) -> np.ndarray:
+        """
+        MediaPipe Hands 기반 손 영역 마스크(HxW float32).
+        손에 들린 소품(휴대폰)까지 보호하기 위해 landmark hull을 여유 있게 dilate한다.
+        """
+        H, W = img_rgb.shape[:2]
+        hand_mask = np.zeros((H, W), dtype=np.float32)
+        if self._mp_hands is None:
+            return hand_mask
+
+        result = self._mp_hands.process(img_rgb)
+        if not result.multi_hand_landmarks:
+            return hand_mask
+
+        for hand_lm in result.multi_hand_landmarks:
+            pts = []
+            for lm in hand_lm.landmark:
+                x = int(np.clip(lm.x * W, 0, W - 1))
+                y = int(np.clip(lm.y * H, 0, H - 1))
+                pts.append([x, y])
+            if len(pts) < 3:
+                continue
+            pts_np = np.asarray(pts, dtype=np.int32)
+            hull = cv2.convexHull(pts_np)
+            cv2.fillConvexPoly(hand_mask, hull, 1.0)
+
+        if hand_mask.sum() > 0:
+            # 손 주변 소품까지 보호하도록 넉넉히 확장
+            hand_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
+            hand_mask = cv2.dilate(hand_mask, hand_k, iterations=1)
+            hand_mask = cv2.GaussianBlur(hand_mask, (0, 0), sigmaX=4.0)
+            hand_mask = np.clip(hand_mask, 0.0, 1.0).astype(np.float32)
+
+        return hand_mask
 
     def _segface_hair_mask(self, img_rgb: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -1413,7 +1477,10 @@ class MirrAISDPipeline:
         self._sam2_factory = None
         if self._mp_face:
             self._mp_face.close()
+        if self._mp_hands:
+            self._mp_hands.close()
         self._mp_face = None
+        self._mp_hands = None
         self._loaded = False
         gc.collect()
         if torch.cuda.is_available():

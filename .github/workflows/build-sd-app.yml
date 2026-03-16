@@ -79,7 +79,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Docker preflight
+      - name: Ensure Docker daemon
+        shell: bash
+        run: |
+          set +e
+          if docker info >/dev/null 2>&1; then
+            echo "[docker] daemon already running"
+          else
+            echo "[docker] daemon not ready, trying to start..."
+            sudo systemctl start docker 2>/dev/null || true
+            sudo service docker start 2>/dev/null || true
+            if ! docker info >/dev/null 2>&1; then
+              sudo nohup dockerd >/tmp/dockerd.log 2>&1 &
+            fi
+          fi
+          for i in $(seq 1 20); do
+            docker info >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker info
+
+      - name: Docker preflight (non-blocking)
+        continue-on-error: true
         run: |
           docker version
           docker info
