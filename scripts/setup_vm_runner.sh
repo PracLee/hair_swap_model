@@ -39,7 +39,22 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 if ! docker info >/dev/null 2>&1; then
-  echo "[runner] docker daemon is not running on VM. start docker first."
+  echo "[runner] docker daemon is not running. starting dockerd directly (no-systemd fallback)..."
+  pkill -f dockerd >/dev/null 2>&1 || true
+  mkdir -p /var/lib/docker
+  nohup dockerd >/tmp/dockerd.log 2>&1 &
+  for i in {1..40}; do
+    if docker info >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+fi
+
+if ! docker info >/dev/null 2>&1; then
+  echo "[runner] docker daemon failed to start."
+  echo "[runner] last 120 lines of /tmp/dockerd.log:"
+  tail -n 120 /tmp/dockerd.log || true
   exit 1
 fi
 
