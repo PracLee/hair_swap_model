@@ -706,6 +706,27 @@ class MirrAISDPipeline:
             hair_mask_for_sd = hair_mask
             img_rgb_for_sd   = img_rgb
             img_rgb_cleaned  = img_rgb
+
+        # ── bald 전용: LaMa 결과를 바로 최종 결과로 반환 (SD 생성 스킵) ──
+        if is_bald_style:
+            logger.info("[SDPipeline] bald: LaMa 결과를 최종 결과로 사용 (SD 생성 스킵)")
+            final_bgr = cv2.cvtColor(img_rgb_cleaned, cv2.COLOR_RGB2BGR)
+            _store_mask("sd_inpaint_mask", hair_mask_for_sd)
+            _store_rgb("sd_input_rgb", img_rgb_for_sd)
+
+            results: List[SDInpaintResult] = []
+            for rank, seed in enumerate(seeds):
+                results.append(SDInpaintResult(
+                    image=final_bgr,
+                    image_pil=Image.fromarray(img_rgb_cleaned),
+                    seed=seed,
+                    rank=rank,
+                    mask_used=mask_source,
+                    clip_score=0.0,
+                    debug_images=dict(debug_images_common) if debug_images_common and rank == 0 else None,
+                ))
+            return results
+
         _store_mask("sd_inpaint_mask", hair_mask_for_sd)
         _store_rgb("sd_input_rgb", img_rgb_for_sd)
 
@@ -974,18 +995,10 @@ class MirrAISDPipeline:
         """LaMa (Large Mask Inpainting) 모델 로드"""
         if self._lama is not None:
             return
-        try:
-            from simple_lama_inpainting import SimpleLama
-            logger.info("[SDPipeline] LaMa 모델 로드 중...")
-            self._lama = SimpleLama()
-            logger.info("[SDPipeline] LaMa 로드 완료")
-        except ImportError:
-            logger.warning(
-                "[SDPipeline] simple-lama-inpainting 미설치. "
-                "bald 스타일에서 cv2.inpaint 폴백 사용. "
-                "pip install simple-lama-inpainting 으로 설치 가능"
-            )
-            self._lama = None
+        from simple_lama_inpainting import SimpleLama
+        logger.info("[SDPipeline] LaMa 모델 로드 중...")
+        self._lama = SimpleLama()
+        logger.info("[SDPipeline] LaMa 로드 완료")
 
     def _lama_inpaint(self, img_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
@@ -994,11 +1007,6 @@ class MirrAISDPipeline:
         mask: (H, W) float32 [0,1] 또는 uint8 [0,255]
         Returns: (H, W, 3) uint8 RGB
         """
-        if self._lama is None:
-            # 폴백: cv2.inpaint
-            mask_u8 = (mask > 0.5).astype(np.uint8) * 255 if mask.dtype != np.uint8 else mask
-            return cv2.inpaint(img_rgb, mask_u8, inpaintRadius=10, flags=cv2.INPAINT_TELEA)
-
         # LaMa 입력: RGB uint8 + mask uint8 (255=inpaint)
         if mask.dtype == np.float32 or mask.dtype == np.float64:
             mask_u8 = (mask > 0.5).astype(np.uint8) * 255
