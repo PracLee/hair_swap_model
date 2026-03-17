@@ -309,8 +309,8 @@ def main():
     # 헤어스타일 파라미터
     parser.add_argument("--hairstyle", default="wolf cut, layered bangs",
                         help="헤어스타일 텍스트 (기본: 'wolf cut, layered bangs')")
-    parser.add_argument("--color",     default="ash brown",
-                        help="헤어 컬러 텍스트 (기본: 'ash brown')")
+    parser.add_argument("--color",     default="",
+                        help="헤어 컬러 텍스트 (기본: 미지정=원본 톤 유지)")
     parser.add_argument("--top-k",     default=3, type=int,
                         help="결과 수 (기본: 3, 최대: 5)")
     parser.add_argument("--bg-fill",   default="cv2", choices=["cv2", "sd"],
@@ -365,7 +365,7 @@ def main():
     print(f"Endpoint : {args.endpoint_id}")
     if not args.health_check:
         print(f"Hairstyle: {args.hairstyle}")
-        print(f"Color    : {args.color}")
+        print(f"Color    : {args.color if args.color.strip() else '(원본 톤 유지)'}")
         print(f"Top-K    : {args.top_k}")
         print(f"BG Fill  : {args.bg_fill}")
         print(f"Intermed : {'on' if args.return_intermediates else 'off'}")

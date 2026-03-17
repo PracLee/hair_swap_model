@@ -84,6 +84,34 @@ _MEDIUM_HAIR_KEYWORDS = frozenset([
     "collarbone", "clavicle", "mid length", "mid-length",
 ])
 
+_NO_COLOR_HINTS = frozenset([
+    "", "none", "no color", "same", "original", "default",
+    "원본", "기존", "유지", "없음",
+])
+
+# RGB 기준 타겟 컬러 (근사값)
+_HAIR_COLOR_TARGET_RGB: List[Tuple[str, Tuple[int, int, int]]] = [
+    ("ash beige", (173, 158, 136)),
+    ("ash brown", (111, 92, 80)),
+    ("ash blonde", (192, 176, 146)),
+    ("ash black", (58, 58, 62)),
+    ("ash gray", (124, 128, 134)),
+    ("ash grey", (124, 128, 134)),
+    ("ash", (128, 126, 124)),
+    ("black", (44, 41, 39)),
+    ("dark brown", (82, 62, 50)),
+    ("brown", (98, 74, 58)),
+    ("beige", (174, 153, 128)),
+    ("blonde", (193, 166, 121)),
+    ("silver", (170, 174, 182)),
+    ("gray", (132, 132, 132)),
+    ("grey", (132, 132, 132)),
+    ("red", (128, 56, 45)),
+    ("auburn", (120, 63, 48)),
+    ("pink", (170, 112, 132)),
+    ("blue", (82, 95, 138)),
+]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
@@ -228,6 +256,14 @@ class MirrAISDPipeline:
         logger.info(f"[SDPipeline] seeds={seeds}")
 
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        normalized_color_text = self._normalize_color_text(color_text)
+        has_color_request = bool(normalized_color_text)
+        target_hair_lab = self._resolve_target_hair_lab(normalized_color_text) if has_color_request else None
+        if not has_color_request:
+            logger.info("[SDPipeline] color_text 미지정 → 원본 머리 톤 유지 모드")
+        elif target_hair_lab is None:
+            logger.info("[SDPipeline] color_text 파싱 실패 → 색상 재정렬은 스킵")
+
         H, W = image.shape[:2]
         debug_images_common: Optional[Dict[str, np.ndarray]] = {} if return_intermediates else None
         debug_data_common: Optional[Dict[str, Any]] = {} if return_intermediates else None
@@ -588,7 +624,7 @@ class MirrAISDPipeline:
 
         # ── Step 6: 프롬프트 ─────────────────────────────────────────────────
         prompt, neg_prompt, guidance = self._build_prompt(
-            hairstyle_text, color_text, hair_length
+            hairstyle_text, normalized_color_text, hair_length
         )
         logger.info(f"[SDPipeline] 프롬프트: {prompt}")
         logger.info(f"[SDPipeline] 네거티브: {neg_prompt}")
@@ -606,12 +642,9 @@ class MirrAISDPipeline:
         composite_base_rgb = img_rgb_cleaned
         composite_base_bgr = cv2.cvtColor(composite_base_rgb, cv2.COLOR_RGB2BGR)
 
-        results: List[SDInpaintResult] = []
-        for rank, (gen_pil, seed) in enumerate(zip(gen_images, seeds)):
-            if debug_images_common is not None and rank == 0:
-                debug_images_common["sd_generated_rank0_512"] = cv2.cvtColor(
-                    np.array(gen_pil), cv2.COLOR_RGB2BGR
-                )
+        candidates: List[Dict[str, Any]] = []
+        for gen_idx, (gen_pil, seed) in enumerate(zip(gen_images, seeds)):
+            gen_preview_bgr = cv2.cvtColor(np.array(gen_pil), cv2.COLOR_RGB2BGR)
             composited_bgr = self._composite(
                 composite_base_bgr, composite_base_rgb,
                 gen_pil, hair_mask_for_sd, scale, pad, (W, H),
@@ -649,12 +682,67 @@ class MirrAISDPipeline:
                 except Exception as e:
                     logger.warning(f"[SDPipeline] final cutoff cleanup 실패(무시): {e}")
 
+            if not has_color_request:
+                try:
+                    post_rgb = cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)
+                    post_rgb = self._preserve_original_hair_tone(
+                        source_rgb=img_rgb,
+                        target_rgb=post_rgb,
+                        face_bbox=face_bbox,
+                    )
+                    composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
+                except Exception as e:
+                    logger.warning(f"[SDPipeline] 원본 컬러 유지 보정 실패(무시): {e}")
+
+            color_distance: Optional[float] = None
+            color_score = 0.0
+            if has_color_request and target_hair_lab is not None:
+                try:
+                    post_rgb = cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)
+                    color_distance = self._estimate_hair_color_distance(
+                        img_rgb=post_rgb,
+                        face_bbox=face_bbox,
+                        target_lab=target_hair_lab,
+                    )
+                    if color_distance is not None:
+                        color_score = float(np.clip(1.0 - (color_distance / 80.0), 0.0, 1.0))
+                except Exception as e:
+                    logger.warning(f"[SDPipeline] 색상 거리 계산 실패(무시): {e}")
+
+            candidates.append({
+                "seed": seed,
+                "image_bgr": composited_bgr,
+                "preview_bgr": gen_preview_bgr,
+                "color_distance": color_distance,
+                "color_score": color_score,
+                "gen_idx": gen_idx,
+            })
+
+        if has_color_request and target_hair_lab is not None and len(candidates) > 1:
+            sortable_count = sum(c["color_distance"] is not None for c in candidates)
+            if sortable_count >= 2:
+                candidates.sort(
+                    key=lambda c: (
+                        c["color_distance"] is None,
+                        c["color_distance"] if c["color_distance"] is not None else 1e9,
+                        c["gen_idx"],
+                    )
+                )
+                logger.info("[SDPipeline] 컬러 유사도 기준으로 결과 재정렬 완료")
+            else:
+                logger.info("[SDPipeline] 컬러 유사도 재정렬 스킵 (유효 샘플 부족)")
+
+        results: List[SDInpaintResult] = []
+        for rank, cand in enumerate(candidates):
+            if debug_images_common is not None and rank == 0:
+                debug_images_common["sd_generated_rank0_512"] = cand["preview_bgr"]
             results.append(SDInpaintResult(
-                image=composited_bgr,
-                image_pil=Image.fromarray(cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)),
-                seed=seed,
+                image=cand["image_bgr"],
+                image_pil=Image.fromarray(cv2.cvtColor(cand["image_bgr"], cv2.COLOR_BGR2RGB)),
+                seed=cand["seed"],
                 rank=rank,
                 mask_used=mask_source,
+                clip_score=float(cand["color_score"]),
                 mask=hair_mask,
                 face_bbox=face_bbox,
                 debug_images=debug_images_common if (debug_images_common is not None and rank == 0) else None,
@@ -1445,6 +1533,93 @@ class MirrAISDPipeline:
         return expanded
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Color Helpers
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_color_text(color_text: str) -> str:
+        text = str(color_text or "").strip()
+        lowered = text.lower()
+        if lowered in _NO_COLOR_HINTS:
+            return ""
+        return text
+
+    @staticmethod
+    def _resolve_target_hair_lab(color_text: str) -> Optional[np.ndarray]:
+        query = str(color_text or "").strip().lower()
+        if not query:
+            return None
+        for keyword, rgb in _HAIR_COLOR_TARGET_RGB:
+            if keyword in query:
+                rgb_np = np.array([[list(rgb)]], dtype=np.uint8)
+                lab = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2LAB).astype(np.float32)[0, 0]
+                return lab
+        return None
+
+    def _estimate_hair_color_distance(
+        self,
+        img_rgb: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        target_lab: np.ndarray,
+    ) -> Optional[float]:
+        hair_mask, _, _ = self._segface_hair_mask(img_rgb, face_bbox)
+        hair_u8 = (hair_mask > 0.45).astype(np.uint8) * 255
+        if int((hair_u8 > 0).sum()) < 80:
+            return None
+
+        lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+        hair_pixels = lab[hair_u8 > 0]
+        if hair_pixels.shape[0] < 50:
+            return None
+
+        # 극단적인 shadow 영역 영향 완화
+        if hair_pixels.shape[0] > 200:
+            l_vals = hair_pixels[:, 0]
+            keep = l_vals > np.percentile(l_vals, 15.0)
+            if np.any(keep):
+                hair_pixels = hair_pixels[keep]
+
+        med = np.median(hair_pixels, axis=0)
+        d_l = abs(float(med[0] - target_lab[0]))
+        d_a = abs(float(med[1] - target_lab[1]))
+        d_b = abs(float(med[2] - target_lab[2]))
+        # 색조(a,b)를 더 강하게 반영
+        return 0.25 * d_l + 0.85 * d_a + 0.85 * d_b
+
+    def _preserve_original_hair_tone(
+        self,
+        source_rgb: np.ndarray,
+        target_rgb: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+    ) -> np.ndarray:
+        src_hair, _, _ = self._segface_hair_mask(source_rgb, face_bbox)
+        tgt_hair, _, _ = self._segface_hair_mask(target_rgb, face_bbox)
+
+        src_mask = (src_hair > 0.45)
+        tgt_mask = (tgt_hair > 0.45)
+        if int(src_mask.sum()) < 100 or int(tgt_mask.sum()) < 100:
+            return target_rgb
+
+        src_lab = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+        tgt_lab = cv2.cvtColor(target_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+        src_mean = src_lab[src_mask].mean(axis=0)
+        tgt_mean = tgt_lab[tgt_mask].mean(axis=0)
+
+        tuned_lab = tgt_lab.copy()
+        vals = tuned_lab[tgt_mask]
+        vals[:, 1] = np.clip(vals[:, 1] + (src_mean[1] - tgt_mean[1]) * 0.78, 0.0, 255.0)
+        vals[:, 2] = np.clip(vals[:, 2] + (src_mean[2] - tgt_mean[2]) * 0.78, 0.0, 255.0)
+        vals[:, 0] = np.clip(vals[:, 0] + (src_mean[0] - tgt_mean[0]) * 0.32, 0.0, 255.0)
+        tuned_lab[tgt_mask] = vals
+
+        tuned_rgb = cv2.cvtColor(tuned_lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+        alpha = cv2.GaussianBlur(tgt_hair.astype(np.float32), (0, 0), sigmaX=3.0, sigmaY=3.0)
+        alpha = np.clip(alpha * 0.70, 0.0, 1.0)[..., np.newaxis]
+        out = tuned_rgb.astype(np.float32) * alpha + target_rgb.astype(np.float32) * (1.0 - alpha)
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Prompt
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -1458,11 +1633,12 @@ class MirrAISDPipeline:
         Returns:
             positive_prompt, negative_prompt, guidance_scale
         """
+        normalized_color = MirrAISDPipeline._normalize_color_text(color_text)
         parts = []
         if hairstyle_text:
             parts.append(hairstyle_text.strip())
-        if color_text:
-            parts.append(f"{color_text.strip()} hair color")
+        if normalized_color:
+            parts.append(f"{normalized_color.strip()} hair color")
         style = ", ".join(parts) if parts else "natural hairstyle"
 
         # ── 길이별 positive/negative 보강 ────────────────────────────────────
@@ -1492,12 +1668,26 @@ class MirrAISDPipeline:
             neg_prefix = ""
             guidance = 7.5
 
-        positive = (
-            f"professional portrait photo of a person with {style}{pos_suffix}, "
-            "photorealistic, high quality, natural lighting, 8k, "
-            "studio photography, sharp focus, beautiful hair"
-        )
-        negative = neg_prefix + _NEGATIVE_BASE
+        color_pos_hint = ""
+        color_neg_hint = ""
+        lowered_color = normalized_color.lower()
+        if "ash" in lowered_color:
+            color_pos_hint = ", cool-toned ash color, smoky neutral undertone, no brassiness"
+            color_neg_hint = "warm orange cast, yellow brassiness, copper tint, reddish tint, "
+        elif normalized_color:
+            color_pos_hint = ", consistent natural hair color tone, coherent root-to-end color"
+
+        positive_parts = [
+            f"professional portrait photo of a person with {style}{pos_suffix}",
+        ]
+        if color_pos_hint:
+            positive_parts.append(color_pos_hint.lstrip(", ").strip())
+        positive_parts.extend([
+            "photorealistic, high quality, natural lighting, 8k",
+            "studio photography, sharp focus, beautiful hair",
+        ])
+        positive = ", ".join(positive_parts)
+        negative = neg_prefix + color_neg_hint + _NEGATIVE_BASE
 
         return positive, negative, guidance
 
