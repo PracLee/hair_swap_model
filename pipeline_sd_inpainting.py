@@ -496,11 +496,7 @@ class MirrAISDPipeline:
             # 얼굴 내부(눈/코/입)는 inpaint 하지 않음
             gen_mask = np.clip(gen_mask - face_region_mask, 0.0, 1.0)
             # 옷도 보호
-            if hair_length == "medium":
-                # medium은 끝선 생성을 위해 의상 보호를 완화(완전 차단시 하단 notching 발생)
-                gen_mask = np.clip(gen_mask - cloth_mask_dilated * 0.55, 0.0, 1.0)
-            else:
-                gen_mask = np.clip(gen_mask - cloth_mask_dilated, 0.0, 1.0)
+            gen_mask = np.clip(gen_mask - cloth_mask_dilated, 0.0, 1.0)
 
             # 어깨 윤곽(옷 상단 경계)은 과도하게 지우지 않도록 보호
             if shoulder_protect_for_post is not None:
