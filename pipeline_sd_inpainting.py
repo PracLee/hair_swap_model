@@ -425,8 +425,9 @@ class MirrAISDPipeline:
             removal_mask = np.clip(removal_mask - hand_mask, 0.0, 1.0)
             # 어깨 윤곽(옷 상단 경계)은 과도하게 지우지 않도록 보호
             if shoulder_protect_for_post is not None:
+                shoulder_protect_weight = 0.48 if hair_length == "short" else 0.85
                 removal_mask = np.clip(
-                    removal_mask - shoulder_protect_for_post * 0.85,
+                    removal_mask - shoulder_protect_for_post * shoulder_protect_weight,
                     0.0,
                     1.0,
                 )
@@ -547,6 +548,7 @@ class MirrAISDPipeline:
                         face_bbox=face_bbox,
                         cutoff_y=cutoff_y,
                         shoulder_protect=shoulder_protect_for_post,
+                        hair_length=hair_length,
                     )
                 except Exception as e:
                     logger.warning(f"[SDPipeline] residual hair 정리 실패(무시): {e}")
@@ -625,6 +627,7 @@ class MirrAISDPipeline:
                         face_bbox=face_bbox,
                         cutoff_y=cutoff_y_for_post,
                         shoulder_protect=shoulder_protect_for_post,
+                        hair_length=hair_length,
                     )
                     composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
                 except Exception as e:
@@ -1745,6 +1748,7 @@ class MirrAISDPipeline:
         face_bbox: Tuple[int, int, int, int],
         cutoff_y: int,
         shoulder_protect: Optional[np.ndarray] = None,
+        hair_length: str = "short",
     ) -> np.ndarray:
         """
         short/medium 변환 후 cutoff 아래에 남은 머리카락을 재검출해 정리.
@@ -1766,7 +1770,14 @@ class MirrAISDPipeline:
         residual_u8 = cv2.morphologyEx(residual_u8, cv2.MORPH_OPEN, open_k)
 
         if shoulder_protect is not None and shoulder_protect.shape == (H, W):
-            protect_u8 = (shoulder_protect > 0.22).astype(np.uint8) * 255
+            protect_threshold = 0.50 if hair_length == "short" else 0.22
+            protect_u8 = (shoulder_protect > protect_threshold).astype(np.uint8) * 255
+            if hair_length == "short" and int((protect_u8 > 0).sum()) > 0:
+                protect_u8 = cv2.erode(
+                    protect_u8,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                    iterations=1,
+                )
             if int((protect_u8 > 0).sum()) > 0:
                 residual_u8 = cv2.bitwise_and(residual_u8, cv2.bitwise_not(protect_u8))
 
@@ -1871,7 +1882,14 @@ class MirrAISDPipeline:
             force_u8 = hair_inter_u8
 
         if shoulder_protect is not None and shoulder_protect.shape == (H, W):
-            protect_u8 = (shoulder_protect > 0.22).astype(np.uint8) * 255
+            protect_threshold = 0.50 if hair_length == "short" else 0.22
+            protect_u8 = (shoulder_protect > protect_threshold).astype(np.uint8) * 255
+            if hair_length == "short" and int((protect_u8 > 0).sum()) > 0:
+                protect_u8 = cv2.erode(
+                    protect_u8,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                    iterations=1,
+                )
             if int((protect_u8 > 0).sum()) > 0:
                 force_u8 = cv2.bitwise_and(force_u8, cv2.bitwise_not(protect_u8))
 
