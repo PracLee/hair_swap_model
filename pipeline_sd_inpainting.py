@@ -531,6 +531,8 @@ class MirrAISDPipeline:
                             face_bbox=face_bbox,
                             face_crop_pil=face_crop_fill,
                             protect_mask=face_region_mask,
+                            cloth_mask=cloth_mask_dilated,
+                            hair_length=hair_length,
                             seed=fill_seed,
                         )
                         logger.info("[SDPipeline] bg_fill_mode=sd: 제거 영역 SD 보정 완료")
@@ -1288,6 +1290,7 @@ class MirrAISDPipeline:
         self,
         img_rgb: np.ndarray,     # H×W×3 RGB
         hair_mask: np.ndarray,   # H×W float32
+        mask_edge_suppression: float = 1.0,  # 0.0=엣지 보존, 1.0=마스크 내부 엣지 완전 제거
     ) -> Tuple[Image.Image, Image.Image, Image.Image, float, Tuple[int, int]]:
         """
         Letter-box resize → 512×512.
@@ -1315,12 +1318,14 @@ class MirrAISDPipeline:
         msk_canvas = np.zeros((SD_SIZE, SD_SIZE), dtype=np.float32)
         msk_canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = msk_rs
 
-        # ── Canny edge (hair 마스크 영역은 완전히 제거 → SD가 자유롭게 헤어 생성)
+        # ── Canny edge
+        # 기본(헤어 생성): 마스크 내부 엣지 강하게 제거
+        # 배경 복원(fill): 일부 엣지를 남겨 texture/구조 연속성 확보
         gray = cv2.cvtColor(canvas, cv2.COLOR_RGB2GRAY)
         canny = cv2.Canny(gray, self.config.canny_low, self.config.canny_high)
-        # 마스크 영역 내부 엣지 완전 제거 (0.8 약화 → 완전 소거로 변경)
+        suppress = float(np.clip(mask_edge_suppression, 0.0, 1.0))
         hair_hard = (msk_canvas > 0.5).astype(np.float32)
-        canny_f = canny.astype(np.float32) * (1.0 - hair_hard)
+        canny_f = canny.astype(np.float32) * (1.0 - hair_hard * suppress)
         canny_rgb = cv2.cvtColor(canny_f.astype(np.uint8), cv2.COLOR_GRAY2RGB)
 
         img_512   = Image.fromarray(canvas)
@@ -1567,6 +1572,8 @@ class MirrAISDPipeline:
         face_bbox: Tuple[int, int, int, int],
         face_crop_pil: Image.Image,    # IP-Adapter conditioning face
         protect_mask: Optional[np.ndarray],  # H×W float32 (얼굴 보호)
+        cloth_mask: Optional[np.ndarray],    # H×W float32 (의상 영역)
+        hair_length: str,
         seed: int,
     ) -> np.ndarray:
         """
@@ -1578,24 +1585,40 @@ class MirrAISDPipeline:
 
         # removal 영역 중심으로만 SD를 적용하기 위해 그대로 letterbox 변환
         fill_mask = (removal_mask > 0.5).astype(np.float32)
-        img_512, mask_512, canny_512, scale, pad = self._prepare_sd_inputs(base_rgb, fill_mask)
-
-        fill_prompt = (
-            "professional portrait photo, clean neck and shoulders, visible neck, "
-            "natural skin and clothing texture continuity, no hair below chin, "
-            "no loose hair strands, photorealistic"
+        img_512, mask_512, canny_512, scale, pad = self._prepare_sd_inputs(
+            base_rgb,
+            fill_mask,
+            mask_edge_suppression=0.45,
         )
+
+        if hair_length == "short":
+            fill_prompt = (
+                "professional portrait photo, clean natural neck and shoulders, "
+                "realistic clothing fabric texture continuity, coherent background, "
+                "short-hair silhouette maintained, no long hair below jawline, "
+                "no loose dangling strands in masked region, photorealistic details"
+            )
+            fill_guidance = 7.1
+        else:
+            fill_prompt = (
+                "professional portrait photo, clean neck and shoulders, "
+                "natural skin and clothing texture continuity, coherent background, "
+                "no loose long hair strands in masked region, photorealistic details"
+            )
+            fill_guidance = 7.6
         fill_negative = (
             "long hair, hair below chin, hair below shoulders, loose hair strands, "
             "wavy hair, straight long hair, wig, ponytail, braid, bangs, side locks, "
             "earrings, earring, dangling earrings, hoop earrings, pearl earrings, "
             "jewelry, necklace, pendant, choker, accessories, piercings, "
-            "deformed neck, artifacts, blurry, cartoon, painting"
+            "deformed neck, artifacts, blurry, smudged texture, melted details, cartoon, painting"
         )
 
         # 배경 복원은 identity 영향이 과하면 긴머리가 다시 생길 수 있어 scale을 낮춘다.
         self._sd_pipe.set_ip_adapter_scale(0.0)
         generator = torch.Generator(device=self.device).manual_seed(int(seed))
+        fill_control = float(np.clip(max(self.config.controlnet_conditioning_scale, 0.18), 0.12, 0.30))
+        fill_steps = max(24, self.config.num_inference_steps - 4)
 
         with torch.inference_mode():
             out = self._sd_pipe(
@@ -1607,12 +1630,12 @@ class MirrAISDPipeline:
                 ip_adapter_image=[face_crop_pil],
                 height=SD_SIZE,
                 width=SD_SIZE,
-                num_inference_steps=max(20, self.config.num_inference_steps - 8),
-                guidance_scale=9.0,
-                controlnet_conditioning_scale=min(self.config.controlnet_conditioning_scale, 0.10),
+                num_inference_steps=fill_steps,
+                guidance_scale=fill_guidance,
+                controlnet_conditioning_scale=fill_control,
                 num_images_per_prompt=1,
                 generator=generator,
-                strength=1.0,
+                strength=0.88,
             )
 
         gen_np = np.array(out.images[0])  # 512×512 RGB
@@ -1624,18 +1647,22 @@ class MirrAISDPipeline:
         gen_cropped = gen_np[pad_t:pad_t + new_h, pad_l:pad_l + new_w]
         gen_orig = cv2.resize(gen_cropped, (W, H), interpolation=cv2.INTER_LANCZOS4)
 
-        alpha = cv2.GaussianBlur(fill_mask, (0, 0), sigmaX=8.0, sigmaY=8.0)
+        alpha = cv2.GaussianBlur(fill_mask, (0, 0), sigmaX=7.0, sigmaY=7.0)
         alpha = np.clip(alpha, 0.0, 1.0)
 
-        # SD 보정은 중앙(목/상체) 위주로 적용하고 좌우 사이드는 cv2 결과를 유지
-        # → side 영역에서 장발이 다시 생성되는 현상 완화
+        # 중앙 편향을 완화해 side 잔존 영역도 자연스럽게 복원한다.
         x1, y1, x2, y2 = face_bbox
         cx = 0.5 * (x1 + x2)
         face_w = max(float(x2 - x1), 1.0)
-        sigma_x = max(face_w * 0.9, 24.0)
+        sigma_x = max(face_w * 1.45, 44.0)
         xs = np.arange(W, dtype=np.float32)
         center_weight = np.exp(-0.5 * ((xs - cx) / sigma_x) ** 2)
-        alpha = alpha * center_weight[np.newaxis, :]
+        alpha = alpha * (0.65 + 0.35 * center_weight[np.newaxis, :])
+
+        # 의상 영역은 과도한 hallucination을 줄이기 위해 SD 블렌딩 가중치를 낮춘다.
+        if cloth_mask is not None and cloth_mask.shape == (H, W):
+            cloth_w = np.clip(cloth_mask.astype(np.float32), 0.0, 1.0)
+            alpha = alpha * (1.0 - 0.18 * cloth_w)
 
         # 얼굴은 기존 픽셀 고정
         if protect_mask is not None:
