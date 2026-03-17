@@ -499,18 +499,34 @@ class MirrAISDPipeline:
             # 기존: hair_mask의 cutoff_y 위쪽 (아치형만 → 귀 옆 공간 없음)
             # 변경: face_bbox 기반 head box → 귀 옆까지 포함해서 SD가 숏컷 생성
 
-            gen_mask = np.zeros((H, W), dtype=np.float32)
-            gen_mask[head_y1:head_y2, head_x1:head_x2] = 1.0
-            # 얼굴 내부(눈/코/입)는 inpaint 하지 않음
-            gen_mask = np.clip(gen_mask - face_region_mask, 0.0, 1.0)
-            # 옷도 보호
-            if hair_length == "medium":
-                # medium은 끝선 생성을 위해 의상 보호를 완화(완전 차단시 하단 notching 발생)
-                gen_mask = np.clip(gen_mask - cloth_mask_dilated * 0.55, 0.0, 1.0)
+            if is_bald_style:
+                # bald는 head-box 사각형 대신 실제 hair silhouette 중심으로 생성 영역을 제한.
+                bald_u8 = (hair_mask_base > 0.35).astype(np.uint8) * 255
+                bald_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+                bald_u8 = cv2.dilate(bald_u8, bald_k, iterations=1)
+                forehead_u8 = np.zeros((H, W), dtype=np.uint8)
+                fx1 = max(0, int(x1f - face_w * 0.28))
+                fx2 = min(W, int(x2f + face_w * 0.28))
+                fy1 = max(0, int(y1f - face_h * 0.28))
+                fy2 = min(H, int(y1f + face_h * 0.20))
+                if fx1 < fx2 and fy1 < fy2:
+                    forehead_u8[fy1:fy2, fx1:fx2] = 255
+                bald_mask = np.maximum(bald_u8.astype(np.float32) / 255.0, forehead_u8.astype(np.float32) / 255.0)
+                gen_mask = np.clip(bald_mask - face_region_mask * 0.72, 0.0, 1.0)
+                gen_mask = np.clip(gen_mask - hand_mask, 0.0, 1.0)
             else:
-                gen_mask = np.clip(gen_mask - cloth_mask_dilated, 0.0, 1.0)
-            # 손/소품도 보호
-            gen_mask = np.clip(gen_mask - hand_mask, 0.0, 1.0)
+                gen_mask = np.zeros((H, W), dtype=np.float32)
+                gen_mask[head_y1:head_y2, head_x1:head_x2] = 1.0
+                # 얼굴 내부(눈/코/입)는 inpaint 하지 않음
+                gen_mask = np.clip(gen_mask - face_region_mask, 0.0, 1.0)
+                # 옷도 보호
+                if hair_length == "medium":
+                    # medium은 끝선 생성을 위해 의상 보호를 완화(완전 차단시 하단 notching 발생)
+                    gen_mask = np.clip(gen_mask - cloth_mask_dilated * 0.55, 0.0, 1.0)
+                else:
+                    gen_mask = np.clip(gen_mask - cloth_mask_dilated, 0.0, 1.0)
+                # 손/소품도 보호
+                gen_mask = np.clip(gen_mask - hand_mask, 0.0, 1.0)
 
             # 제거 단계에서도 손/소품은 보호
             removal_mask = np.clip(removal_mask - hand_mask, 0.0, 1.0)
@@ -644,13 +660,17 @@ class MirrAISDPipeline:
                         #   step-1) 긴머리 흔적을 tied/slicked-back 컨셉으로 먼저 정리
                         #   step-2) 제거 영역 배경/목/어깨를 한 번 더 정리
                         if self.config.enable_two_step_preclean:
+                            preclean_seed_mask = removal_mask
+                            if is_bald_style:
+                                preclean_seed_mask = np.maximum(preclean_seed_mask, hair_mask_base)
                             preclean_mask = self._build_preclean_mask_for_two_step(
-                                removal_mask=removal_mask,
+                                removal_mask=preclean_seed_mask,
                                 face_bbox=face_bbox,
                                 cutoff_y=cutoff_y,
                                 cloth_mask=cloth_mask_dilated,
                                 hand_mask=hand_mask,
                                 hair_length=hair_length,
+                                is_bald_style=is_bald_style,
                             )
                             _store_mask("pipeline_preclean_mask", preclean_mask)
                             preclean_protect = np.clip(face_region_mask + hand_mask, 0.0, 1.0)
@@ -661,6 +681,7 @@ class MirrAISDPipeline:
                                 face_crop_pil=face_crop_fill,
                                 protect_mask=preclean_protect,
                                 hair_length=hair_length,
+                                is_bald_style=is_bald_style,
                                 seed=fill_seed + 13,
                             )
                             _store_rgb("sd_preclean_rgb", fill_base)
@@ -1763,11 +1784,12 @@ class MirrAISDPipeline:
         if is_bald_style:
             pos_suffix = (
                 ", shaved head, bald scalp, clean scalp skin texture, "
-                "no bangs, no side hair, no visible loose strands"
+                "no bangs, no side hair, no visible loose strands, no headwear"
             )
             neg_prefix = (
                 "long hair, medium hair, short bob, pixie cut, bangs, fringe, "
                 "side locks, strands over forehead, hair over ears, "
+                "hat, cap, beanie, helmet, hairnet, headscarf, bandana, head covering, "
             )
             guidance = 9.8
         elif hair_length == "short":
@@ -2014,6 +2036,7 @@ class MirrAISDPipeline:
         cloth_mask: Optional[np.ndarray],
         hand_mask: Optional[np.ndarray],
         hair_length: str,
+        is_bald_style: bool = False,
     ) -> np.ndarray:
         """
         two-step pre-clean용 확장 마스크 생성.
@@ -2037,11 +2060,24 @@ class MirrAISDPipeline:
         dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kx, ky))
         preclean_u8 = cv2.dilate(base_u8, dilate_k, iterations=1)
 
-        corridor_x_ratio = 1.95 if hair_length == "short" else 2.15
-        x_min = max(0, int(x1 - face_w * corridor_x_ratio))
-        x_max = min(W, int(x2 + face_w * corridor_x_ratio))
-        y_min = max(0, int(cutoff_y - face_h * 0.16))
-        y_max = min(H, int(cutoff_y + face_h * (1.35 if hair_length == "short" else 1.65)))
+        if is_bald_style:
+            ys_h, xs_h = np.where(preclean_u8 > 0)
+            if xs_h.size > 0 and ys_h.size > 0:
+                x_min = max(0, int(xs_h.min() - face_w * 0.35))
+                x_max = min(W, int(xs_h.max() + face_w * 0.35))
+                y_min = max(0, int(min(ys_h.min(), y1) - face_h * 0.45))
+                y_max = min(H, int(max(ys_h.max(), cutoff_y) + face_h * 0.90))
+            else:
+                x_min = max(0, int(x1 - face_w * 0.95))
+                x_max = min(W, int(x2 + face_w * 0.95))
+                y_min = max(0, int(y1 - face_h * 0.45))
+                y_max = min(H, int(cutoff_y + face_h * 0.90))
+        else:
+            corridor_x_ratio = 1.95 if hair_length == "short" else 2.15
+            x_min = max(0, int(x1 - face_w * corridor_x_ratio))
+            x_max = min(W, int(x2 + face_w * corridor_x_ratio))
+            y_min = max(0, int(cutoff_y - face_h * 0.16))
+            y_max = min(H, int(cutoff_y + face_h * (1.35 if hair_length == "short" else 1.65)))
         corridor_u8 = np.zeros((H, W), dtype=np.uint8)
         if x_min < x_max and y_min < y_max:
             corridor_u8[y_min:y_max, x_min:x_max] = 255
@@ -2064,7 +2100,10 @@ class MirrAISDPipeline:
         close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
         preclean_u8 = cv2.morphologyEx(preclean_u8, cv2.MORPH_CLOSE, close_k)
 
-        max_ratio = 0.30 if hair_length == "short" else 0.34
+        if is_bald_style:
+            max_ratio = 0.22
+        else:
+            max_ratio = 0.30 if hair_length == "short" else 0.34
         max_px = int(H * W * max_ratio)
         cur_px = int((preclean_u8 > 0).sum())
         if cur_px > max_px:
@@ -2086,6 +2125,7 @@ class MirrAISDPipeline:
         face_crop_pil: Image.Image,
         protect_mask: Optional[np.ndarray],
         hair_length: str,
+        is_bald_style: bool,
         seed: int,
     ) -> np.ndarray:
         """
@@ -2106,7 +2146,13 @@ class MirrAISDPipeline:
             mask_edge_suppression=0.22,
         )
 
-        if hair_length == "short":
+        if is_bald_style:
+            clean_prompt = (
+                "professional portrait photo, clean bald scalp, bare smooth scalp skin texture, "
+                "no bangs, no side hair, no visible strands, clean neck and shoulders, "
+                "coherent background and clothing texture, photorealistic details"
+            )
+        elif hair_length == "short":
             clean_prompt = (
                 "professional portrait photo, tightly tied-back slicked-back hair silhouette, "
                 "clean exposed neck and shoulders, no dangling side hair strands, "
@@ -2122,13 +2168,17 @@ class MirrAISDPipeline:
             )
         clean_negative = (
             "long hanging hair, side locks over chest, loose strands, visible ponytail, braid, "
+            "hat, cap, beanie, helmet, hairnet, headscarf, bandana, head covering, "
             "wavy long hair, hair below shoulders, messy flyaway clumps, wig-like texture, "
             "artifacts, blurred texture, melted details, cartoon, painting"
         )
 
         self._sd_pipe.set_ip_adapter_scale(0.0)
         generator = torch.Generator(device=self.device).manual_seed(int(seed))
-        clean_control = float(np.clip(self.config.controlnet_conditioning_scale * 0.45, 0.08, 0.16))
+        if is_bald_style:
+            clean_control = float(np.clip(self.config.controlnet_conditioning_scale * 0.25, 0.04, 0.08))
+        else:
+            clean_control = float(np.clip(self.config.controlnet_conditioning_scale * 0.45, 0.08, 0.16))
         clean_steps = max(26, self.config.num_inference_steps - 2)
         clean_strength = float(np.clip(self.config.preclean_strength, 0.86, 0.99))
 
