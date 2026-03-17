@@ -392,207 +392,45 @@ class MirrAISDPipeline:
             head_y1  = max(0, y1f - int(face_h * 0.6))   # 정수리 위까지
             head_y2  = cutoff_y
 
-            # ── 제거 마스크: SAM2 감지 영역 + 어깨 너비 확장 ────────────────────
-            # SAM2가 한쪽 머리를 놓친 경우(오른쪽 등) 를 커버하기 위해
-            # cutoff_y 아래 전체 어깨 너비를 removal 영역으로 포함
-            # short에서는 SAM2 과검출(손/소품/배경 포함) 억제를 위해
-            # SegFace 기반 hair prior와 교집합을 우선 사용한다.
-            if hair_length == "short":
-                base_prior = np.clip(hair_mask_base - face_region_mask, 0.0, 1.0).astype(np.float32)
-                prior_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
-                base_prior = cv2.dilate((base_prior > 0.5).astype(np.uint8) * 255, prior_k, iterations=1)
-                base_prior = (base_prior > 0).astype(np.float32)
-
-                removal_seed = np.clip(hair_mask_for_removal * base_prior, 0.0, 1.0)
-                # short 변환에서는 cutoff 아래 long-tail은 적극적으로 제거한다.
-                # (prior 교집합이 너무 보수적으로 작동할 때 하단 잔존 모발이 남는 문제 보완)
-                tail_below_cutoff = hair_mask_for_removal.copy()
-                tail_below_cutoff[:cutoff_y, :] = 0.0
-                tail_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 9))
-                tail_below_cutoff = cv2.dilate(
-                    (tail_below_cutoff > 0.5).astype(np.uint8) * 255,
-                    tail_k,
-                    iterations=1,
-                ).astype(np.float32) / 255.0
-
-                # 교집합이 과도하게 작으면 기존 SAM 기반 마스크로 폴백
-                if removal_seed.sum() > 120:
-                    removal_mask = np.clip(np.maximum(removal_seed, tail_below_cutoff), 0.0, 1.0)
-                else:
-                    removal_mask = hair_mask_for_removal.copy()
-            else:
-                # medium은 의상 훼손이 크므로 cloth-protected hair mask를 기본으로 사용.
-                removal_mask = hair_mask.copy()
-            removal_mask[:cutoff_y, :] = 0.0
-
-            # 실제 hair 픽셀 기반으로만 확장 (직사각형 전체 확장 시 옷 패치 훼손 유발)
-            hair_below_src = hair_mask_for_removal if hair_length == "short" else hair_mask
-            hair_below = (hair_below_src > 0.5).astype(np.uint8)
-            hair_below[:cutoff_y, :] = 0
-            hair_below[:, :max(0, head_x1 - 20)] = 0
-            hair_below[:, min(W, head_x2 + 20):] = 0
-            if int((hair_below > 0).sum()) > 0:
-                # short는 연결 보정만, medium은 어깨선까지 조금 더 강하게 확장
-                expand_k = (
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 9))
-                    if hair_length == "short"
-                    else cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 13))
-                )
-                hair_below_expanded = cv2.dilate(hair_below, expand_k, iterations=1).astype(np.float32)
-                removal_mask = np.maximum(removal_mask, hair_below_expanded)
-                logger.info(
-                    f"[SDPipeline] removal_mask hair기반 확장({hair_length}): "
-                    f"pixels={removal_mask.sum():.0f}"
-                )
-
-                # SegFace/SAM miss로 중앙이 끊겨 있으면 neck corridor에서 좌우를 연결.
-                # (잔존 장발 + 생성 헤어 이중 경계 완화)
-                bridge_u8 = np.zeros((H, W), dtype=np.uint8)
-                bridge_src_u8 = (hair_below_expanded > 0).astype(np.uint8)
-                bridge_y2 = min(H, int(cutoff_y + face_h * (1.10 if hair_length == "short" else 1.45)))
-                max_span = int(face_w * (2.70 if hair_length == "short" else 3.00))
-                for row in range(cutoff_y, bridge_y2):
-                    cols = np.where(bridge_src_u8[row] > 0)[0]
-                    if cols.size < 2:
-                        continue
-                    c_min = int(cols.min())
-                    c_max = int(cols.max())
-                    if c_max - c_min > max_span:
-                        continue
-                    bridge_u8[row, c_min:c_max + 1] = 255
-                if int((bridge_u8 > 0).sum()) > 0:
-                    smooth_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 7))
-                    bridge_u8 = cv2.morphologyEx(bridge_u8, cv2.MORPH_CLOSE, smooth_k)
-                    bridge_zone = np.zeros((H, W), dtype=np.uint8)
-                    bridge_zone[cutoff_y:bridge_y2, max(0, head_x1 - 14):min(W, head_x2 + 14)] = 255
-                    bridge_u8 = cv2.bitwise_and(bridge_u8, bridge_zone)
-
-                support_k = cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE,
-                    (111, 47) if hair_length == "short" else (131, 55),
-                )
-                support_u8 = cv2.dilate((hair_below > 0).astype(np.uint8) * 255, support_k, iterations=1)
-                bridge_u8 = cv2.bitwise_and(bridge_u8, support_u8)
-
-                if int((bridge_u8 > 0).sum()) > 0:
-                    removal_mask = np.maximum(removal_mask, bridge_u8.astype(np.float32) / 255.0)
-                    logger.info(
-                        f"[SDPipeline] removal_mask 연결 보강({hair_length}): "
-                        f"pixels={int((bridge_u8 > 0).sum())}"
-                    )
-            # short는 최소 연결만, medium은 조금 더 강하게 연결
-            close_size = 5 if hair_length == "short" else 11
-            remove_close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size))
-            removal_mask = cv2.morphologyEx(removal_mask, cv2.MORPH_CLOSE, remove_close_k)
-            removal_mask = np.clip(removal_mask, 0.0, 1.0).astype(np.float32)
+            # ── 전략 1: 선(先) 철거 후(後) 시공 ──────────────────────────────────
+            # 전체 머리카락을 LaMa로 제거한 뒤, 깨끗한 캔버스 위에 SD로 새 헤어 생성
+            #
+            # removal_mask = 전체 머리카락 (cutoff 구분 없이 SAM2 전체 mask)
+            removal_mask = hair_mask_for_removal.copy()
+            # 얼굴/옷 보호
+            removal_mask = np.clip(removal_mask - face_region_mask, 0.0, 1.0)
+            removal_mask = np.clip(removal_mask - cloth_mask_dilated, 0.0, 1.0)
             removal_mask_for_post = removal_mask.copy()
 
-            # ── 생성 마스크: head box 기반 (아치형만이 아닌 머리 전체 공간) ─────
-            # 기존: hair_mask의 cutoff_y 위쪽 (아치형만 → 귀 옆 공간 없음)
-            # 변경: face_bbox 기반 head box → 귀 옆까지 포함해서 SD가 숏컷 생성
-
+            # gen_mask = head box 기반 (SD가 새 헤어를 생성할 영역)
             gen_mask = np.zeros((H, W), dtype=np.float32)
             gen_mask[head_y1:head_y2, head_x1:head_x2] = 1.0
-            # 얼굴 내부(눈/코/입)는 inpaint 하지 않음
             gen_mask = np.clip(gen_mask - face_region_mask, 0.0, 1.0)
-            # 옷도 보호
             gen_mask = np.clip(gen_mask - cloth_mask_dilated, 0.0, 1.0)
 
-            # 어깨 윤곽(옷 상단 경계)은 과도하게 지우지 않도록 보호
-            if shoulder_protect_for_post is not None:
-                shoulder_protect_weight = 0.40 if hair_length == "short" else 0.50
-                removal_mask = np.clip(
-                    removal_mask - shoulder_protect_for_post * shoulder_protect_weight,
-                    0.0,
-                    1.0,
-                )
             _store_mask("pipeline_short_removal_mask", removal_mask)
             _store_mask("pipeline_short_generation_mask", gen_mask)
 
             logger.info(
-                f"[SDPipeline] 2단계 숏컷: removal_px={removal_mask.sum():.0f}, "
+                f"[SDPipeline] 전략1: removal_px={removal_mask.sum():.0f}, "
                 f"gen_px={gen_mask.sum():.0f}, cutoff_y={cutoff_y}, "
                 f"head_box=({head_x1},{head_y1})-({head_x2},{head_y2})"
             )
 
-            # 단계 1: 긴 머리 제거 ─────────────────────────────────────────────
-            bg_mode = self.config.bg_fill_mode
-            logger.info(f"[SDPipeline] bg_fill_mode={bg_mode}")
+            # 단계 1: LaMa로 전체 머리카락 제거 → 깨끗한 캔버스 ─────────────────
+            removal_u8 = (removal_mask > 0.3).astype(np.uint8) * 255
+            # 경계 머리카락까지 포함하도록 dilate
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+            removal_u8 = cv2.dilate(removal_u8, k, iterations=1)
+            # dilate 후 다시 얼굴/옷 보호
+            protect_u8 = (np.clip(face_region_mask + cloth_mask_dilated, 0.0, 1.0) > 0.3).astype(np.uint8) * 255
+            removal_u8 = cv2.bitwise_and(removal_u8, cv2.bitwise_not(protect_u8))
 
-            if removal_mask.sum() > 50:
-                removal_u8 = (removal_mask > 0.5).astype(np.uint8) * 255
-                # 약간 dilate해서 경계 머리카락까지 제거
-                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-                removal_u8_dilated = cv2.dilate(removal_u8, k, iterations=1)
-                # 얼굴/옷 보호
-                protect_u8 = (np.clip(face_region_mask + cloth_mask_dilated, 0.0, 1.0) > 0.3).astype(np.uint8) * 255
-                removal_u8_dilated = cv2.bitwise_and(removal_u8_dilated, cv2.bitwise_not(protect_u8))
+            img_rgb_cleaned = self._lama_inpaint(img_rgb, removal_u8)
+            logger.info(f"[SDPipeline] LaMa 전체 철거 완료: pixels={int((removal_u8 > 0).sum())}")
+            _store_rgb("cv2_background_cleaned_rgb", img_rgb_cleaned)
 
-                # LaMa로 머리카락 제거
-                img_rgb_cleaned = self._lama_inpaint(img_rgb, removal_u8_dilated)
-                logger.info(f"[SDPipeline] LaMa inpaint 완료: pixels={int((removal_u8_dilated > 0).sum())}")
-                _store_rgb("cv2_background_cleaned_rgb", img_rgb_cleaned)
-
-                if bg_mode == "sd":
-                    try:
-                        fill_seed = int(seeds[0]) if seeds else random.randint(0, 2**31 - 1)
-                        face_crop_fill = self._crop_face(Image.fromarray(img_rgb), face_bbox)
-                        fill_base = img_rgb_cleaned
-
-                        if self.config.enable_two_step_preclean:
-                            preclean_seed_mask = removal_mask
-                            preclean_mask = self._build_preclean_mask_for_two_step(
-                                removal_mask=preclean_seed_mask,
-                                face_bbox=face_bbox,
-                                cutoff_y=cutoff_y,
-                                cloth_mask=cloth_mask_dilated,
-                                hair_length=hair_length,
-                            )
-                            _store_mask("pipeline_preclean_mask", preclean_mask)
-                            preclean_protect = face_region_mask
-                            fill_base = self._sd_preclean_long_hair_region(
-                                base_rgb=fill_base,
-                                preclean_mask=preclean_mask,
-                                face_bbox=face_bbox,
-                                face_crop_pil=face_crop_fill,
-                                protect_mask=preclean_protect,
-                                hair_length=hair_length,
-                                seed=fill_seed + 13,
-                            )
-                            _store_rgb("sd_preclean_rgb", fill_base)
-                            logger.info("[SDPipeline] two-step preclean 완료")
-
-                        img_rgb_cleaned = self._sd_refine_removed_region(
-                            base_rgb=fill_base,
-                            removal_mask=removal_mask,
-                            face_bbox=face_bbox,
-                            face_crop_pil=face_crop_fill,
-                            protect_mask=face_region_mask,
-                            cloth_mask=cloth_mask_dilated,
-                            hair_length=hair_length,
-                            seed=fill_seed,
-                        )
-                        logger.info("[SDPipeline] bg_fill_mode=sd: 제거 영역 SD 보정 완료")
-                    except Exception as e:
-                        logger.warning(f"[SDPipeline] bg_fill_mode=sd 실패, cv2 결과 사용: {e}")
-
-                # SD/cv2 제거 단계 이후에도 아래쪽 장발이 남거나 다시 생길 수 있어
-                # cutoff 아래 hair를 한 번 더 검출해서 얇게 정리한다.
-                try:
-                    img_rgb_cleaned = self._remove_residual_hair_below_cutoff(
-                        img_rgb=img_rgb_cleaned,
-                        face_bbox=face_bbox,
-                        cutoff_y=cutoff_y,
-                        shoulder_protect=shoulder_protect_for_post,
-                        hair_length=hair_length,
-                    )
-                except Exception as e:
-                    logger.warning(f"[SDPipeline] residual hair 정리 실패(무시): {e}")
-            else:
-                img_rgb_cleaned = img_rgb
-
-            # 단계 2: SD 생성은 head box 중심(위쪽)으로 제한해 배경/의상 훼손을 줄임.
-            # 아래쪽 장발 잔존은 final cleanup에서 선택적으로 제거한다.
+            # 단계 2: SD 생성은 head box 영역에서 새 헤어 생성
             hair_mask_for_sd = gen_mask.astype(np.float32)
             img_rgb_for_sd   = img_rgb_cleaned
         else:
@@ -653,36 +491,8 @@ class MirrAISDPipeline:
                 hair_length=hair_length,
             )
 
-            # 최종 결과 기준으로 cutoff 아래 장발 잔존이 있으면 한 번 더 정리
-            if cutoff_y_for_post is not None:
-                try:
-                    post_rgb = cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)
-                    post_rgb = self._remove_residual_hair_below_cutoff(
-                        img_rgb=post_rgb,
-                        face_bbox=face_bbox,
-                        cutoff_y=cutoff_y_for_post,
-                        shoulder_protect=shoulder_protect_for_post,
-                        hair_length=hair_length,
-                    )
-                    composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
-                except Exception as e:
-                    logger.warning(f"[SDPipeline] final residual hair 정리 실패(무시): {e}")
-
-            # short/medium: 원본 long-hair 제거 마스크 기반으로 최종 하드 컷
-            if cutoff_y_for_post is not None and removal_mask_for_post is not None:
-                try:
-                    post_rgb = cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)
-                    post_rgb = self._final_cutoff_cleanup(
-                        img_rgb=post_rgb,
-                        face_bbox=face_bbox,
-                        removal_mask=removal_mask_for_post,
-                        cutoff_y=cutoff_y_for_post,
-                        shoulder_protect=shoulder_protect_for_post,
-                        hair_length=hair_length,
-                    )
-                    composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
-                except Exception as e:
-                    logger.warning(f"[SDPipeline] final cutoff cleanup 실패(무시): {e}")
+            # 전략 1에서는 LaMa가 원본 머리를 전부 제거했으므로
+            # residual hair cleanup / final cutoff cleanup 불필요
 
             if not has_color_request:
                 try:
