@@ -315,7 +315,7 @@ def main():
     parser.add_argument("--top-k",     default=3, type=int,
                         help="결과 수 (기본: 3, 최대: 5)")
     parser.add_argument("--bg-fill",   default="cv2", choices=["cv2", "sd"],
-                        help="단발 변환 시 배경 채우기 방법: cv2=기본(짧은길이 안정), sd=배경 품질 실험")
+                        help="하이브리드 pre-clean 모드: cv2=빠른 partial pre-clean, sd=partial pre-clean + SD refine")
 
     # 기타
     parser.add_argument("--no-base64",    action="store_true",

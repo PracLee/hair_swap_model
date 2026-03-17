@@ -155,9 +155,9 @@ class SDInpaintConfig:
     use_color_match:  bool = False   # 향후 LAB 색상 매칭 확장용
     use_poisson_blend: bool = False  # 향후 Poisson blend 확장용
 
-    # 배경 채우기 모드 (short/medium 변환 시 긴머리 제거 방법)
-    #   "cv2" : cv2.inpaint(NS+TELEA) 블렌딩 (기본, 빠름)
-    #   "sd"  : cv2 1차 + SD 복원 보정 2차 (품질↑, 시간↑)
+    # 하이브리드 pre-clean 모드 (short/medium 변환 시 하단 긴머리 선철거 방법)
+    #   "cv2" : 빠른 pre-clean만 수행 (LaMa partial pre-clean, SD refine 없음)
+    #   "sd"  : partial pre-clean 후 SD pre-clean refinement까지 수행
     bg_fill_mode: str = "cv2"
 
     # short/medium 2-step 전략:
@@ -477,11 +477,18 @@ class MirrAISDPipeline:
                 preclean_seed = int(seeds[0]) ^ 0x5A5A5A5A
                 preclean_seed &= 0x7FFFFFFF
                 face_crop_preclean = self._crop_face(Image.fromarray(img_rgb), face_bbox)
-                img_rgb_preclean = self._cv2_inpaint_region(
-                    img_rgb,
-                    preclean_mask_for_input,
-                    protect_mask=face_region_mask,
-                )
+                try:
+                    img_rgb_preclean = self._lama_inpaint(
+                        img_rgb,
+                        (np.clip(preclean_mask_for_input, 0.0, 1.0) > 0.35).astype(np.uint8) * 255,
+                    )
+                except Exception as e:
+                    logger.warning(f"[SDPipeline] hybrid LaMa preclean 실패 → cv2 fallback: {e}")
+                    img_rgb_preclean = self._cv2_inpaint_region(
+                        img_rgb,
+                        preclean_mask_for_input,
+                        protect_mask=face_region_mask,
+                    )
                 if str(self.config.bg_fill_mode).lower() == "sd":
                     img_rgb_cleaned = self._sd_preclean_long_hair_region(
                         img_rgb_preclean,
@@ -1914,19 +1921,22 @@ class MirrAISDPipeline:
     ) -> np.ndarray:
         """
         two-step pre-clean용 확장 마스크 생성.
-        긴머리 영역 + 어깨/배경 일부까지 넉넉하게 포함해 1차 제거 품질을 높인다.
+        하이브리드 short/medium 입력에서 하단 긴머리만 부분 선철거하도록
+        removal_mask를 적당히 확장하되, 목/가슴 중앙은 과도하게 먹지 않게 제한한다.
         """
         H, W = removal_mask.shape[:2]
         x1, y1, x2, y2 = face_bbox
         face_w = max(int(x2 - x1), 1)
         face_h = max(int(y2 - y1), 1)
+        cx = int(0.5 * (x1 + x2))
 
         base_u8 = (np.clip(removal_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
         if int((base_u8 > 0).sum()) < 40:
             return np.clip(removal_mask, 0.0, 1.0).astype(np.float32)
 
-        kx = max(21, int(face_w * float(self.config.preclean_mask_expand_ratio_x)))
-        ky = max(13, int(face_h * float(self.config.preclean_mask_expand_ratio_y)))
+        # 기존 full pre-clean보다 훨씬 좁게 확장한다.
+        kx = max(11, int(face_w * (0.22 if hair_length == "short" else 0.28)))
+        ky = max(13, int(face_h * (0.20 if hair_length == "short" else 0.26)))
         if kx % 2 == 0:
             kx += 1
         if ky % 2 == 0:
@@ -1934,35 +1944,60 @@ class MirrAISDPipeline:
         dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kx, ky))
         preclean_u8 = cv2.dilate(base_u8, dilate_k, iterations=1)
 
-        corridor_x_ratio = 1.95 if hair_length == "short" else 2.15
+        # cutoff 근처 아래쪽만 허용
+        top_y = max(0, int(cutoff_y - face_h * (0.05 if hair_length == "short" else 0.09)))
+        top_gate = np.zeros((H, W), dtype=np.uint8)
+        top_gate[top_y:, :] = 255
+        preclean_u8 = cv2.bitwise_and(preclean_u8, top_gate)
+
+        # 얼굴 주변 side corridor 안에서만 유지
+        corridor_x_ratio = 1.20 if hair_length == "short" else 1.35
         x_min = max(0, int(x1 - face_w * corridor_x_ratio))
         x_max = min(W, int(x2 + face_w * corridor_x_ratio))
-        y_min = max(0, int(cutoff_y - face_h * 0.16))
-        y_max = min(H, int(cutoff_y + face_h * (1.35 if hair_length == "short" else 1.65)))
         corridor_u8 = np.zeros((H, W), dtype=np.uint8)
-        if x_min < x_max and y_min < y_max:
-            corridor_u8[y_min:y_max, x_min:x_max] = 255
-            preclean_u8 = cv2.bitwise_or(preclean_u8, corridor_u8)
+        if x_min < x_max:
+            corridor_u8[:, x_min:x_max] = 255
+            preclean_u8 = cv2.bitwise_and(preclean_u8, corridor_u8)
 
+        # 목/가슴 중앙은 과보정 방지용 carve-out
+        center_half = max(24, int(face_w * (0.40 if hair_length == "short" else 0.34)))
+        center_bottom = min(H, int(cutoff_y + face_h * (0.95 if hair_length == "short" else 1.20)))
+        center_cut = np.zeros((H, W), dtype=np.uint8)
+        center_cut[top_y:center_bottom, max(0, cx - center_half):min(W, cx + center_half)] = 255
+        preclean_u8 = cv2.bitwise_and(preclean_u8, cv2.bitwise_not(center_cut))
+
+        # 옷 경계 쪽 잔머리는 조금 더 포함하되, side corridor 안에서만 넓힌다.
         if cloth_mask is not None and cloth_mask.shape == (H, W):
-            cloth_u8 = (np.clip(cloth_mask, 0.0, 1.0) > 0.12).astype(np.uint8) * 255
-            cloth_k = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE,
-                (31, 31) if hair_length == "short" else (37, 37),
-            )
-            cloth_u8 = cv2.dilate(cloth_u8, cloth_k, iterations=1)
-            shoulder_band = cv2.bitwise_and(cloth_u8, corridor_u8)
-            preclean_u8 = cv2.bitwise_or(preclean_u8, shoulder_band)
+            cloth_u8 = (np.clip(cloth_mask, 0.0, 1.0) > 0.18).astype(np.uint8) * 255
+            cloth_u8 = cv2.bitwise_and(cloth_u8, corridor_u8)
+            cloth_u8 = cv2.bitwise_and(cloth_u8, cv2.bitwise_not(center_cut))
+            cloth_u8[:top_y, :] = 0
+            if int((cloth_u8 > 0).sum()) > 20:
+                cloth_band = cv2.dilate(
+                    cloth_u8,
+                    cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE,
+                        (17, 17) if hair_length == "short" else (21, 21),
+                    ),
+                    iterations=1,
+                )
+                base_support = cv2.dilate(
+                    base_u8,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
+                    iterations=1,
+                )
+                cloth_band = cv2.bitwise_and(cloth_band, base_support)
+                preclean_u8 = cv2.bitwise_or(preclean_u8, cloth_band)
 
-        close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+        close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
         preclean_u8 = cv2.morphologyEx(preclean_u8, cv2.MORPH_CLOSE, close_k)
 
-        max_ratio = 0.30 if hair_length == "short" else 0.34
+        max_ratio = 0.18 if hair_length == "short" else 0.24
         max_px = int(H * W * max_ratio)
         cur_px = int((preclean_u8 > 0).sum())
         if cur_px > max_px:
-            shrink_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-            for _ in range(5):
+            shrink_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            for _ in range(6):
                 preclean_u8 = cv2.erode(preclean_u8, shrink_k, iterations=1)
                 cur_px = int((preclean_u8 > 0).sum())
                 if cur_px <= max_px:
