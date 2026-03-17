@@ -363,9 +363,20 @@ class MirrAISDPipeline:
                 base_prior = (base_prior > 0).astype(np.float32)
 
                 removal_seed = np.clip(hair_mask_for_removal * base_prior, 0.0, 1.0)
+                # short 변환에서는 cutoff 아래 long-tail은 적극적으로 제거한다.
+                # (prior 교집합이 너무 보수적으로 작동할 때 하단 잔존 모발이 남는 문제 보완)
+                tail_below_cutoff = hair_mask_for_removal.copy()
+                tail_below_cutoff[:cutoff_y, :] = 0.0
+                tail_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 9))
+                tail_below_cutoff = cv2.dilate(
+                    (tail_below_cutoff > 0.5).astype(np.uint8) * 255,
+                    tail_k,
+                    iterations=1,
+                ).astype(np.float32) / 255.0
+
                 # 교집합이 과도하게 작으면 기존 SAM 기반 마스크로 폴백
                 if removal_seed.sum() > 120:
-                    removal_mask = removal_seed
+                    removal_mask = np.clip(np.maximum(removal_seed, tail_below_cutoff), 0.0, 1.0)
                 else:
                     removal_mask = hair_mask_for_removal.copy()
             else:
@@ -377,13 +388,17 @@ class MirrAISDPipeline:
             hair_below[:cutoff_y, :] = 0
             hair_below[:, :max(0, head_x1 - 20)] = 0
             hair_below[:, min(W, head_x2 + 20):] = 0
-            if int((hair_below > 0).sum()) > 0 and hair_length != "short":
-                # medium은 어깨선까지 자연스럽게 지우기 위해 약간 확장
-                expand_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 13))
+            if int((hair_below > 0).sum()) > 0:
+                # short는 연결 보정만, medium은 어깨선까지 조금 더 강하게 확장
+                expand_k = (
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 9))
+                    if hair_length == "short"
+                    else cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 13))
+                )
                 hair_below_expanded = cv2.dilate(hair_below, expand_k, iterations=1).astype(np.float32)
                 removal_mask = np.maximum(removal_mask, hair_below_expanded)
                 logger.info(
-                    f"[SDPipeline] removal_mask hair기반 확장(medium): "
+                    f"[SDPipeline] removal_mask hair기반 확장({hair_length}): "
                     f"pixels={removal_mask.sum():.0f}"
                 )
             # short는 최소 연결만, medium은 조금 더 강하게 연결
