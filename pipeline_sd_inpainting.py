@@ -541,6 +541,13 @@ class MirrAISDPipeline:
                         shoulder_protect=shoulder_protect_for_post,
                         hair_length=hair_length,
                     )
+                    post_rgb = self._remove_residual_hair_below_cutoff(
+                        post_rgb,
+                        face_bbox=face_bbox,
+                        cutoff_y=cutoff_y_for_post,
+                        shoulder_protect=shoulder_protect_for_post,
+                        hair_length=hair_length,
+                    )
                     composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
                 except Exception as e:
                     logger.warning(f"[SDPipeline] short/medium 잔여물 cleanup 실패(무시): {e}")
@@ -2055,12 +2062,12 @@ class MirrAISDPipeline:
         residual_u8 = cv2.morphologyEx(residual_u8, cv2.MORPH_OPEN, open_k)
 
         if shoulder_protect is not None and shoulder_protect.shape == (H, W):
-            protect_threshold = 0.50 if hair_length == "short" else 0.34
+            protect_threshold = 0.72 if hair_length == "short" else 0.34
             protect_u8 = (shoulder_protect > protect_threshold).astype(np.uint8) * 255
             if hair_length == "short" and int((protect_u8 > 0).sum()) > 0:
                 protect_u8 = cv2.erode(
                     protect_u8,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
                     iterations=1,
                 )
             if int((protect_u8 > 0).sum()) > 0:
@@ -2158,12 +2165,12 @@ class MirrAISDPipeline:
             force_u8 = cv2.bitwise_or(hair_inter_u8, fallback_u8)
 
         if shoulder_protect is not None and shoulder_protect.shape == (H, W):
-            protect_threshold = 0.50 if hair_length == "short" else 0.34
+            protect_threshold = 0.72 if hair_length == "short" else 0.34
             protect_u8 = (shoulder_protect > protect_threshold).astype(np.uint8) * 255
             if hair_length == "short" and int((protect_u8 > 0).sum()) > 0:
                 protect_u8 = cv2.erode(
                     protect_u8,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
                     iterations=1,
                 )
             if int((protect_u8 > 0).sum()) > 0:
