@@ -354,12 +354,13 @@ class MirrAISDPipeline:
             f"[SDPipeline] 옷 픽셀 제거 완료, pixels={hair_mask.sum():.0f}"
         )
 
-        # ── Step 3-e: 숏컷/중단발 — 전략 2 (Post-Inpainting) ────────────────
-        # 단발/숏컷에서 기존 긴머리 prior가 강하면, 생성 후 잔여 long-hair만
-        # 차집합 마스크 기반으로 후처리하는 쪽이 더 안정적이다.
+        # ── Step 3-e: 숏컷/중단발 — 하이브리드 전략 ───────────────────────────
+        # 하단 긴머리를 먼저 부분 선철거한 뒤 새 short를 생성하고,
+        # 마지막에 잔여 long-hair만 차집합 마스크로 정리한다.
         cutoff_y_for_post: Optional[int] = None
         removal_mask_for_post: Optional[np.ndarray] = None
         shoulder_protect_for_post: Optional[np.ndarray] = None
+        preclean_mask_for_input: Optional[np.ndarray] = None
         if hair_length in ("short", "medium"):
             x1f, y1f, x2f, y2f = face_bbox
             face_w = max(x2f - x1f, 1)
@@ -453,18 +454,56 @@ class MirrAISDPipeline:
             _store_mask("pipeline_short_removal_mask", removal_mask_for_post)
             _store_mask("pipeline_short_generation_mask", gen_mask)
 
+            preclean_mask_for_input = removal_mask_for_post.copy()
+            if self.config.enable_two_step_preclean:
+                preclean_mask_for_input = self._build_preclean_mask_for_two_step(
+                    removal_mask_for_post,
+                    face_bbox=face_bbox,
+                    cutoff_y=cutoff_y,
+                    cloth_mask=cloth_mask_dilated,
+                    hair_length=hair_length,
+                )
+
             logger.info(
-                f"[SDPipeline] 전략2: removal_px={removal_mask_for_post.sum():.0f}, "
-                f"gen_px={gen_mask.sum():.0f}, cutoff_y={cutoff_y}, "
-                f"head_box=({head_x1},{head_y1})-({head_x2},{head_y2})"
+                f"[SDPipeline] hybrid: removal_px={removal_mask_for_post.sum():.0f}, "
+                f"gen_px={gen_mask.sum():.0f}, preclean_px={preclean_mask_for_input.sum():.0f}, "
+                f"cutoff_y={cutoff_y}, head_box=({head_x1},{head_y1})-({head_x2},{head_y2})"
             )
 
-            # 전략 2는 원본 위에서 short 생성 후, 남은 long-hair만 LaMa로 정리한다.
             img_rgb_cleaned = img_rgb
+            _store_mask("pipeline_short_preclean_mask", preclean_mask_for_input)
+            preclean_pixels = int((np.clip(preclean_mask_for_input, 0.0, 1.0) > 0.35).sum())
+            if preclean_pixels >= 80:
+                preclean_seed = int(seeds[0]) ^ 0x5A5A5A5A
+                preclean_seed &= 0x7FFFFFFF
+                face_crop_preclean = self._crop_face(Image.fromarray(img_rgb), face_bbox)
+                img_rgb_preclean = self._cv2_inpaint_region(
+                    img_rgb,
+                    preclean_mask_for_input,
+                    protect_mask=face_region_mask,
+                )
+                if str(self.config.bg_fill_mode).lower() == "sd":
+                    img_rgb_cleaned = self._sd_preclean_long_hair_region(
+                        img_rgb_preclean,
+                        preclean_mask_for_input,
+                        face_bbox=face_bbox,
+                        face_crop_pil=face_crop_preclean,
+                        protect_mask=face_region_mask,
+                        hair_length=hair_length,
+                        seed=preclean_seed,
+                    )
+                else:
+                    img_rgb_cleaned = img_rgb_preclean
+
+                logger.info(
+                    f"[SDPipeline] hybrid preclean 완료: mode={self.config.bg_fill_mode}, "
+                    f"pixels={preclean_pixels}"
+                )
+
             _store_rgb("cv2_background_cleaned_rgb", img_rgb_cleaned)
 
             hair_mask_for_sd = gen_mask.astype(np.float32)
-            img_rgb_for_sd   = img_rgb
+            img_rgb_for_sd   = img_rgb_cleaned
         else:
             # long 헤어는 기존 단일 패스 유지
             hair_mask_for_sd = hair_mask
@@ -512,7 +551,8 @@ class MirrAISDPipeline:
         )
 
         # ── Step 8: Composite → 원본 해상도 ───────────────────────────────────
-        # 전략 2는 원본 위에 short 생성물을 합성한 뒤, cutoff 아래 잔여 긴머리만 정리한다.
+        # 하이브리드는 부분 선철거된 베이스 위에 short 생성물을 합성한 뒤,
+        # cutoff 아래 잔여 긴머리만 추가 정리한다.
         composite_base_rgb = img_rgb_cleaned
         composite_base_bgr = cv2.cvtColor(composite_base_rgb, cv2.COLOR_RGB2BGR)
 
@@ -814,6 +854,56 @@ class MirrAISDPipeline:
 
         logger.info("[SDPipeline] LaMa progressive 완료")
         return current_img
+
+    def _cv2_inpaint_region(
+        self,
+        img_rgb: np.ndarray,
+        mask: np.ndarray,
+        protect_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        cv2 TELEA + NS 블렌딩 기반 부분 인페인팅.
+        short/medium 하이브리드 pre-clean의 빠른 기본 경로로 사용한다.
+        """
+        H, W = img_rgb.shape[:2]
+        if mask.shape != (H, W):
+            return img_rgb
+
+        mask_u8 = (np.clip(mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
+        if int((mask_u8 > 0).sum()) < 40:
+            return img_rgb
+
+        mask_u8 = cv2.dilate(
+            mask_u8,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+            iterations=1,
+        )
+        if protect_mask is not None and protect_mask.shape == (H, W):
+            protect_u8 = (np.clip(protect_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
+            protect_u8 = cv2.dilate(
+                protect_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+                iterations=1,
+            )
+            mask_u8 = cv2.bitwise_and(mask_u8, cv2.bitwise_not(protect_u8))
+
+        if int((mask_u8 > 0).sum()) < 40:
+            return img_rgb
+
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        telea = cv2.inpaint(img_bgr, mask_u8, 5, cv2.INPAINT_TELEA)
+        ns = cv2.inpaint(img_bgr, mask_u8, 5, cv2.INPAINT_NS)
+
+        alpha = cv2.GaussianBlur(
+            mask_u8.astype(np.float32) / 255.0,
+            (0, 0),
+            sigmaX=5.0,
+            sigmaY=5.0,
+        )
+        alpha = np.clip(alpha, 0.0, 1.0)[..., np.newaxis]
+        blend_bgr = telea.astype(np.float32) * 0.68 + ns.astype(np.float32) * 0.32
+        out_bgr = blend_bgr * alpha + img_bgr.astype(np.float32) * (1.0 - alpha)
+        return cv2.cvtColor(np.clip(out_bgr, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
 
     def _load_segface(self) -> None:
         """SegFace (Swin-B) 모델 로드"""

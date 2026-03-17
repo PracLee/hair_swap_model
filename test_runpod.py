@@ -59,6 +59,7 @@ INTERMEDIATE_KEY_ALIASES = {
     "cloth_mask_dilated": "segface_cloth_mask_dilated",
     "hair_mask_after_cloth_protect": "pipeline_hair_mask_cloth_protected",
     "shoulder_protect_mask": "pipeline_shoulder_protect_mask",
+    "short_preclean_mask": "pipeline_short_preclean_mask",
     "short_removal_mask": "pipeline_short_removal_mask",
     "short_generation_mask": "pipeline_short_generation_mask",
     "background_cleaned_rgb": "cv2_background_cleaned_rgb",
