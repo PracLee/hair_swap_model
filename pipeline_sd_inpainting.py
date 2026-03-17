@@ -79,6 +79,10 @@ _SHORT_HAIR_KEYWORDS = frozenset([
     "above ear", "above shoulder", "ear length", "single",
     "단발", "숏컷", "픽시",
 ])
+_BALD_HAIR_KEYWORDS = frozenset([
+    "bald", "shaved head", "clean scalp", "skinhead", "buzz 0", "buzzcut 0",
+    "삭발", "대머리", "민머리",
+])
 _MEDIUM_HAIR_KEYWORDS = frozenset([
     "lob", "midi", "medium", "shoulder length", "shoulder-length",
     "collarbone", "clavicle", "mid length", "mid-length",
@@ -334,8 +338,9 @@ class MirrAISDPipeline:
             raise ValueError("머리카락 영역이 너무 작습니다.")
 
         # ── Step 3-b: 헤어 길이 분류 ─────────────────────────────────────────
+        is_bald_style = self._is_bald_request(hairstyle_text)
         hair_length = self._classify_hair_length(hairstyle_text)
-        logger.info(f"[SDPipeline] 헤어 길이 분류: {hair_length}")
+        logger.info(f"[SDPipeline] 헤어 길이 분류: {hair_length} (bald={is_bald_style})")
 
         # ── Step 3-c: SegFace 얼굴 픽셀 제거 (bbox 직사각형 대신 픽셀 단위 보정) ─
         hair_mask = np.clip(hair_mask - face_region_mask, 0.0, 1.0)
@@ -723,7 +728,7 @@ class MirrAISDPipeline:
 
         # ── Step 6: 프롬프트 ─────────────────────────────────────────────────
         prompt, neg_prompt, guidance = self._build_prompt(
-            hairstyle_text, normalized_color_text, hair_length
+            hairstyle_text, normalized_color_text, hair_length, is_bald_style=is_bald_style
         )
         logger.info(f"[SDPipeline] 프롬프트: {prompt}")
         logger.info(f"[SDPipeline] 네거티브: {neg_prompt}")
@@ -733,6 +738,7 @@ class MirrAISDPipeline:
         gen_images = self._generate(
             img_512, mask_512, canny_512, face_crop_pil, prompt, neg_prompt, guidance, seeds,
             hair_length=hair_length,
+            is_bald_style=is_bald_style,
         )
 
         # ── Step 8: Composite → 원본 해상도 ───────────────────────────────────
@@ -1556,9 +1562,20 @@ class MirrAISDPipeline:
     # ──────────────────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _is_bald_request(hairstyle_text: str) -> bool:
+        text = hairstyle_text.lower()
+        for kw in _BALD_HAIR_KEYWORDS:
+            if kw in text:
+                return True
+        return False
+
+    @staticmethod
     def _classify_hair_length(hairstyle_text: str) -> str:
         """헤어스타일 텍스트 → 'short' | 'medium' | 'long'"""
         text = hairstyle_text.lower()
+        for kw in _BALD_HAIR_KEYWORDS:
+            if kw in text:
+                return "short"
         for kw in _SHORT_HAIR_KEYWORDS:
             if kw in text:
                 return "short"
@@ -1728,6 +1745,7 @@ class MirrAISDPipeline:
         hairstyle_text: str,
         color_text: str,
         hair_length: str = "long",
+        is_bald_style: bool = False,
     ) -> Tuple[str, str, float]:
         """
         Returns:
@@ -1742,7 +1760,17 @@ class MirrAISDPipeline:
         style = ", ".join(parts) if parts else "natural hairstyle"
 
         # ── 길이별 positive/negative 보강 ────────────────────────────────────
-        if hair_length == "short":
+        if is_bald_style:
+            pos_suffix = (
+                ", shaved head, bald scalp, clean scalp skin texture, "
+                "no bangs, no side hair, no visible loose strands"
+            )
+            neg_prefix = (
+                "long hair, medium hair, short bob, pixie cut, bangs, fringe, "
+                "side locks, strands over forehead, hair over ears, "
+            )
+            guidance = 9.8
+        elif hair_length == "short":
             pos_suffix = (
                 ", short chin-length bob, soft layered ends, feathered tapered tips, "
                 "natural uneven hairline near jaw, clear neckline, visible neck, "
@@ -1787,7 +1815,10 @@ class MirrAISDPipeline:
             "studio photography, sharp focus, beautiful hair",
         ])
         positive = ", ".join(positive_parts)
-        negative = neg_prefix + color_neg_hint + _NEGATIVE_BASE
+        negative_base = _NEGATIVE_BASE
+        if is_bald_style:
+            negative_base = negative_base.replace("bald patch, ", "")
+        negative = neg_prefix + color_neg_hint + negative_base
 
         return positive, negative, guidance
 
@@ -1806,6 +1837,7 @@ class MirrAISDPipeline:
         guidance_scale: float,
         seeds: List[int],
         hair_length: str = "long",
+        is_bald_style: bool = False,
     ) -> List[Image.Image]:
         """
         모든 seed를 단일 배치 forward pass로 생성 (순차 대비 ~절반 시간).
@@ -1816,8 +1848,12 @@ class MirrAISDPipeline:
         # 숏컷/중단발 변환 시 IP-Adapter scale을 낮춤
         # → 원본 긴머리 identity가 생성에 과도하게 영향주는 것 방지
         if hair_length == "short":
-            ip_scale = 0.05
-            control_scale = min(self.config.controlnet_conditioning_scale, 0.12)
+            if is_bald_style:
+                ip_scale = 0.0
+                control_scale = min(self.config.controlnet_conditioning_scale, 0.06)
+            else:
+                ip_scale = 0.05
+                control_scale = min(self.config.controlnet_conditioning_scale, 0.12)
         elif hair_length == "medium":
             ip_scale = 0.18
             control_scale = min(self.config.controlnet_conditioning_scale, 0.20)
