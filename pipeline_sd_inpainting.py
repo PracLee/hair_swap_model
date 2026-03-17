@@ -500,19 +500,25 @@ class MirrAISDPipeline:
             # 변경: face_bbox 기반 head box → 귀 옆까지 포함해서 SD가 숏컷 생성
 
             if is_bald_style:
-                # bald는 head-box 사각형 대신 실제 hair silhouette 중심으로 생성 영역을 제한.
-                bald_u8 = (hair_mask_base > 0.35).astype(np.uint8) * 255
-                bald_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+                # bald: SAM2 full hair mask 기반으로 전체 머리 영역을 커버해야 함.
+                # hair_mask_base(SegFace)는 너무 작아서 양옆 머리를 놓침.
+                # hair_mask_for_removal = SAM2 refined mask (face 제거 완료 상태)
+                bald_u8 = (hair_mask_for_removal > 0.3).astype(np.uint8) * 255
+                bald_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
                 bald_u8 = cv2.dilate(bald_u8, bald_k, iterations=1)
+                # 이마 + 정수리 영역도 포함 (머리카락이 없더라도 두피 연속성 필요)
                 forehead_u8 = np.zeros((H, W), dtype=np.uint8)
-                fx1 = max(0, int(x1f - face_w * 0.28))
-                fx2 = min(W, int(x2f + face_w * 0.28))
-                fy1 = max(0, int(y1f - face_h * 0.28))
-                fy2 = min(H, int(y1f + face_h * 0.20))
+                fx1 = max(0, int(x1f - face_w * 0.35))
+                fx2 = min(W, int(x2f + face_w * 0.35))
+                fy1 = max(0, int(y1f - face_h * 0.55))
+                fy2 = min(H, int(y1f + face_h * 0.10))
                 if fx1 < fx2 and fy1 < fy2:
                     forehead_u8[fy1:fy2, fx1:fx2] = 255
                 bald_mask = np.maximum(bald_u8.astype(np.float32) / 255.0, forehead_u8.astype(np.float32) / 255.0)
+                # 얼굴 내부는 보호하되 이마 위쪽 헤어라인은 포함
                 gen_mask = np.clip(bald_mask - face_region_mask * 0.72, 0.0, 1.0)
+                # 옷 보호 (bald는 머리만 바꾸고 옷은 절대 건드리면 안 됨)
+                gen_mask = np.clip(gen_mask - cloth_mask_dilated, 0.0, 1.0)
                 gen_mask = np.clip(gen_mask - hand_mask, 0.0, 1.0)
             else:
                 gen_mask = np.zeros((H, W), dtype=np.float32)
@@ -662,7 +668,8 @@ class MirrAISDPipeline:
                         if self.config.enable_two_step_preclean:
                             preclean_seed_mask = removal_mask
                             if is_bald_style:
-                                preclean_seed_mask = np.maximum(preclean_seed_mask, hair_mask_base)
+                                # bald: SAM2 full mask 사용 (hair_mask_base는 너무 작음)
+                                preclean_seed_mask = np.maximum(preclean_seed_mask, hair_mask_for_removal)
                             preclean_mask = self._build_preclean_mask_for_two_step(
                                 removal_mask=preclean_seed_mask,
                                 face_bbox=face_bbox,
@@ -2061,17 +2068,18 @@ class MirrAISDPipeline:
         preclean_u8 = cv2.dilate(base_u8, dilate_k, iterations=1)
 
         if is_bald_style:
+            # bald: SAM2 full mask 기반이므로 corridor를 넓게 잡아야 함
             ys_h, xs_h = np.where(preclean_u8 > 0)
             if xs_h.size > 0 and ys_h.size > 0:
-                x_min = max(0, int(xs_h.min() - face_w * 0.35))
-                x_max = min(W, int(xs_h.max() + face_w * 0.35))
-                y_min = max(0, int(min(ys_h.min(), y1) - face_h * 0.45))
-                y_max = min(H, int(max(ys_h.max(), cutoff_y) + face_h * 0.90))
+                x_min = max(0, int(xs_h.min() - face_w * 0.55))
+                x_max = min(W, int(xs_h.max() + face_w * 0.55))
+                y_min = max(0, int(min(ys_h.min(), y1) - face_h * 0.55))
+                y_max = min(H, int(max(ys_h.max(), cutoff_y) + face_h * 1.20))
             else:
-                x_min = max(0, int(x1 - face_w * 0.95))
-                x_max = min(W, int(x2 + face_w * 0.95))
-                y_min = max(0, int(y1 - face_h * 0.45))
-                y_max = min(H, int(cutoff_y + face_h * 0.90))
+                x_min = max(0, int(x1 - face_w * 1.20))
+                x_max = min(W, int(x2 + face_w * 1.20))
+                y_min = max(0, int(y1 - face_h * 0.55))
+                y_max = min(H, int(cutoff_y + face_h * 1.20))
         else:
             corridor_x_ratio = 1.95 if hair_length == "short" else 2.15
             x_min = max(0, int(x1 - face_w * corridor_x_ratio))
@@ -2101,7 +2109,7 @@ class MirrAISDPipeline:
         preclean_u8 = cv2.morphologyEx(preclean_u8, cv2.MORPH_CLOSE, close_k)
 
         if is_bald_style:
-            max_ratio = 0.22
+            max_ratio = 0.38  # bald는 긴 머리 전체를 제거해야 하므로 넉넉하게
         else:
             max_ratio = 0.30 if hair_length == "short" else 0.34
         max_px = int(H * W * max_ratio)
