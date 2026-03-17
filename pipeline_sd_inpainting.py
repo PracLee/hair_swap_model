@@ -454,10 +454,12 @@ class MirrAISDPipeline:
             _store_mask("pipeline_short_removal_mask", removal_mask_for_post)
             _store_mask("pipeline_short_generation_mask", gen_mask)
 
-            preclean_mask_for_input = removal_mask_for_post.copy()
+            preclean_seed_mask = long_hair_mask.copy()
+            preclean_seed_mask[:cutoff_y, :] = 0.0
+            preclean_mask_for_input = preclean_seed_mask.copy()
             if self.config.enable_two_step_preclean:
                 preclean_mask_for_input = self._build_preclean_mask_for_two_step(
-                    removal_mask_for_post,
+                    preclean_seed_mask,
                     face_bbox=face_bbox,
                     cutoff_y=cutoff_y,
                     cloth_mask=cloth_mask_dilated,
@@ -1959,11 +1961,12 @@ class MirrAISDPipeline:
             corridor_u8[:, x_min:x_max] = 255
             preclean_u8 = cv2.bitwise_and(preclean_u8, corridor_u8)
 
-        # 목/가슴 중앙은 과보정 방지용 carve-out
-        center_half = max(24, int(face_w * (0.40 if hair_length == "short" else 0.34)))
-        center_bottom = min(H, int(cutoff_y + face_h * (0.95 if hair_length == "short" else 1.20)))
+        # 목 바로 아래는 hair 제거를 허용하고, 더 아래 torso 중앙만 carve-out 한다.
+        center_half = max(18, int(face_w * (0.24 if hair_length == "short" else 0.22)))
+        center_top = min(H, int(cutoff_y + face_h * (0.32 if hair_length == "short" else 0.42)))
+        center_bottom = min(H, int(cutoff_y + face_h * (1.00 if hair_length == "short" else 1.20)))
         center_cut = np.zeros((H, W), dtype=np.uint8)
-        center_cut[top_y:center_bottom, max(0, cx - center_half):min(W, cx + center_half)] = 255
+        center_cut[center_top:center_bottom, max(0, cx - center_half):min(W, cx + center_half)] = 255
         preclean_u8 = cv2.bitwise_and(preclean_u8, cv2.bitwise_not(center_cut))
 
         # 옷 경계 쪽 잔머리는 조금 더 포함하되, side corridor 안에서만 넓힌다.
