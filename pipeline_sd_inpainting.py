@@ -218,6 +218,7 @@ class MirrAISDPipeline:
         self._mp_face    = None   # MediaPipe FaceDetection
         self._mp_face_mesh = None # MediaPipe FaceMesh
         self._mp_hands   = None   # MediaPipe Hands
+        self._lama       = None   # LaMa large mask inpainting
         self._loaded     = False
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -233,6 +234,7 @@ class MirrAISDPipeline:
         self._load_sam2()
         self._load_mediapipe()
         self._load_sd_pipeline()
+        self._load_lama()
         self._loaded = True
         logger.info("[SDPipeline] 모든 모델 로드 완료")
 
@@ -557,7 +559,29 @@ class MirrAISDPipeline:
             bg_mode = self.config.bg_fill_mode
             logger.info(f"[SDPipeline] bg_fill_mode={bg_mode}")
 
-            if removal_mask.sum() > 50:
+            if is_bald_style:
+                # ── bald 전용: LaMa로 전체 머리카락 제거 ──────────────────
+                # SAM2 full mask + gen_mask(이마/정수리) 합쳐서 머리 영역 전체를 LaMa로 제거
+                bald_removal_mask = np.maximum(hair_mask_for_removal, gen_mask)
+                # 옷/얼굴/손은 보호
+                bald_removal_mask = np.clip(bald_removal_mask - face_region_mask, 0.0, 1.0)
+                bald_removal_mask = np.clip(bald_removal_mask - cloth_mask_dilated, 0.0, 1.0)
+                bald_removal_mask = np.clip(bald_removal_mask - hand_mask, 0.0, 1.0)
+                # 약간 dilate해서 경계 머리카락까지 제거
+                bald_removal_u8 = (bald_removal_mask > 0.3).astype(np.uint8) * 255
+                bald_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+                bald_removal_u8 = cv2.dilate(bald_removal_u8, bald_k, iterations=1)
+                # 다시 보호 영역 적용
+                protect_u8 = (np.clip(face_region_mask + cloth_mask_dilated + hand_mask, 0.0, 1.0) > 0.3).astype(np.uint8) * 255
+                bald_removal_u8 = cv2.bitwise_and(bald_removal_u8, cv2.bitwise_not(protect_u8))
+
+                logger.info(f"[SDPipeline] bald LaMa 제거: pixels={int((bald_removal_u8 > 0).sum())}")
+                img_rgb_cleaned = self._lama_inpaint(img_rgb, bald_removal_u8)
+                _store_rgb("cv2_background_cleaned_rgb", img_rgb_cleaned)
+                _store_mask("pipeline_preclean_mask", bald_removal_mask)
+                logger.info("[SDPipeline] bald LaMa inpaint 완료 (preclean SD 스킵)")
+
+            elif removal_mask.sum() > 50:
                 removal_u8 = (removal_mask > 0.5).astype(np.uint8) * 255
                 # inpaint 입력은 약하게만 확장해서 불필요한 배경/의상 훼손을 줄임
                 k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
@@ -573,62 +597,23 @@ class MirrAISDPipeline:
                 )
                 img_rgb_filled = cv2.addWeighted(img_rgb_ns, 0.25, img_rgb_telea, 0.75, 0.0)
 
-                # 작은/중간 영역은 seamlessClone으로 경계 접합을 자연스럽게 처리
-                # (분리된 마스크에서는 왜곡/패치가 커서 alpha blend로 폴백)
+                # seamlessClone / alpha blend
                 removal_px = int((removal_u8 > 0).sum())
-                max_clone_px = int(H * W * 0.18)
                 cc_count = 0
-                largest_cc_ratio = 0.0
                 if removal_px > 0:
                     cc_num, _, cc_stats, _ = cv2.connectedComponentsWithStats(removal_u8, connectivity=8)
                     cc_count = max(0, int(cc_num - 1))
-                    if cc_count > 0:
-                        largest_cc = int(cc_stats[1:, cv2.CC_STAT_AREA].max())
-                        largest_cc_ratio = largest_cc / float(removal_px)
-                allow_clone = (
-                    50 <= removal_px <= max_clone_px
-                    and cc_count == 1
-                    and largest_cc_ratio >= 0.82
-                )
                 # short/medium 헤어 제거에서는 seamlessClone이 목/어깨 패치를 만드는 케이스가 많아 기본 비활성화.
-                allow_clone = False
-                if allow_clone:
-                    ys, xs = np.where(removal_u8 > 0)
-                    c_x = int((xs.min() + xs.max()) * 0.5)
-                    c_y = int((ys.min() + ys.max()) * 0.5)
-                    src_bgr = cv2.cvtColor(img_rgb_filled, cv2.COLOR_RGB2BGR)
-                    dst_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-                    try:
-                        cloned_bgr = cv2.seamlessClone(
-                            src_bgr, dst_bgr, removal_u8, (c_x, c_y), cv2.NORMAL_CLONE
-                        )
-                        img_rgb_cleaned = cv2.cvtColor(cloned_bgr, cv2.COLOR_BGR2RGB)
-                    except Exception:
-                        # fallback: alpha blend
-                        soft_alpha = removal_u8.astype(np.float32) / 255.0
-                        soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=1.2)[..., np.newaxis]
-                        soft_alpha = np.clip((soft_alpha - 0.28) / 0.72, 0.0, 1.0)
-                        img_rgb_cleaned = (
-                            img_rgb_filled.astype(np.float32) * soft_alpha
-                            + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
-                        ).clip(0, 255).astype(np.uint8)
-                else:
-                    if cc_count > 1:
-                        logger.info(
-                            "[SDPipeline] seamlessClone 스킵: 분리 마스크 "
-                            f"(components={cc_count}, largest_ratio={largest_cc_ratio:.3f})"
-                        )
-                    # soft-blend는 core mask 기준으로만 feather → 사다리꼴 번짐 방지
-                    soft_alpha = removal_u8.astype(np.float32) / 255.0
-                    soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=1.2)[..., np.newaxis]
-                    soft_alpha = np.clip((soft_alpha - 0.28) / 0.72, 0.0, 1.0)
-                    img_rgb_cleaned = (
-                        img_rgb_filled.astype(np.float32) * soft_alpha
-                        + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
-                    ).clip(0, 255).astype(np.uint8)
+                # soft-blend는 core mask 기준으로만 feather
+                soft_alpha = removal_u8.astype(np.float32) / 255.0
+                soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=1.2)[..., np.newaxis]
+                soft_alpha = np.clip((soft_alpha - 0.28) / 0.72, 0.0, 1.0)
+                img_rgb_cleaned = (
+                    img_rgb_filled.astype(np.float32) * soft_alpha
+                    + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
+                ).clip(0, 255).astype(np.uint8)
 
-                # 옷(어깨/상체)과 겹친 제거 영역은 별도 복원해서
-                # 반투명 얼룩/패치가 남는 문제를 완화한다.
+                # 옷(어깨/상체)과 겹친 제거 영역은 별도 복원
                 cloth_u8 = (cloth_mask_dilated > 0.45).astype(np.uint8) * 255
                 cloth_overlap = cv2.bitwise_and(removal_u8, cloth_u8)
                 protect_u8 = (((face_region_mask + hand_mask) > 0.2).astype(np.uint8) * 255)
@@ -648,28 +633,17 @@ class MirrAISDPipeline:
                         cloth_refill.astype(np.float32) * cloth_alpha
                         + img_rgb_cleaned.astype(np.float32) * (1.0 - cloth_alpha)
                     ).clip(0, 255).astype(np.uint8)
-                    logger.info(
-                        f"[SDPipeline] cloth overlap 복원 적용: pixels={int((cloth_overlap > 0).sum())}"
-                    )
                 logger.info("[SDPipeline] cv2.inpaint 2-way 블렌딩 완료")
                 _store_rgb("cv2_background_cleaned_rgb", img_rgb_cleaned)
 
                 if bg_mode == "sd":
-                    # SD 보정 패스: 제거 영역의 배경/목/어깨 텍스처를 더 자연스럽게 정리
                     try:
                         fill_seed = int(seeds[0]) if seeds else random.randint(0, 2**31 - 1)
                         face_crop_fill = self._crop_face(Image.fromarray(img_rgb), face_bbox)
-                        # 분리 컴포넌트 제거 마스크는 cv2 inpaint 흔적이 커서 원본 기반으로 SD 채움.
                         fill_base = img_rgb if cc_count > 1 else img_rgb_cleaned
 
-                        # Two-step pre-clean:
-                        #   step-1) 긴머리 흔적을 tied/slicked-back 컨셉으로 먼저 정리
-                        #   step-2) 제거 영역 배경/목/어깨를 한 번 더 정리
                         if self.config.enable_two_step_preclean:
                             preclean_seed_mask = removal_mask
-                            if is_bald_style:
-                                # bald: SAM2 full mask 사용 (hair_mask_base는 너무 작음)
-                                preclean_seed_mask = np.maximum(preclean_seed_mask, hair_mask_for_removal)
                             preclean_mask = self._build_preclean_mask_for_two_step(
                                 removal_mask=preclean_seed_mask,
                                 face_bbox=face_bbox,
@@ -677,14 +651,10 @@ class MirrAISDPipeline:
                                 cloth_mask=cloth_mask_dilated,
                                 hand_mask=hand_mask,
                                 hair_length=hair_length,
-                                is_bald_style=is_bald_style,
+                                is_bald_style=False,
                             )
                             _store_mask("pipeline_preclean_mask", preclean_mask)
-                            if is_bald_style:
-                                # bald: 옷도 보호 (preclean이 옷/배경을 바꾸는 문제 방지)
-                                preclean_protect = np.clip(face_region_mask + hand_mask + cloth_mask_dilated, 0.0, 1.0)
-                            else:
-                                preclean_protect = np.clip(face_region_mask + hand_mask, 0.0, 1.0)
+                            preclean_protect = np.clip(face_region_mask + hand_mask, 0.0, 1.0)
                             fill_base = self._sd_preclean_long_hair_region(
                                 base_rgb=fill_base,
                                 preclean_mask=preclean_mask,
@@ -692,7 +662,7 @@ class MirrAISDPipeline:
                                 face_crop_pil=face_crop_fill,
                                 protect_mask=preclean_protect,
                                 hair_length=hair_length,
-                                is_bald_style=is_bald_style,
+                                is_bald_style=False,
                                 seed=fill_seed + 13,
                             )
                             _store_rgb("sd_preclean_rgb", fill_base)
@@ -999,6 +969,43 @@ class MirrAISDPipeline:
         pipe.to(self.device)
         self._sd_pipe = pipe
         logger.info("[SDPipeline] SD Pipeline 로드 완료")
+
+    def _load_lama(self) -> None:
+        """LaMa (Large Mask Inpainting) 모델 로드"""
+        if self._lama is not None:
+            return
+        try:
+            from simple_lama_inpainting import SimpleLama
+            logger.info("[SDPipeline] LaMa 모델 로드 중...")
+            self._lama = SimpleLama()
+            logger.info("[SDPipeline] LaMa 로드 완료")
+        except ImportError:
+            logger.warning(
+                "[SDPipeline] simple-lama-inpainting 미설치. "
+                "bald 스타일에서 cv2.inpaint 폴백 사용. "
+                "pip install simple-lama-inpainting 으로 설치 가능"
+            )
+            self._lama = None
+
+    def _lama_inpaint(self, img_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """
+        LaMa로 대규모 영역 inpainting.
+        img_rgb: (H, W, 3) uint8 RGB
+        mask: (H, W) float32 [0,1] 또는 uint8 [0,255]
+        Returns: (H, W, 3) uint8 RGB
+        """
+        if self._lama is None:
+            # 폴백: cv2.inpaint
+            mask_u8 = (mask > 0.5).astype(np.uint8) * 255 if mask.dtype != np.uint8 else mask
+            return cv2.inpaint(img_rgb, mask_u8, inpaintRadius=10, flags=cv2.INPAINT_TELEA)
+
+        # LaMa 입력: RGB uint8 + mask uint8 (255=inpaint)
+        if mask.dtype == np.float32 or mask.dtype == np.float64:
+            mask_u8 = (mask > 0.5).astype(np.uint8) * 255
+        else:
+            mask_u8 = mask
+        result_pil = self._lama(img_rgb, mask_u8)
+        return np.array(result_pil)
 
     def _load_segface(self) -> None:
         """SegFace (Swin-B) 모델 로드"""

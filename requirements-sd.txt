@@ -16,6 +16,7 @@ tqdm==4.67.1
 # Image processing
 opencv-python-headless==4.10.0.84
 scikit-image==0.24.0
+simple-lama-inpainting>=0.1.0
 
 # Face detection
 mediapipe==0.10.18
