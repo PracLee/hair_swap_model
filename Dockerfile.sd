@@ -12,7 +12,7 @@
 #     -t byoungj/sd-v1 --push .
 # =============================================================================
 
-FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel AS deps
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel AS deps
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -40,13 +40,10 @@ RUN pip install --upgrade pip && \
 # SAM2 pip install이 의존성 해소 시 PyPI(CPU) torchvision으로 덮어쓸 수 있음.
 # torchvision::nms C++ CUDA operator 누락 방지를 위해 명시적 재설치.
 RUN pip install --force-reinstall --no-deps \
-    "torchvision==0.19.1+cu124" \
-    --extra-index-url https://download.pytorch.org/whl/cu124
+    "torchvision==0.22.1+cu128" \
+    --extra-index-url https://download.pytorch.org/whl/cu128
 
-# ── Step C: xformers ─────────────────────────────────────────────────────────
-RUN pip install "xformers==0.0.27.post2"
-
-# ── Step D: opencv headless (mediapipe 충돌 방지) ────────────────────────────
+# ── Step C: opencv headless (mediapipe 충돌 방지) ────────────────────────────
 RUN pip install --force-reinstall "opencv-python-headless==4.10.0.84"
 
 # =============================================================================

@@ -1,12 +1,12 @@
-# HairCLIPv2 runtime dependencies for Python 3.11 / CUDA 12.4 on RunPod.
+# HairCLIPv2 runtime dependencies for Python 3.11 / CUDA 12.8 on RunPod.
 # Install this file first.
 # Optional extras:
 #   - requirements-dev.txt for notebook tooling
 
---extra-index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://download.pytorch.org/whl/cu128
 
-torch==2.4.1+cu124
-torchvision==0.19.1+cu124
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
 numpy==2.2.6
 Pillow==10.2.0
 

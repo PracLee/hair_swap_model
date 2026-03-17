@@ -148,7 +148,7 @@ class SDInpaintConfig:
     use_sam2: bool = True
 
     # 메모리 최적화
-    enable_xformers: bool = True
+    enable_xformers: bool = False
 
     # 후처리 옵션 (현재 파이프라인에서는 기본 alpha blend 사용)
     use_clip_ranking: bool = False   # 향후 CLIP 랭킹 확장용

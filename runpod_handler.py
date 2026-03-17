@@ -254,10 +254,17 @@ def _to_json_safe(obj: Any) -> Any:
 def _cuda_info() -> dict:
     try:
         import torch
+        capability = None
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability(0)
+            capability = f"{major}.{minor}"
         return {
+            "torch_version": torch.__version__,
+            "cuda_runtime": torch.version.cuda,
             "available": torch.cuda.is_available(),
             "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
             "vram_total_mb": round(torch.cuda.get_device_properties(0).total_memory / 1024 ** 2) if torch.cuda.is_available() else None,
+            "capability": capability,
         }
     except Exception as e:
         return {"available": False, "error": str(e)}

@@ -95,7 +95,7 @@ def _get_pipeline() -> "MirrAISDPipeline":
             "use_clip_ranking":    True,
             "use_color_match":     True,
             "use_poisson_blend":   True,
-            "enable_xformers":     True,
+            "enable_xformers":     False,
         }
         cfg = SDInpaintConfig(**{k: v for k, v in _cfg_kwargs.items() if k in _cfg_fields})
 
@@ -210,11 +210,18 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     # 헬스체크
     if _coerce_bool(inp.get("health_check")):
         import torch
+        capability = None
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability(0)
+            capability = f"{major}.{minor}"
         return {
             "status": "ok",
             "cuda": {
+                "torch_version": torch.__version__,
+                "cuda_runtime": torch.version.cuda,
                 "available": torch.cuda.is_available(),
                 "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+                "capability": capability,
             },
         }
 

@@ -1,9 +1,9 @@
 # =============================================================================
 # Stage 1 – Python 의존성
-#   • pytorch/pytorch 공식 베이스 (torch+cu124 포함)
+#   • pytorch/pytorch 공식 베이스 (torch+cu128 포함)
 #   • requirements 변경 시에만 이 레이어 재빌드
 # =============================================================================
-FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel AS deps
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel AS deps
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -112,9 +112,9 @@ ENV PYTHONPATH=/app \
 
 # ── StyleGAN2 CUDA 확장 빌드 시점 pre-compile ──────────────────────────────
 #   콜드 스타트마다 JIT 컴파일(30~60 초)을 이미지 빌드 시점으로 이동.
-#   RTX 4090(8.9) / A100(8.0) / A40(8.6) / H100(9.0) 멀티 아키텍처 대응.
+#   RTX 4090(8.9) / RTX 5090(11.0) / A100(8.0) / A40(8.6) / H100(9.0) 멀티 아키텍처 대응.
 #   nvcc(devel 이미지)가 CPU에서 컴파일 → GPU 없이도 빌드 가능.
-ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" \
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;11.0+PTX" \
     HAIRCLIP_VERBOSE_EXTENSIONS=0
 
 RUN python - << 'PYEOF'

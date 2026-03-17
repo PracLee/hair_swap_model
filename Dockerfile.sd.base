@@ -7,7 +7,7 @@
 # - CI 디스크 압박 완화를 위해 devel 대신 runtime 베이스 사용
 # =============================================================================
 
-FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -33,11 +33,8 @@ RUN pip install --upgrade pip && \
 
 # Step B: torchvision CUDA 버전 강제 고정
 RUN pip install --force-reinstall --no-deps \
-    "torchvision==0.19.1+cu124" \
-    --extra-index-url https://download.pytorch.org/whl/cu124
+    "torchvision==0.22.1+cu128" \
+    --extra-index-url https://download.pytorch.org/whl/cu128
 
-# Step C: xformers
-RUN pip install "xformers==0.0.27.post2"
-
-# Step D: opencv headless (mediapipe 충돌 방지)
+# Step C: opencv headless (mediapipe 충돌 방지)
 RUN pip install --force-reinstall "opencv-python-headless==4.10.0.84"
