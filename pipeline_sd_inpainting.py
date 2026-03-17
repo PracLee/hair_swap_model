@@ -638,6 +638,7 @@ class MirrAISDPipeline:
                         removal_mask=removal_mask_for_post,
                         cutoff_y=cutoff_y_for_post,
                         shoulder_protect=shoulder_protect_for_post,
+                        hair_length=hair_length,
                     )
                     composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
                 except Exception as e:
@@ -1780,6 +1781,7 @@ class MirrAISDPipeline:
         removal_mask: np.ndarray,
         cutoff_y: int,
         shoulder_protect: Optional[np.ndarray] = None,
+        hair_length: str = "short",
     ) -> np.ndarray:
         """
         최종 결과에서 cutoff 아래 long-hair 제거 마스크 영역을 한 번 더 정리.
@@ -1788,8 +1790,10 @@ class MirrAISDPipeline:
         if removal_mask.shape != (H, W):
             return img_rgb
 
-        _, y1, _, y2 = face_bbox
+        x1, y1, x2, y2 = face_bbox
         face_h = max(int(y2 - y1), 1)
+        face_w = max(int(x2 - x1), 1)
+        cx = int(0.5 * (x1 + x2))
         soft_zone = max(12, int(face_h * 0.25))
 
         force = removal_mask.copy().astype(np.float32)
@@ -1804,34 +1808,66 @@ class MirrAISDPipeline:
             )
             force = force * ramp[:, np.newaxis]
 
-        # 실제 남아있는 hair 픽셀과 교집합만 제거해 의상/배경 훼손 방지
+        # 얼굴 주변 corridor 안에서만 cleanup을 허용해 의상/배경 훼손을 줄인다.
+        corridor_ratio = 1.55 if hair_length == "short" else 1.35
+        x_min = max(0, int(x1 - face_w * corridor_ratio))
+        x_max = min(W, int(x2 + face_w * corridor_ratio))
+        corridor = np.zeros((H, W), dtype=np.uint8)
+        if x_min < x_max:
+            corridor[:, x_min:x_max] = 255
+
+        force_thresh = 0.56 if hair_length == "short" else 0.60
+        force_u8 = ((force > force_thresh).astype(np.uint8) * 255)
+        force_u8 = cv2.bitwise_and(force_u8, corridor)
+
+        # 실제 남아있는 hair 픽셀과 교집합을 우선 적용해 의상/배경 훼손 방지
         hair_now, _, _ = self._segface_hair_mask(img_rgb, face_bbox)
         hair_now[:cutoff_y, :] = 0.0
         hair_now_u8 = (hair_now > 0.5).astype(np.uint8) * 255
         if int((hair_now_u8 > 0).sum()) > 0:
-            hair_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            hair_k = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (11, 11) if hair_length == "short" else (9, 9),
+            )
             hair_now_u8 = cv2.dilate(hair_now_u8, hair_k, iterations=1)
 
-        force_u8 = ((force > 0.60).astype(np.uint8) * 255)
-        force_u8 = cv2.bitwise_and(force_u8, hair_now_u8)
+        hair_inter_u8 = cv2.bitwise_and(force_u8, hair_now_u8)
+        if hair_length == "short":
+            # SegFace miss를 보완하기 위해 side-zone에 한해 high-confidence force를 추가 반영
+            center_half = max(18, int(face_w * 0.42))
+            side_zone = corridor.copy()
+            side_zone[:, max(0, cx - center_half):min(W, cx + center_half)] = 0
+            fallback_u8 = ((force > 0.78).astype(np.uint8) * 255)
+            fallback_u8 = cv2.bitwise_and(fallback_u8, side_zone)
+            force_u8 = cv2.bitwise_or(hair_inter_u8, fallback_u8)
+        else:
+            force_u8 = hair_inter_u8
+
         if shoulder_protect is not None and shoulder_protect.shape == (H, W):
             protect_u8 = (shoulder_protect > 0.22).astype(np.uint8) * 255
             if int((protect_u8 > 0).sum()) > 0:
                 force_u8 = cv2.bitwise_and(force_u8, cv2.bitwise_not(protect_u8))
 
-        if int((force_u8 > 0).sum()) < 40:
+        min_cleanup_px = 28 if hair_length == "short" else 40
+        if int((force_u8 > 0).sum()) < min_cleanup_px:
             return img_rgb
 
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (9, 9) if hair_length == "short" else (7, 7),
+        )
         force_u8 = cv2.dilate(force_u8, k, iterations=1)
 
-        filled_ns = cv2.inpaint(img_rgb, force_u8, inpaintRadius=8, flags=cv2.INPAINT_NS)
-        filled_te = cv2.inpaint(img_rgb, force_u8, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+        inpaint_ns = 9 if hair_length == "short" else 8
+        inpaint_te = 6 if hair_length == "short" else 5
+        filled_ns = cv2.inpaint(img_rgb, force_u8, inpaintRadius=inpaint_ns, flags=cv2.INPAINT_NS)
+        filled_te = cv2.inpaint(img_rgb, force_u8, inpaintRadius=inpaint_te, flags=cv2.INPAINT_TELEA)
         filled = cv2.addWeighted(filled_ns, 0.6, filled_te, 0.4, 0.0)
 
         alpha = force_u8.astype(np.float32) / 255.0
         alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=4.0, sigmaY=4.0)[..., np.newaxis]
-        alpha = np.clip(alpha * 0.78, 0.0, 1.0)
+        alpha_gain = 0.84 if hair_length == "short" else 0.78
+        alpha = np.clip(alpha * alpha_gain, 0.0, 1.0)
         out = filled.astype(np.float32) * alpha + img_rgb.astype(np.float32) * (1.0 - alpha)
         return np.clip(out, 0, 255).astype(np.uint8)
 
