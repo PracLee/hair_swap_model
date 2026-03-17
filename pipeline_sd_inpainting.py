@@ -680,7 +680,11 @@ class MirrAISDPipeline:
                                 is_bald_style=is_bald_style,
                             )
                             _store_mask("pipeline_preclean_mask", preclean_mask)
-                            preclean_protect = np.clip(face_region_mask + hand_mask, 0.0, 1.0)
+                            if is_bald_style:
+                                # bald: 옷도 보호 (preclean이 옷/배경을 바꾸는 문제 방지)
+                                preclean_protect = np.clip(face_region_mask + hand_mask + cloth_mask_dilated, 0.0, 1.0)
+                            else:
+                                preclean_protect = np.clip(face_region_mask + hand_mask, 0.0, 1.0)
                             fill_base = self._sd_preclean_long_hair_region(
                                 base_rgb=fill_base,
                                 preclean_mask=preclean_mask,
@@ -2068,18 +2072,10 @@ class MirrAISDPipeline:
         preclean_u8 = cv2.dilate(base_u8, dilate_k, iterations=1)
 
         if is_bald_style:
-            # bald: SAM2 full mask 기반이므로 corridor를 넓게 잡아야 함
-            ys_h, xs_h = np.where(preclean_u8 > 0)
-            if xs_h.size > 0 and ys_h.size > 0:
-                x_min = max(0, int(xs_h.min() - face_w * 0.55))
-                x_max = min(W, int(xs_h.max() + face_w * 0.55))
-                y_min = max(0, int(min(ys_h.min(), y1) - face_h * 0.55))
-                y_max = min(H, int(max(ys_h.max(), cutoff_y) + face_h * 1.20))
-            else:
-                x_min = max(0, int(x1 - face_w * 1.20))
-                x_max = min(W, int(x2 + face_w * 1.20))
-                y_min = max(0, int(y1 - face_h * 0.55))
-                y_max = min(H, int(cutoff_y + face_h * 1.20))
+            # bald: SAM2 hair mask 기반이므로 dilated mask만으로 충분.
+            # corridor를 추가하면 배경/옷까지 덮어서 SD가 전체를 재생성하는 문제 발생.
+            # → corridor 없이 dilated hair mask만 사용.
+            x_min, x_max, y_min, y_max = 0, 0, 0, 0  # corridor 비활성화
         else:
             corridor_x_ratio = 1.95 if hair_length == "short" else 2.15
             x_min = max(0, int(x1 - face_w * corridor_x_ratio))
@@ -2098,8 +2094,12 @@ class MirrAISDPipeline:
                 (31, 31) if hair_length == "short" else (37, 37),
             )
             cloth_u8 = cv2.dilate(cloth_u8, cloth_k, iterations=1)
-            shoulder_band = cv2.bitwise_and(cloth_u8, corridor_u8)
-            preclean_u8 = cv2.bitwise_or(preclean_u8, shoulder_band)
+            if is_bald_style:
+                # bald: 옷 영역은 preclean에서 제외 (옷이 바뀌는 문제 방지)
+                preclean_u8 = cv2.bitwise_and(preclean_u8, cv2.bitwise_not(cloth_u8))
+            else:
+                shoulder_band = cv2.bitwise_and(cloth_u8, corridor_u8)
+                preclean_u8 = cv2.bitwise_or(preclean_u8, shoulder_band)
 
         if hand_mask is not None and hand_mask.shape == (H, W):
             hand_u8 = (np.clip(hand_mask, 0.0, 1.0) > 0.22).astype(np.uint8) * 255
