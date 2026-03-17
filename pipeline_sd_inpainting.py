@@ -354,11 +354,9 @@ class MirrAISDPipeline:
             f"[SDPipeline] 옷 픽셀 제거 완료, pixels={hair_mask.sum():.0f}"
         )
 
-        # ── Step 3-e: 숏컷/중단발 — 2단계 전략 ──────────────────────────────
-        # 단발/숏컷 변환은 단순 SD inpainting으로 불가능:
-        #   SD는 마스크 주변에 긴 머리가 보이면 계속 긴 머리를 생성함.
-        # 해결: ① cv2.inpaint로 긴 머리 먼저 제거(배경/피부로 채움)
-        #        ② 제거된 이미지 위에 SD로 새 숏컷 생성 (머리 없는 주변 맥락)
+        # ── Step 3-e: 숏컷/중단발 — 전략 2 (Post-Inpainting) ────────────────
+        # 단발/숏컷에서 기존 긴머리 prior가 강하면, 생성 후 잔여 long-hair만
+        # 차집합 마스크 기반으로 후처리하는 쪽이 더 안정적이다.
         cutoff_y_for_post: Optional[int] = None
         removal_mask_for_post: Optional[np.ndarray] = None
         shoulder_protect_for_post: Optional[np.ndarray] = None
@@ -385,54 +383,88 @@ class MirrAISDPipeline:
                 )
             _store_mask("pipeline_shoulder_protect_mask", shoulder_protect_for_post)
 
-            # ── head box 계산 (removal_mask, gen_mask 양쪽에서 사용) ─────────────
+            # ── head box 계산 (gen_mask corridor 범위 산정에 사용) ───────────────
             margin_x = int(face_w * 0.5)   # 얼굴 폭의 50% 여백 (양 옆 머리 공간)
             head_x1  = max(0, x1f - margin_x)
             head_x2  = min(W, x2f + margin_x)
             head_y1  = max(0, y1f - int(face_h * 0.6))   # 정수리 위까지
             head_y2  = cutoff_y
 
-            # ── 전략 1: 선(先) 철거 후(後) 시공 ──────────────────────────────────
-            # 전체 머리카락을 LaMa로 제거한 뒤, 깨끗한 캔버스 위에 SD로 새 헤어 생성
-            #
-            # removal_mask = 전체 머리카락 (cutoff 구분 없이 SAM2 전체 mask)
-            removal_mask = hair_mask_for_removal.copy()
-            # 얼굴/옷 보호
-            removal_mask = np.clip(removal_mask - face_region_mask, 0.0, 1.0)
-            removal_mask = np.clip(removal_mask - cloth_mask_dilated, 0.0, 1.0)
-            removal_mask_for_post = removal_mask.copy()
+            # removal_mask_for_post = 기존 긴 머리 전체에서 새 short 영역 후보를 뺀 잔여물 마스크
+            # 옷 위로 떨어진 머리카락도 지워야 하므로 cloth는 여기서 빼지 않는다.
+            long_hair_mask = np.clip(hair_mask_for_removal - face_region_mask, 0.0, 1.0)
 
-            # gen_mask = head box 기반 (SD가 새 헤어를 생성할 영역)
-            gen_mask = np.zeros((H, W), dtype=np.float32)
-            gen_mask[head_y1:head_y2, head_x1:head_x2] = 1.0
+            # gen_mask = 기존 헤어 상단 + 얼굴 주변 corridor를 합쳐 새 단발이 생성될 영역만 열어 준다.
+            # 직사각형 전체 head box를 쓰면 배경 패치가 같이 생겨 사각형 artifact가 남기 쉽다.
+            gen_mask = long_hair_mask.copy()
+            gen_soft_bottom = min(
+                H,
+                cutoff_y + max(10, int(face_h * (0.08 if hair_length == "short" else 0.16))),
+            )
+            gen_mask[gen_soft_bottom:, :] = 0.0
+
+            # 직사각 corridor 대신 타원형 head prior를 더해 사각형 artifact를 줄인다.
+            corridor_y_pad = max(14, int(face_h * (0.10 if hair_length == "short" else 0.22)))
+            cx = int(0.5 * (x1f + x2f))
+            cy = int(y1f + face_h * (0.34 if hair_length == "short" else 0.40))
+            ellipse_axes = (
+                max(24, int(face_w * (0.86 if hair_length == "short" else 1.00))),
+                max(30, int(face_h * (0.92 if hair_length == "short" else 1.10))),
+            )
+            ellipse_u8 = np.zeros((H, W), dtype=np.uint8)
+            cv2.ellipse(ellipse_u8, (cx, cy), ellipse_axes, 0, 0, 360, 255, -1)
+            ellipse_mask = (ellipse_u8 > 0).astype(np.float32)
+            ellipse_mask[min(H, cutoff_y + corridor_y_pad):, :] = 0.0
+            gen_mask = np.clip(np.maximum(gen_mask, ellipse_mask), 0.0, 1.0)
+
+            gen_kx = max(11, int(face_w * (0.10 if hair_length == "short" else 0.13)))
+            gen_ky = max(11, int(face_h * (0.08 if hair_length == "short" else 0.12)))
+            if gen_kx % 2 == 0:
+                gen_kx += 1
+            if gen_ky % 2 == 0:
+                gen_ky += 1
+            gen_u8 = (gen_mask > 0.30).astype(np.uint8) * 255
+            gen_u8 = cv2.dilate(
+                gen_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (gen_kx, gen_ky)),
+                iterations=1,
+            )
+            gen_u8 = cv2.morphologyEx(
+                gen_u8,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            )
+            gen_mask = (gen_u8 > 0).astype(np.float32)
             gen_mask = np.clip(gen_mask - face_region_mask, 0.0, 1.0)
-            gen_mask = np.clip(gen_mask - cloth_mask_dilated, 0.0, 1.0)
+            if shoulder_protect_for_post is not None and shoulder_protect_for_post.shape == (H, W):
+                gen_mask = np.clip(gen_mask - (shoulder_protect_for_post * 0.55), 0.0, 1.0)
 
-            _store_mask("pipeline_short_removal_mask", removal_mask)
+            # 새 short 생성 영역을 dilate해 잔여물 cleanup 대상에서 제외한다.
+            # -> 새 단발 끝선이 LaMa 후처리에 다시 지워지는 문제를 줄인다.
+            exclude_u8 = (gen_mask > 0.18).astype(np.uint8) * 255
+            exclude_u8 = cv2.dilate(
+                exclude_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
+                iterations=1,
+            )
+            exclude_mask = (exclude_u8 > 0).astype(np.float32)
+            removal_mask_for_post = np.clip(long_hair_mask - exclude_mask, 0.0, 1.0)
+
+            _store_mask("pipeline_short_removal_mask", removal_mask_for_post)
             _store_mask("pipeline_short_generation_mask", gen_mask)
 
             logger.info(
-                f"[SDPipeline] 전략1: removal_px={removal_mask.sum():.0f}, "
+                f"[SDPipeline] 전략2: removal_px={removal_mask_for_post.sum():.0f}, "
                 f"gen_px={gen_mask.sum():.0f}, cutoff_y={cutoff_y}, "
                 f"head_box=({head_x1},{head_y1})-({head_x2},{head_y2})"
             )
 
-            # 단계 1: LaMa로 전체 머리카락 제거 → 깨끗한 캔버스 ─────────────────
-            removal_u8 = (removal_mask > 0.3).astype(np.uint8) * 255
-            # 경계 머리카락까지 포함하도록 dilate
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-            removal_u8 = cv2.dilate(removal_u8, k, iterations=1)
-            # dilate 후 다시 얼굴/옷 보호
-            protect_u8 = (np.clip(face_region_mask + cloth_mask_dilated, 0.0, 1.0) > 0.3).astype(np.uint8) * 255
-            removal_u8 = cv2.bitwise_and(removal_u8, cv2.bitwise_not(protect_u8))
-
-            img_rgb_cleaned = self._lama_inpaint(img_rgb, removal_u8)
-            logger.info(f"[SDPipeline] LaMa 전체 철거 완료: pixels={int((removal_u8 > 0).sum())}")
+            # 전략 2는 원본 위에서 short 생성 후, 남은 long-hair만 LaMa로 정리한다.
+            img_rgb_cleaned = img_rgb
             _store_rgb("cv2_background_cleaned_rgb", img_rgb_cleaned)
 
-            # 단계 2: SD 생성은 head box 영역에서 새 헤어 생성
             hair_mask_for_sd = gen_mask.astype(np.float32)
-            img_rgb_for_sd   = img_rgb_cleaned
+            img_rgb_for_sd   = img_rgb
         else:
             # long 헤어는 기존 단일 패스 유지
             hair_mask_for_sd = hair_mask
@@ -444,8 +476,12 @@ class MirrAISDPipeline:
 
         # ── Step 4: SD 입력 준비 ─────────────────────────────────────────────
         img_pil = Image.fromarray(img_rgb_cleaned)
+        # short/medium에서는 기존 long-hair 윤곽도 억제해 ControlNet이
+        # 원본 긴머리 edge를 새 단발 형상으로 따라가지 않게 한다.
+        canny_suppress = hair_mask_for_removal if hair_length in ("short", "medium") else None
         img_512, mask_512, canny_512, scale, pad = self._prepare_sd_inputs(
-            img_rgb_for_sd, hair_mask_for_sd
+            img_rgb_for_sd, hair_mask_for_sd,
+            canny_suppress_mask=canny_suppress,
         )
         if debug_images_common is not None:
             debug_images_common["sd_input_512"] = cv2.cvtColor(
@@ -476,8 +512,7 @@ class MirrAISDPipeline:
         )
 
         # ── Step 8: Composite → 원본 해상도 ───────────────────────────────────
-        # composite base: short/medium은 cv2.inpaint된 이미지 사용
-        #   → 긴머리 제거된 상태에서 새 숏컷을 얹음
+        # 전략 2는 원본 위에 short 생성물을 합성한 뒤, cutoff 아래 잔여 긴머리만 정리한다.
         composite_base_rgb = img_rgb_cleaned
         composite_base_bgr = cv2.cvtColor(composite_base_rgb, cv2.COLOR_RGB2BGR)
 
@@ -491,8 +526,24 @@ class MirrAISDPipeline:
                 hair_length=hair_length,
             )
 
-            # 전략 1에서는 LaMa가 원본 머리를 전부 제거했으므로
-            # residual hair cleanup / final cutoff cleanup 불필요
+            if (
+                hair_length in ("short", "medium")
+                and cutoff_y_for_post is not None
+                and removal_mask_for_post is not None
+            ):
+                try:
+                    post_rgb = cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)
+                    post_rgb = self._final_cutoff_cleanup(
+                        post_rgb,
+                        face_bbox=face_bbox,
+                        removal_mask=removal_mask_for_post,
+                        cutoff_y=cutoff_y_for_post,
+                        shoulder_protect=shoulder_protect_for_post,
+                        hair_length=hair_length,
+                    )
+                    composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
+                except Exception as e:
+                    logger.warning(f"[SDPipeline] short/medium 잔여물 cleanup 실패(무시): {e}")
 
             if not has_color_request:
                 try:
@@ -680,7 +731,11 @@ class MirrAISDPipeline:
 
     def _lama_inpaint(self, img_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
-        LaMa로 대규모 영역 inpainting.
+        LaMa로 대규모 영역 inpainting (progressive 방식).
+
+        대규모 마스크(이미지의 20%+ 영역)인 경우, 바깥 테두리부터 안쪽으로
+        단계적으로 인페인팅하여 품질을 높임.
+
         img_rgb: (H, W, 3) uint8 RGB
         mask: (H, W) float32 [0,1] 또는 uint8 [0,255]
         Returns: (H, W, 3) uint8 RGB
@@ -688,9 +743,70 @@ class MirrAISDPipeline:
         if mask.dtype == np.float32 or mask.dtype == np.float64:
             mask_u8 = (mask > 0.5).astype(np.uint8) * 255
         else:
-            mask_u8 = mask
-        result_pil = self._lama(img_rgb, mask_u8)
-        return np.array(result_pil)
+            mask_u8 = mask.copy()
+
+        total_pixels = int((mask_u8 > 0).sum())
+        image_pixels = mask_u8.shape[0] * mask_u8.shape[1]
+
+        # PIL Image 변환 (simple-lama-inpainting 호환성 보장)
+        img_pil = Image.fromarray(img_rgb)
+
+        # 작은 마스크(이미지의 15% 미만)는 단일 패스
+        if total_pixels < image_pixels * 0.15:
+            mask_pil = Image.fromarray(mask_u8)
+            result_pil = self._lama(img_pil, mask_pil)
+            return np.array(result_pil)
+
+        # ── Progressive inpainting: 바깥→안쪽 단계적 처리 ──────────────
+        # 큰 마스크를 3단계로 나눠서 테두리부터 인페인팅
+        logger.info(
+            f"[SDPipeline] LaMa progressive 모드: "
+            f"total_pixels={total_pixels}, ratio={total_pixels/image_pixels:.1%}"
+        )
+
+        current_img = img_rgb.copy()
+        remaining_mask = mask_u8.copy()
+        n_stages = 3
+        # 각 단계에서 사용할 erosion 커널 크기 (점점 안쪽으로)
+        erode_sizes = [31, 21, 0]  # 마지막은 나머지 전부
+
+        for stage_i, erode_k in enumerate(erode_sizes):
+            if remaining_mask.sum() == 0:
+                break
+
+            if erode_k > 0:
+                # remaining_mask에서 erosion → 안쪽 영역 제거 → 테두리만 남김
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_k, erode_k))
+                inner = cv2.erode(remaining_mask, k, iterations=1)
+                stage_mask = remaining_mask - inner  # 테두리 밴드
+                stage_mask = np.clip(stage_mask, 0, 255).astype(np.uint8)
+            else:
+                # 마지막 단계: 남은 영역 전부
+                stage_mask = remaining_mask.copy()
+
+            stage_pixels = int((stage_mask > 0).sum())
+            if stage_pixels < 100:
+                continue
+
+            logger.info(
+                f"[SDPipeline] LaMa stage {stage_i+1}/{n_stages}: "
+                f"pixels={stage_pixels}"
+            )
+
+            # 이 단계의 마스크로 인페인팅
+            img_pil_stage = Image.fromarray(current_img)
+            mask_pil_stage = Image.fromarray(stage_mask)
+            result_pil = self._lama(img_pil_stage, mask_pil_stage)
+            current_img = np.array(result_pil)
+
+            # 처리 완료된 부분 제거
+            remaining_mask = np.clip(
+                remaining_mask.astype(np.int16) - stage_mask.astype(np.int16),
+                0, 255
+            ).astype(np.uint8)
+
+        logger.info("[SDPipeline] LaMa progressive 완료")
+        return current_img
 
     def _load_segface(self) -> None:
         """SegFace (Swin-B) 모델 로드"""
@@ -1177,9 +1293,14 @@ class MirrAISDPipeline:
         img_rgb: np.ndarray,     # H×W×3 RGB
         hair_mask: np.ndarray,   # H×W float32
         mask_edge_suppression: float = 1.0,  # 0.0=엣지 보존, 1.0=마스크 내부 엣지 완전 제거
+        canny_suppress_mask: Optional[np.ndarray] = None,  # H×W float32 — 이 영역의 canny edge도 제거
     ) -> Tuple[Image.Image, Image.Image, Image.Image, float, Tuple[int, int]]:
         """
         Letter-box resize → 512×512.
+
+        Args:
+            canny_suppress_mask: short/medium에서 사용. 기존 long-hair 영역의 canny edge를
+                                 추가로 제거하여 ControlNet이 원본 긴머리 윤곽을 따라가지 않게 함.
 
         Returns:
             img_512:    PIL RGB 512×512 (full image)
@@ -1211,6 +1332,26 @@ class MirrAISDPipeline:
         canny = cv2.Canny(gray, self.config.canny_low, self.config.canny_high)
         suppress = float(np.clip(mask_edge_suppression, 0.0, 1.0))
         hair_hard = (msk_canvas > 0.5).astype(np.float32)
+
+        # canny_suppress_mask가 있으면 해당 영역의 edge도 완전 제거
+        # → LaMa 잔여 블러 윤곽이 ControlNet에 전달되지 않음
+        if canny_suppress_mask is not None:
+            sup_rs = cv2.resize(canny_suppress_mask, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            sup_canvas = np.zeros((SD_SIZE, SD_SIZE), dtype=np.float32)
+            sup_canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = sup_rs
+            # dilate: 경계 blur 잔여물까지 제거
+            k_sup = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            sup_hard = cv2.dilate(
+                (sup_canvas > 0.3).astype(np.uint8), k_sup, iterations=1
+            ).astype(np.float32)
+            # 기존 hair_hard와 합쳐서 최종 suppression 영역
+            hair_hard = np.clip(hair_hard + sup_hard, 0.0, 1.0)
+            logger.info(
+                f"[SDPipeline] canny suppress 확장: "
+                f"gen_mask pixels={int((msk_canvas > 0.5).sum())}, "
+                f"total suppress pixels={int((hair_hard > 0.5).sum())}"
+            )
+
         canny_f = canny.astype(np.float32) * (1.0 - hair_hard * suppress)
         canny_rgb = cv2.cvtColor(canny_f.astype(np.uint8), cv2.COLOR_GRAY2RGB)
 
