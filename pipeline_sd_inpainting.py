@@ -365,7 +365,7 @@ class MirrAISDPipeline:
             if hair_length == "short":
                 cutoff_y = int(y2f + face_h * 0.12)   # 턱~윗목 사이 (하드컷 완화)
             else:
-                cutoff_y = int(y2f + face_h * 0.60)   # 어깨 위
+                cutoff_y = int(y2f + face_h * 0.54)   # 어깨 위 (끝선 명확도 강화)
             cutoff_y = min(cutoff_y, H - 1)
             cutoff_y_for_post = cutoff_y
             shoulder_protect_for_post = self._build_shoulder_protect_mask(
@@ -437,6 +437,42 @@ class MirrAISDPipeline:
                     f"[SDPipeline] removal_mask hair기반 확장({hair_length}): "
                     f"pixels={removal_mask.sum():.0f}"
                 )
+
+                # SegFace/SAM miss로 중앙이 끊겨 있으면 neck corridor에서 좌우를 연결.
+                # (잔존 장발 + 생성 헤어 이중 경계 완화)
+                bridge_u8 = np.zeros((H, W), dtype=np.uint8)
+                bridge_src_u8 = (hair_below_expanded > 0).astype(np.uint8)
+                bridge_y2 = min(H, int(cutoff_y + face_h * (1.10 if hair_length == "short" else 1.45)))
+                max_span = int(face_w * (2.70 if hair_length == "short" else 3.00))
+                for row in range(cutoff_y, bridge_y2):
+                    cols = np.where(bridge_src_u8[row] > 0)[0]
+                    if cols.size < 2:
+                        continue
+                    c_min = int(cols.min())
+                    c_max = int(cols.max())
+                    if c_max - c_min > max_span:
+                        continue
+                    bridge_u8[row, c_min:c_max + 1] = 255
+                if int((bridge_u8 > 0).sum()) > 0:
+                    smooth_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 7))
+                    bridge_u8 = cv2.morphologyEx(bridge_u8, cv2.MORPH_CLOSE, smooth_k)
+                    bridge_zone = np.zeros((H, W), dtype=np.uint8)
+                    bridge_zone[cutoff_y:bridge_y2, max(0, head_x1 - 14):min(W, head_x2 + 14)] = 255
+                    bridge_u8 = cv2.bitwise_and(bridge_u8, bridge_zone)
+
+                support_k = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE,
+                    (31, 17) if hair_length == "short" else (39, 21),
+                )
+                support_u8 = cv2.dilate((hair_below > 0).astype(np.uint8) * 255, support_k, iterations=1)
+                bridge_u8 = cv2.bitwise_and(bridge_u8, support_u8)
+
+                if int((bridge_u8 > 0).sum()) > 0:
+                    removal_mask = np.maximum(removal_mask, bridge_u8.astype(np.float32) / 255.0)
+                    logger.info(
+                        f"[SDPipeline] removal_mask 연결 보강({hair_length}): "
+                        f"pixels={int((bridge_u8 > 0).sum())}"
+                    )
             # short는 최소 연결만, medium은 조금 더 강하게 연결
             close_size = 5 if hair_length == "short" else 11
             remove_close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size))
@@ -453,7 +489,11 @@ class MirrAISDPipeline:
             # 얼굴 내부(눈/코/입)는 inpaint 하지 않음
             gen_mask = np.clip(gen_mask - face_region_mask, 0.0, 1.0)
             # 옷도 보호
-            gen_mask = np.clip(gen_mask - cloth_mask_dilated, 0.0, 1.0)
+            if hair_length == "medium":
+                # medium은 끝선 생성을 위해 의상 보호를 완화(완전 차단시 하단 notching 발생)
+                gen_mask = np.clip(gen_mask - cloth_mask_dilated * 0.55, 0.0, 1.0)
+            else:
+                gen_mask = np.clip(gen_mask - cloth_mask_dilated, 0.0, 1.0)
             # 손/소품도 보호
             gen_mask = np.clip(gen_mask - hand_mask, 0.0, 1.0)
 
@@ -461,7 +501,7 @@ class MirrAISDPipeline:
             removal_mask = np.clip(removal_mask - hand_mask, 0.0, 1.0)
             # 어깨 윤곽(옷 상단 경계)은 과도하게 지우지 않도록 보호
             if shoulder_protect_for_post is not None:
-                shoulder_protect_weight = 0.48 if hair_length == "short" else 0.85
+                shoulder_protect_weight = 0.40 if hair_length == "short" else 0.50
                 removal_mask = np.clip(
                     removal_mask - shoulder_protect_for_post * shoulder_protect_weight,
                     0.0,
@@ -497,10 +537,23 @@ class MirrAISDPipeline:
                 img_rgb_filled = cv2.addWeighted(img_rgb_ns, 0.25, img_rgb_telea, 0.75, 0.0)
 
                 # 작은/중간 영역은 seamlessClone으로 경계 접합을 자연스럽게 처리
-                # (큰 영역에서는 오히려 왜곡이 생길 수 있어 alpha blend로 폴백)
+                # (분리된 마스크에서는 왜곡/패치가 커서 alpha blend로 폴백)
                 removal_px = int((removal_u8 > 0).sum())
                 max_clone_px = int(H * W * 0.18)
-                if 50 <= removal_px <= max_clone_px:
+                cc_count = 0
+                largest_cc_ratio = 0.0
+                if removal_px > 0:
+                    cc_num, _, cc_stats, _ = cv2.connectedComponentsWithStats(removal_u8, connectivity=8)
+                    cc_count = max(0, int(cc_num - 1))
+                    if cc_count > 0:
+                        largest_cc = int(cc_stats[1:, cv2.CC_STAT_AREA].max())
+                        largest_cc_ratio = largest_cc / float(removal_px)
+                allow_clone = (
+                    50 <= removal_px <= max_clone_px
+                    and cc_count == 1
+                    and largest_cc_ratio >= 0.82
+                )
+                if allow_clone:
                     ys, xs = np.where(removal_u8 > 0)
                     c_x = int((xs.min() + xs.max()) * 0.5)
                     c_y = int((ys.min() + ys.max()) * 0.5)
@@ -521,6 +574,11 @@ class MirrAISDPipeline:
                             + img_rgb.astype(np.float32) * (1.0 - soft_alpha)
                         ).clip(0, 255).astype(np.uint8)
                 else:
+                    if cc_count > 1:
+                        logger.info(
+                            "[SDPipeline] seamlessClone 스킵: 분리 마스크 "
+                            f"(components={cc_count}, largest_ratio={largest_cc_ratio:.3f})"
+                        )
                     # soft-blend는 core mask 기준으로만 feather → 사다리꼴 번짐 방지
                     soft_alpha = removal_u8.astype(np.float32) / 255.0
                     soft_alpha = cv2.GaussianBlur(soft_alpha, (0, 0), sigmaX=1.2)[..., np.newaxis]
@@ -562,8 +620,10 @@ class MirrAISDPipeline:
                     try:
                         fill_seed = int(seeds[0]) if seeds else random.randint(0, 2**31 - 1)
                         face_crop_fill = self._crop_face(Image.fromarray(img_rgb), face_bbox)
+                        # 분리 컴포넌트 제거 마스크는 cv2 inpaint 흔적이 커서 원본 기반으로 SD 채움.
+                        fill_base = img_rgb if cc_count > 1 else img_rgb_cleaned
                         img_rgb_cleaned = self._sd_refine_removed_region(
-                            base_rgb=img_rgb_cleaned,
+                            base_rgb=fill_base,
                             removal_mask=removal_mask,
                             face_bbox=face_bbox,
                             face_crop_pil=face_crop_fill,
@@ -649,6 +709,7 @@ class MirrAISDPipeline:
                 composite_base_bgr, composite_base_rgb,
                 gen_pil, hair_mask_for_sd, scale, pad, (W, H),
                 protect_mask=face_region_mask,   # 얼굴 영역 alpha 침범 방지
+                hair_length=hair_length,
             )
 
             # 최종 결과 기준으로 cutoff 아래 장발 잔존이 있으면 한 번 더 정리
@@ -1960,7 +2021,7 @@ class MirrAISDPipeline:
         residual_u8 = cv2.morphologyEx(residual_u8, cv2.MORPH_OPEN, open_k)
 
         if shoulder_protect is not None and shoulder_protect.shape == (H, W):
-            protect_threshold = 0.50 if hair_length == "short" else 0.22
+            protect_threshold = 0.50 if hair_length == "short" else 0.34
             protect_u8 = (shoulder_protect > protect_threshold).astype(np.uint8) * 255
             if hair_length == "short" and int((protect_u8 > 0).sum()) > 0:
                 protect_u8 = cv2.erode(
@@ -2044,7 +2105,7 @@ class MirrAISDPipeline:
         if x_min < x_max:
             corridor[:, x_min:x_max] = 255
 
-        force_thresh = 0.56 if hair_length == "short" else 0.60
+        force_thresh = 0.56 if hair_length == "short" else 0.54
         force_u8 = ((force > force_thresh).astype(np.uint8) * 255)
         force_u8 = cv2.bitwise_and(force_u8, corridor)
 
@@ -2069,10 +2130,13 @@ class MirrAISDPipeline:
             fallback_u8 = cv2.bitwise_and(fallback_u8, side_zone)
             force_u8 = cv2.bitwise_or(hair_inter_u8, fallback_u8)
         else:
-            force_u8 = hair_inter_u8
+            # medium도 SegFace miss 보완용 fallback force 일부 허용
+            fallback_u8 = ((force > 0.74).astype(np.uint8) * 255)
+            fallback_u8 = cv2.bitwise_and(fallback_u8, corridor)
+            force_u8 = cv2.bitwise_or(hair_inter_u8, fallback_u8)
 
         if shoulder_protect is not None and shoulder_protect.shape == (H, W):
-            protect_threshold = 0.50 if hair_length == "short" else 0.22
+            protect_threshold = 0.50 if hair_length == "short" else 0.34
             protect_u8 = (shoulder_protect > protect_threshold).astype(np.uint8) * 255
             if hair_length == "short" and int((protect_u8 > 0).sum()) > 0:
                 protect_u8 = cv2.erode(
@@ -2120,6 +2184,7 @@ class MirrAISDPipeline:
         pad: Tuple[int, int],            # (pad_left, pad_top)
         original_size: Tuple[int, int],  # (W, H)
         protect_mask: Optional[np.ndarray] = None,  # H×W float32: 이 영역은 alpha=0 강제 (얼굴 보호)
+        hair_length: str = "long",
     ) -> np.ndarray:
         """
         SD 생성 이미지를 원본에 합성.
@@ -2138,8 +2203,17 @@ class MirrAISDPipeline:
         # 원본 해상도로 upscale
         gen_orig = cv2.resize(gen_cropped, (W, H), interpolation=cv2.INTER_LANCZOS4)
 
-        # alpha 블렌딩: Gaussian feather로 경계 자연스럽게 처리
-        alpha = cv2.GaussianBlur(hair_mask, (0, 0), sigmaX=6.0, sigmaY=6.0)
+        # alpha 블렌딩: short/medium는 경계를 더 또렷하게 유지
+        sigma = 6.0
+        if hair_length == "short":
+            sigma = 4.2
+        elif hair_length == "medium":
+            sigma = 4.8
+        alpha = cv2.GaussianBlur(hair_mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        if hair_length == "short":
+            alpha = np.clip((alpha - 0.10) / 0.90, 0.0, 1.0)
+        elif hair_length == "medium":
+            alpha = np.clip((alpha - 0.07) / 0.93, 0.0, 1.0)
         alpha = np.clip(alpha, 0.0, 1.0)
 
         # 얼굴/귀/눈 등 보호 영역: alpha를 0으로 강제
