@@ -3486,6 +3486,12 @@ class MirrAISDPipeline:
         front_cleanup_u8 = np.zeros((H, W), dtype=np.uint8)
         side_cleanup_u8 = np.zeros((H, W), dtype=np.uint8)
         side_outer_cleanup_u8 = np.zeros((H, W), dtype=np.uint8)
+        short_cleanup_pattern = "uncertain"
+        side_outer_enabled = False
+        front_panel_area_total = 0
+        side_panel_area_total = 0
+        front_panel_count = 0
+        side_panel_count = 0
         if hair_length == "short":
             # SegFace miss를 보완하기 위해 side-zone에 한해 high-confidence force를 추가 반영
             center_half = max(18, int(face_w * 0.42))
@@ -3589,6 +3595,8 @@ class MirrAISDPipeline:
                         )
                     )
                     if is_front_panel:
+                        front_panel_count += 1
+                        front_panel_area_total += int(area)
                         front_panel_fallback_u8[component_mask] = 255
                         front_zone_margin_x = max(8, int(face_w * 0.10))
                         zone_y1 = max(0, y)
@@ -3604,6 +3612,8 @@ class MirrAISDPipeline:
                         tail_extra_h = max(32, int(face_h * 0.42))
                         tail_target_u8 = front_tail_u8
                     else:
+                        side_panel_count += 1
+                        side_panel_area_total += int(area)
                         side_panel_fallback_u8[component_mask] = 255
                         # 긴 side panel의 하단 잔존 blob은 원래 component보다 아래에서 남는다.
                         # 채움 강도는 그대로 두고, tail shape만 더 내려서 cleanup 마스크에 포함한다.
@@ -3686,29 +3696,41 @@ class MirrAISDPipeline:
                     )
                     side_panel_fallback_u8 = cv2.bitwise_or(side_panel_fallback_u8, side_tail_u8)
                 if int((side_outer_tail_u8 > 0).sum()) > 0:
-                    side_outer_tail_u8 = cv2.bitwise_and(side_outer_tail_u8, corridor)
-                    side_outer_tail_u8 = cv2.bitwise_and(
-                        side_outer_tail_u8,
-                        cv2.bitwise_not(lower_center_keepout_u8),
+                    center_fallback_pixels = int((center_fallback_u8 > 0).sum())
+                    side_dominant = (
+                        side_panel_count > 0
+                        and (
+                            front_panel_count == 0
+                            or front_panel_area_total <= max(96, int(side_panel_area_total * 0.28))
+                        )
                     )
-                    side_outer_tail_u8 = cv2.morphologyEx(
-                        side_outer_tail_u8,
-                        cv2.MORPH_CLOSE,
-                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 19)),
-                    )
-                    side_outer_tail_u8 = cv2.dilate(
-                        side_outer_tail_u8,
-                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 15)),
-                        iterations=1,
-                    )
-                    side_outer_tail_u8 = cv2.bitwise_and(
-                        side_outer_tail_u8,
-                        cv2.bitwise_not(lower_center_keepout_u8),
-                    )
-                    side_outer_cleanup_u8 = cv2.bitwise_or(
-                        side_outer_cleanup_u8,
-                        side_outer_tail_u8,
-                    )
+                    center_light = center_fallback_pixels <= max(72, int(side_panel_area_total * 0.12))
+                    if side_dominant and center_light:
+                        side_outer_enabled = True
+                        short_cleanup_pattern = "side"
+                        side_outer_tail_u8 = cv2.bitwise_and(side_outer_tail_u8, corridor)
+                        side_outer_tail_u8 = cv2.bitwise_and(
+                            side_outer_tail_u8,
+                            cv2.bitwise_not(lower_center_keepout_u8),
+                        )
+                        side_outer_tail_u8 = cv2.morphologyEx(
+                            side_outer_tail_u8,
+                            cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 19)),
+                        )
+                        side_outer_tail_u8 = cv2.dilate(
+                            side_outer_tail_u8,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 15)),
+                            iterations=1,
+                        )
+                        side_outer_tail_u8 = cv2.bitwise_and(
+                            side_outer_tail_u8,
+                            cv2.bitwise_not(lower_center_keepout_u8),
+                        )
+                        side_outer_cleanup_u8 = cv2.bitwise_or(
+                            side_outer_cleanup_u8,
+                            side_outer_tail_u8,
+                        )
             front_zone_top = min(H, int(cutoff_y + face_h * 0.10))
             front_zone_bottom = min(H, int(cutoff_y + face_h * 1.80))
             front_zone_half = max(20, int(face_w * 0.28))
@@ -3732,6 +3754,15 @@ class MirrAISDPipeline:
             side_cleanup_u8 = cv2.bitwise_or(side_hair_inter_u8, side_fallback_u8)
             side_cleanup_u8 = cv2.bitwise_or(side_cleanup_u8, side_panel_fallback_u8)
             side_cleanup_u8 = cv2.bitwise_or(side_cleanup_u8, side_outer_cleanup_u8)
+            if short_cleanup_pattern != "side":
+                front_pixels = int((front_cleanup_u8 > 0).sum())
+                side_pixels = int((side_cleanup_u8 > 0).sum())
+                if front_panel_count > 0 and side_panel_count > 0:
+                    short_cleanup_pattern = "mixed"
+                elif front_panel_count > 0 or front_pixels > max(180, int(side_pixels * 0.72)):
+                    short_cleanup_pattern = "front"
+                elif side_panel_count > 0 or side_pixels > 0:
+                    short_cleanup_pattern = "side"
             panel_fallback_u8 = cv2.bitwise_or(front_panel_fallback_u8, side_panel_fallback_u8)
             panel_tail_u8 = cv2.bitwise_or(front_tail_u8, side_tail_u8)
 
@@ -3933,6 +3964,12 @@ class MirrAISDPipeline:
                 "pipeline_short_side_outer_cleanup_mask": side_outer_cleanup_u8.astype(np.float32) / 255.0,
                 "pipeline_short_center_keepout_mask": lower_center_keepout_u8.astype(np.float32) / 255.0,
                 "pipeline_short_residual_cleanup_mask": residual_cleanup_mask,
+                "short_cleanup_pattern": short_cleanup_pattern,
+                "short_side_outer_enabled": side_outer_enabled,
+                "short_front_panel_area": front_panel_area_total,
+                "short_side_panel_area": side_panel_area_total,
+                "short_front_panel_count": front_panel_count,
+                "short_side_panel_count": side_panel_count,
             }
             if cv2_post_rgb is not None:
                 debug_bundle["pipeline_cv2_post_cleanup_result"] = cv2_post_rgb
