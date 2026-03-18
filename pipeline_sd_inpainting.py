@@ -530,20 +530,45 @@ class MirrAISDPipeline:
                 gen_mask_base = np.clip(gen_mask_base - (shoulder_protect_for_post * 0.55), 0.0, 1.0)
                 lower_rewrite_mask = np.clip(lower_rewrite_mask - (shoulder_protect_for_post * 0.18), 0.0, 1.0)
 
-            gen_mask = np.clip(np.maximum(gen_mask_base, lower_rewrite_mask), 0.0, 1.0)
+            short_cleanup_mask = lower_rewrite_mask.copy()
+            if hair_length == "short":
+                gen_mask = gen_mask_base.copy()
+                cleanup_u8 = (short_cleanup_mask > 0.35).astype(np.uint8) * 255
+                if int((cleanup_u8 > 0).sum()) > 0:
+                    cleanup_u8 = cv2.dilate(
+                        cleanup_u8,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+                        iterations=1,
+                    )
+                    cleanup_u8 = cv2.morphologyEx(
+                        cleanup_u8,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                    )
+                short_cleanup_mask = (cleanup_u8 > 0).astype(np.float32)
+            else:
+                gen_mask = np.clip(np.maximum(gen_mask_base, short_cleanup_mask), 0.0, 1.0)
 
             if debug_data_common is not None:
                 debug_data_common["short_generation_mask_stats"] = {
                     "base_pixels": int((gen_mask_base > 0.35).sum()),
-                    "lower_rewrite_pixels": int((lower_rewrite_mask > 0.35).sum()),
+                    "lower_rewrite_pixels": int((short_cleanup_mask > 0.35).sum()),
                     "final_pixels": int((gen_mask > 0.35).sum()),
                 }
 
             _store_mask("pipeline_short_generation_mask", gen_mask)
+            if hair_length == "short":
+                _store_mask("pipeline_short_cleanup_mask", short_cleanup_mask)
 
             preclean_seed_mask = long_hair_mask.copy()
             preclean_top = max(0, int(cutoff_y - face_h * 0.03))
             preclean_seed_mask[:preclean_top, :] = 0.0
+            if hair_length == "short":
+                preclean_seed_mask = np.clip(
+                    np.maximum(preclean_seed_mask, short_cleanup_mask),
+                    0.0,
+                    1.0,
+                )
             preclean_mask_for_input = preclean_seed_mask.copy()
             if self.config.enable_two_step_preclean:
                 preclean_mask_for_input = self._build_preclean_mask_for_two_step(
@@ -642,11 +667,19 @@ class MirrAISDPipeline:
             _store_rgb("pipeline_background_cleaned_rgb", img_rgb_cleaned)
 
             hair_mask_for_sd = gen_mask.astype(np.float32)
+            short_conditioning_mask = hair_mask_for_sd
+            if hair_length == "short":
+                short_conditioning_mask = np.clip(
+                    np.maximum(hair_mask_for_sd, short_cleanup_mask.astype(np.float32)),
+                    0.0,
+                    1.0,
+                )
+                _store_mask("pipeline_short_conditioning_mask", short_conditioning_mask)
             img_rgb_for_sd = img_rgb_cleaned
             if hair_length == "short":
                 img_rgb_for_sd = self._neutralize_short_generation_input(
                     img_rgb_cleaned,
-                    hair_mask_for_sd,
+                    short_conditioning_mask,
                     face_bbox=face_bbox,
                     protect_mask=feature_protect_for_generation,
                     shoulder_protect=shoulder_protect_for_post,
@@ -668,10 +701,13 @@ class MirrAISDPipeline:
         canny_suppress = None
         canny_suppress_kernel = 15
         if hair_length in ("short", "medium"):
+            canny_seed_mask = np.clip(hair_mask_for_sd, 0.0, 1.0)
+            if hair_length == "short":
+                canny_seed_mask = np.clip(short_conditioning_mask, 0.0, 1.0)
             canny_suppress = np.clip(
                 np.maximum(
                     np.clip(hair_mask_for_removal, 0.0, 1.0),
-                    np.clip(hair_mask_for_sd, 0.0, 1.0),
+                    canny_seed_mask,
                 ),
                 0.0,
                 1.0,
@@ -683,11 +719,6 @@ class MirrAISDPipeline:
             canny_suppress_mask=canny_suppress,
             canny_suppress_kernel_size=canny_suppress_kernel,
         )
-        if hair_length == "short":
-            structure_guide = self._render_structure_guide_to_sd(short_structure_guide, scale, pad)
-            canny_arr = np.array(canny_512)
-            structure_arr = np.array(structure_guide)
-            canny_512 = Image.fromarray(np.maximum(canny_arr, structure_arr))
         if debug_images_common is not None:
             debug_images_common["sd_input_512"] = cv2.cvtColor(
                 np.array(img_512), cv2.COLOR_RGB2BGR
@@ -2628,7 +2659,7 @@ class MirrAISDPipeline:
         # → 원본 긴머리 identity가 생성에 과도하게 영향주는 것 방지
         if hair_length == "short":
             ip_scale = 0.0
-            control_scale = min(self.config.controlnet_conditioning_scale, 0.12)
+            control_scale = min(self.config.controlnet_conditioning_scale, 0.06)
         elif hair_length == "medium":
             ip_scale = 0.18
             control_scale = min(self.config.controlnet_conditioning_scale, 0.20)
@@ -2648,12 +2679,13 @@ class MirrAISDPipeline:
         if hair_length == "short":
             coarse_prompt = (
                 f"{prompt}, compact bob silhouette, exposed neckline, "
-                "jaw-length outline, no long front panels"
+                "jaw-length outline, no long front panels, hair ends stop above collar"
             )
             coarse_negative = (
                 negative_prompt
                 + ", long front ribbons, center-parted long curtains, "
-                "collarbone-length front sections, long strands hanging on chest"
+                "collarbone-length front sections, long strands hanging on chest, "
+                "hair touching sweater, hair crossing neckline"
             )
             coarse_images = run_sd(
                 base_image=img_512,
@@ -2661,7 +2693,7 @@ class MirrAISDPipeline:
                 use_prompt=coarse_prompt,
                 use_negative_prompt=coarse_negative,
                 use_guidance=max(guidance_scale, 11.2),
-                use_control_scale=max(control_scale, 0.10),
+                use_control_scale=control_scale,
                 use_strength=1.0,
                 use_seeds=seeds,
             )
@@ -2674,7 +2706,7 @@ class MirrAISDPipeline:
                     use_prompt=prompt,
                     use_negative_prompt=negative_prompt,
                     use_guidance=guidance_scale,
-                    use_control_scale=min(control_scale, 0.08),
+                    use_control_scale=min(control_scale, 0.04),
                     use_strength=0.72,
                     use_seeds=[seed],
                 )
