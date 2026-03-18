@@ -29,6 +29,8 @@ MirrAI SD Inpainting Pipeline
 from __future__ import annotations
 
 import dataclasses
+import importlib
+import json
 import logging
 import os
 import random
@@ -147,6 +149,10 @@ class SDInpaintConfig:
     # SAM2 사용 여부
     use_sam2: bool = True
 
+    # Optional: custom hair-only SegFace fine-tune (HF repo)
+    segface_hair_repo_id: str = os.environ.get("SEGFACE_HAIR_REPO_ID", "").strip()
+    segface_hair_revision: str = os.environ.get("SEGFACE_HAIR_REVISION", "main").strip()
+
     # 메모리 최적화
     enable_xformers: bool = False
 
@@ -209,6 +215,8 @@ class MirrAISDPipeline:
         )
 
         self._segface    = None   # SegFace (Swin-B) face parsing
+        self._segface_hair = None # Optional: custom SegFace hair-only model
+        self._segface_hair_threshold = 0.5
         self._sam2_factory = None  # SAM2 predictor factory (callable)
         self._sd_pipe    = None   # StableDiffusionControlNetInpaintPipeline
         self._mp_face    = None   # MediaPipe FaceDetection
@@ -226,6 +234,7 @@ class MirrAISDPipeline:
             return
         logger.info("[SDPipeline] 모델 로딩 시작...")
         self._load_segface()
+        self._load_segface_hair()
         self._load_sam2()
         self._load_mediapipe()
         self._load_sd_pipeline()
@@ -305,6 +314,10 @@ class MirrAISDPipeline:
 
         if debug_images_common is not None:
             debug_images_common["pipeline_input_image"] = image.copy()
+        if debug_data_common is not None:
+            debug_data_common["hair_mask_model"] = (
+                self.config.segface_hair_repo_id if self._segface_hair is not None else "segface_default"
+            )
 
         # ── Step 1: 얼굴 검출 ────────────────────────────────────────────────
         face_obs = self._detect_face(img_rgb)
@@ -1006,6 +1019,77 @@ class MirrAISDPipeline:
         self._segface = segface
         logger.info("[SDPipeline] SegFace 로드 완료")
 
+    def _load_segface_hair(self) -> None:
+        """Optional custom SegFace hair-only model 로드"""
+        if self._segface_hair is not None:
+            return
+
+        repo_id = str(getattr(self.config, "segface_hair_repo_id", "") or "").strip()
+        if not repo_id:
+            logger.info("[SDPipeline] custom hair SegFace 비활성화")
+            return
+
+        from huggingface_hub import snapshot_download
+
+        revision = str(getattr(self.config, "segface_hair_revision", "main") or "main").strip()
+        token = os.environ.get("HF_TOKEN") or None
+        logger.info(f"[SDPipeline] custom hair SegFace 다운로드/로드: repo={repo_id}@{revision}")
+        repo_root = Path(
+            snapshot_download(
+                repo_id=repo_id,
+                revision=revision,
+                token=token,
+                allow_patterns=[
+                    "best.pt",
+                    "config.json",
+                    "README.md",
+                    "hair_mask_dataset/__init__.py",
+                    "hair_mask_dataset/*.py",
+                    "models/__init__.py",
+                    "models/segface/__init__.py",
+                    "models/segface/models/__init__.py",
+                    "models/segface/models/*.py",
+                    "__init__.py",
+                ],
+            )
+        )
+
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+
+        segface_hair_module = importlib.import_module("hair_mask_dataset.segface_hair_model")
+        SegFaceHairModel = getattr(segface_hair_module, "SegFaceHairModel")
+
+        ckpt_path = repo_root / "best.pt"
+        cfg_path = repo_root / "config.json"
+        checkpoint = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        cfg = checkpoint.get("config")
+        if cfg is None:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+
+        segface_hair = SegFaceHairModel(
+            input_resolution=int(cfg.get("image_size", 512)),
+            model_name=str(cfg.get("model_name", "swin_base")),
+            load_pretrained=False,
+            freeze_backbone=bool(cfg.get("freeze_backbone", False)),
+            lora_rank=int(cfg.get("lora_rank", 0)),
+            lora_alpha=float(cfg.get("lora_alpha", 16.0)),
+            lora_dropout=float(cfg.get("lora_dropout", 0.0)),
+            lora_targets=tuple(cfg.get("lora_targets", ())),
+        )
+        model_state = checkpoint.get("model_state")
+        if not isinstance(model_state, dict):
+            raise ValueError(f"Unexpected custom hair checkpoint format: keys={list(checkpoint.keys())[:20]}")
+        segface_hair.load_state_dict(model_state, strict=False)
+        segface_hair.float().to(self.device).eval()
+
+        self._segface_hair = segface_hair
+        self._segface_hair_threshold = float(cfg.get("threshold", 0.5))
+        logger.info(
+            "[SDPipeline] custom hair SegFace 로드 완료 "
+            f"(threshold={self._segface_hair_threshold:.2f})"
+        )
+
     # ──────────────────────────────────────────────────────────────────────────
     # Segmentation: SegFace + SAM2
     # ──────────────────────────────────────────────────────────────────────────
@@ -1338,7 +1422,15 @@ class MirrAISDPipeline:
             # logits: [1, 19, 512, 512]
             parsing = logits.argmax(dim=1).squeeze(0).cpu().numpy()
 
-        hair_512  = (parsing == HAIR_CLASS_IDX).astype(np.float32)
+        hair_512: np.ndarray
+        if self._segface_hair is not None:
+            with torch.no_grad():
+                hair_out = self._segface_hair(inp_t)
+                hair_logits = hair_out["hair_logits"]
+                hair_probs = torch.sigmoid(hair_logits).squeeze(0).squeeze(0).cpu().numpy()
+            hair_512 = (hair_probs >= float(self._segface_hair_threshold)).astype(np.float32)
+        else:
+            hair_512 = (parsing == HAIR_CLASS_IDX).astype(np.float32)
         face_512  = np.isin(parsing, list(FACE_CLASS_IDXS)).astype(np.float32)
         cloth_512 = (parsing == CLOTH_CLASS_IDX).astype(np.float32)
 

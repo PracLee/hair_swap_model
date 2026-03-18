@@ -53,6 +53,51 @@ def ensure_models_cached() -> None:
     _ensure_file("IP-Adapter weight", "h94/IP-Adapter",
                  "ip-adapter-plus-face_sd15.bin", "models", token)
 
+    custom_hair_repo = (os.environ.get("SEGFACE_HAIR_REPO_ID") or "").strip()
+    custom_hair_revision = (os.environ.get("SEGFACE_HAIR_REVISION") or "main").strip()
+    if custom_hair_repo:
+        logger.info(f"[models] custom hair SegFace 확인 중... ({custom_hair_repo}@{custom_hair_revision})")
+        try:
+            snapshot_download(
+                custom_hair_repo,
+                revision=custom_hair_revision,
+                token=token,
+                allow_patterns=[
+                    "best.pt",
+                    "config.json",
+                    "README.md",
+                    "hair_mask_dataset/__init__.py",
+                    "hair_mask_dataset/*.py",
+                    "models/__init__.py",
+                    "models/segface/__init__.py",
+                    "models/segface/models/__init__.py",
+                    "models/segface/models/*.py",
+                    "__init__.py",
+                ],
+                local_files_only=True,
+            )
+            logger.info("[models] custom hair SegFace 캐시 확인 ✓")
+        except Exception:
+            logger.info("[models] custom hair SegFace 다운로드 중...")
+            snapshot_download(
+                custom_hair_repo,
+                revision=custom_hair_revision,
+                token=token,
+                allow_patterns=[
+                    "best.pt",
+                    "config.json",
+                    "README.md",
+                    "hair_mask_dataset/__init__.py",
+                    "hair_mask_dataset/*.py",
+                    "models/__init__.py",
+                    "models/segface/__init__.py",
+                    "models/segface/models/__init__.py",
+                    "models/segface/models/*.py",
+                    "__init__.py",
+                ],
+            )
+            logger.info("[models] custom hair SegFace 완료 ✓")
+
 
 def _ensure_file(name, repo_id, filename, subfolder, token):
     from huggingface_hub import hf_hub_download
