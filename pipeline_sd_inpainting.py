@@ -803,6 +803,10 @@ class MirrAISDPipeline:
                         shoulder_protect=shoulder_protect_for_post,
                         hair_length=hair_length,
                         current_hair_mask=current_short_mask_for_post,
+                        face_crop_pil=face_crop_pil,
+                        protect_mask=feature_protect_mask,
+                        cloth_mask=cloth_mask_dilated,
+                        seed=seed,
                         return_debug=post_debug_enabled,
                     )
                     if post_debug_enabled:
@@ -2753,16 +2757,19 @@ class MirrAISDPipeline:
             base_rgb,
             fill_mask,
             mask_edge_suppression=0.45,
+            canny_suppress_mask=fill_mask,
         )
 
         if hair_length == "short":
             fill_prompt = (
                 "professional portrait photo, clean natural neck and shoulders, "
                 "realistic clothing fabric texture continuity, coherent background, "
+                "clean sweater neckline, empty collar area in masked region, "
                 "short-hair silhouette maintained, no long hair below jawline, "
-                "no loose dangling strands in masked region, photorealistic details"
+                "no long front panels, no loose dangling strands in masked region, "
+                "no dark hair shadows on clothing, photorealistic details"
             )
-            fill_guidance = 7.1
+            fill_guidance = 8.0
         else:
             fill_prompt = (
                 "professional portrait photo, clean neck and shoulders, "
@@ -2773,6 +2780,7 @@ class MirrAISDPipeline:
         fill_negative = (
             "long hair, hair below chin, hair below shoulders, loose hair strands, "
             "wavy hair, straight long hair, wig, ponytail, braid, bangs, side locks, "
+            "front hair panel on sweater, dangling dark strand on clothing, ghosted hair residue, "
             "earrings, earring, dangling earrings, hoop earrings, pearl earrings, "
             "jewelry, necklace, pendant, choker, accessories, piercings, "
             "deformed neck, artifacts, blurry, smudged texture, melted details, cartoon, painting"
@@ -2781,8 +2789,14 @@ class MirrAISDPipeline:
         # 배경 복원은 identity 영향이 과하면 긴머리가 다시 생길 수 있어 scale을 낮춘다.
         self._sd_pipe.set_ip_adapter_scale(0.0)
         generator = torch.Generator(device=self.device).manual_seed(int(seed))
-        fill_control = float(np.clip(max(self.config.controlnet_conditioning_scale, 0.18), 0.12, 0.30))
-        fill_steps = max(24, self.config.num_inference_steps - 4)
+        if hair_length == "short":
+            fill_control = float(np.clip(self.config.controlnet_conditioning_scale * 0.32, 0.04, 0.10))
+            fill_steps = max(28, self.config.num_inference_steps)
+            fill_strength = 0.94
+        else:
+            fill_control = float(np.clip(max(self.config.controlnet_conditioning_scale, 0.18), 0.12, 0.30))
+            fill_steps = max(24, self.config.num_inference_steps - 4)
+            fill_strength = 0.88
 
         with torch.inference_mode():
             out = self._sd_pipe(
@@ -2799,7 +2813,7 @@ class MirrAISDPipeline:
                 controlnet_conditioning_scale=fill_control,
                 num_images_per_prompt=1,
                 generator=generator,
-                strength=0.88,
+                strength=fill_strength,
             )
 
         gen_np = np.array(out.images[0])  # 512×512 RGB
@@ -2826,7 +2840,8 @@ class MirrAISDPipeline:
         # 의상 영역은 과도한 hallucination을 줄이기 위해 SD 블렌딩 가중치를 낮춘다.
         if cloth_mask is not None and cloth_mask.shape == (H, W):
             cloth_w = np.clip(cloth_mask.astype(np.float32), 0.0, 1.0)
-            alpha = alpha * (1.0 - 0.18 * cloth_w)
+            cloth_blend_penalty = 0.05 if hair_length == "short" else 0.18
+            alpha = alpha * (1.0 - cloth_blend_penalty * cloth_w)
 
         # 얼굴은 기존 픽셀 고정
         if protect_mask is not None:
@@ -3315,6 +3330,10 @@ class MirrAISDPipeline:
         shoulder_protect: Optional[np.ndarray] = None,
         hair_length: str = "short",
         current_hair_mask: Optional[np.ndarray] = None,
+        face_crop_pil: Optional[Image.Image] = None,
+        protect_mask: Optional[np.ndarray] = None,
+        cloth_mask: Optional[np.ndarray] = None,
+        seed: Optional[int] = None,
         return_debug: bool = False,
     ) -> Any:
         """
@@ -3456,14 +3475,38 @@ class MirrAISDPipeline:
         force_u8 = cv2.dilate(force_u8, k, iterations=1)
         force_mask = force_u8.astype(np.float32) / 255.0
 
-        # LaMa로 잔존 hair 제거
+        # 1차: LaMa로 잔존 hair를 먼저 지우고
+        # 2차: short에서는 SD refine로 neckline/cloth texture를 다시 정리한다.
         result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
+        sd_cleanup_applied = False
+        if (
+            hair_length == "short"
+            and face_crop_pil is not None
+            and seed is not None
+            and force_pixels >= 80
+        ):
+            refine_seed = (int(seed) ^ 0x13579BDF) & 0x7FFFFFFF
+            try:
+                result_rgb = self._sd_refine_removed_region(
+                    result_rgb,
+                    force_mask,
+                    face_bbox=face_bbox,
+                    face_crop_pil=face_crop_pil,
+                    protect_mask=protect_mask,
+                    cloth_mask=cloth_mask,
+                    hair_length=hair_length,
+                    seed=refine_seed,
+                )
+                sd_cleanup_applied = True
+            except Exception as e:
+                logger.warning(f"[SDPipeline] short post SD cleanup 실패, LaMa 결과 유지: {e}")
         if return_debug:
             return result_rgb, {
                 "pipeline_lama_post_cleanup_mask": force_mask,
                 "pipeline_lama_post_cleanup_result": result_rgb,
                 "lama_post_cleanup_applied": True,
                 "lama_post_cleanup_pixels": force_pixels,
+                "sd_post_cleanup_applied": sd_cleanup_applied,
             }
         return result_rgb
 
