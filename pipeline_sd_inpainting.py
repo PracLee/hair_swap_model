@@ -494,6 +494,21 @@ class MirrAISDPipeline:
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
             )
             gen_mask = (gen_u8 > 0).astype(np.float32)
+
+            # short/medium에서는 턱 아래 남아 있는 기존 long-hair 영역도
+            # SD가 다시 쓰도록 generation mask에 포함시킨다.
+            # 이 확장이 없으면 preclean에서 남은 흐린 hair remnant가
+            # composite 이후 그대로 살아남기 쉽다.
+            expanded_lower_mask = self._expand_mask_for_short_hair(
+                long_hair_mask.copy(),
+                face_bbox=face_bbox,
+                H=H,
+                W=W,
+                hair_length=hair_length,
+            )
+            if expanded_lower_mask.shape == (H, W):
+                gen_mask = np.clip(np.maximum(gen_mask, expanded_lower_mask), 0.0, 1.0)
+
             gen_mask = np.clip(gen_mask - feature_protect_mask, 0.0, 1.0)
             if shoulder_protect_for_post is not None and shoulder_protect_for_post.shape == (H, W):
                 gen_mask = np.clip(gen_mask - (shoulder_protect_for_post * 0.55), 0.0, 1.0)
