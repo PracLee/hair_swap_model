@@ -617,7 +617,16 @@ class MirrAISDPipeline:
             _store_rgb("pipeline_background_cleaned_rgb", img_rgb_cleaned)
 
             hair_mask_for_sd = gen_mask.astype(np.float32)
-            img_rgb_for_sd   = img_rgb_cleaned
+            img_rgb_for_sd = img_rgb_cleaned
+            if hair_length == "short":
+                img_rgb_for_sd = self._neutralize_short_generation_input(
+                    img_rgb_cleaned,
+                    hair_mask_for_sd,
+                    face_bbox=face_bbox,
+                    protect_mask=feature_protect_mask,
+                    shoulder_protect=shoulder_protect_for_post,
+                )
+                _store_rgb("pipeline_short_generation_input_neutralized_rgb", img_rgb_for_sd)
         else:
             # long 헤어는 기존 단일 패스 유지
             hair_mask_for_sd = hair_mask
@@ -628,7 +637,7 @@ class MirrAISDPipeline:
         _store_rgb("sd_input_rgb", img_rgb_for_sd)
 
         # ── Step 4: SD 입력 준비 ─────────────────────────────────────────────
-        img_pil = Image.fromarray(img_rgb_cleaned)
+        img_pil = Image.fromarray(img_rgb_for_sd)
         # short/medium에서는 기존 long-hair 윤곽도 억제해 ControlNet이
         # 원본 긴머리 edge를 새 단발 형상으로 따라가지 않게 한다.
         canny_suppress = None
@@ -1203,6 +1212,74 @@ class MirrAISDPipeline:
         blend_bgr = telea.astype(np.float32) * 0.68 + ns.astype(np.float32) * 0.32
         out_bgr = blend_bgr * alpha + img_bgr.astype(np.float32) * (1.0 - alpha)
         return cv2.cvtColor(np.clip(out_bgr, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
+
+    def _neutralize_short_generation_input(
+        self,
+        img_rgb: np.ndarray,
+        generation_mask: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        protect_mask: Optional[np.ndarray] = None,
+        shoulder_protect: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        단발 생성용 SD 입력에서 기존 긴머리 흔적을 최대한 지운다.
+        최종 합성 베이스는 유지하고, SD conditioning 입력만 별도로 중화한다.
+        """
+        H, W = img_rgb.shape[:2]
+        if generation_mask.shape != (H, W):
+            return img_rgb
+
+        x1, y1, x2, y2 = face_bbox
+        face_h = max(int(y2 - y1), 1)
+        neutral_mask = np.clip(generation_mask.astype(np.float32), 0.0, 1.0)
+
+        # 턱 아래로 남는 긴 스트랜드 잔상을 끊기 위해 하단 재작성 영역을 더 넓게 중화한다.
+        lower_top = min(H, max(0, int(y2 + face_h * 0.02)))
+        lower_zone = np.zeros((H, W), dtype=np.float32)
+        lower_zone[lower_top:, :] = 1.0
+        neutral_mask = np.maximum(neutral_mask, generation_mask * lower_zone)
+
+        neutral_u8 = (neutral_mask > 0.28).astype(np.uint8) * 255
+        if int((neutral_u8 > 0).sum()) < 80:
+            return img_rgb
+
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+        neutral_u8 = cv2.dilate(neutral_u8, k, iterations=1)
+
+        if protect_mask is not None and protect_mask.shape == (H, W):
+            protect_u8 = (np.clip(protect_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
+            protect_u8 = cv2.dilate(
+                protect_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+                iterations=1,
+            )
+            neutral_u8 = cv2.bitwise_and(neutral_u8, cv2.bitwise_not(protect_u8))
+
+        if shoulder_protect is not None and shoulder_protect.shape == (H, W):
+            shoulder_u8 = (np.clip(shoulder_protect, 0.0, 1.0) > 0.92).astype(np.uint8) * 255
+            if int((shoulder_u8 > 0).sum()) > 0:
+                neutral_u8 = cv2.bitwise_and(neutral_u8, cv2.bitwise_not(shoulder_u8))
+
+        if int((neutral_u8 > 0).sum()) < 80:
+            return img_rgb
+
+        neutralized = self._cv2_inpaint_region(
+            img_rgb,
+            neutral_u8.astype(np.float32) / 255.0,
+            protect_mask=protect_mask,
+        )
+
+        # Edge hint가 남지 않도록 neutralized 결과를 마스크 내부에서 한 번 더 부드럽게 만든다.
+        alpha = cv2.GaussianBlur(
+            neutral_u8.astype(np.float32) / 255.0,
+            (0, 0),
+            sigmaX=4.0,
+            sigmaY=4.0,
+        )
+        alpha = np.clip(alpha, 0.0, 1.0)[..., np.newaxis]
+        smooth = cv2.GaussianBlur(neutralized, (0, 0), sigmaX=2.6, sigmaY=2.6)
+        out = smooth.astype(np.float32) * alpha + neutralized.astype(np.float32) * (1.0 - alpha)
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     def _load_segface(self) -> None:
         """SegFace (Swin-B) 모델 로드"""
