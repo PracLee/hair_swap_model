@@ -631,7 +631,16 @@ class MirrAISDPipeline:
         img_pil = Image.fromarray(img_rgb_cleaned)
         # short/medium에서는 기존 long-hair 윤곽도 억제해 ControlNet이
         # 원본 긴머리 edge를 새 단발 형상으로 따라가지 않게 한다.
-        canny_suppress = hair_mask_for_removal if hair_length in ("short", "medium") else None
+        canny_suppress = None
+        if hair_length in ("short", "medium"):
+            canny_suppress = np.clip(
+                np.maximum(
+                    np.clip(hair_mask_for_removal, 0.0, 1.0),
+                    np.clip(hair_mask_for_sd, 0.0, 1.0),
+                ),
+                0.0,
+                1.0,
+            )
         img_512, mask_512, canny_512, scale, pad = self._prepare_sd_inputs(
             img_rgb_for_sd, hair_mask_for_sd,
             canny_suppress_mask=canny_suppress,
@@ -2328,6 +2337,8 @@ class MirrAISDPipeline:
                 "very long hair, flowing long hair, hair below shoulders, "
                 "hair below chin, hair touching shoulders, hair covering chest, "
                 "waist-length hair, side long locks over chest, "
+                "center-parted long front panels, curtain-like long side pieces, "
+                "long face-framing layers below jawline, elongated front sections, "
                 "dangling front tendrils, face-framing strands below jawline, "
                 "wispy long strands on neck, flyaway strands below jawline, "
                 "thin hanging side pieces, stringy strands on chest, "
@@ -2335,7 +2346,7 @@ class MirrAISDPipeline:
                 "earrings, earring, dangling earrings, hoop earrings, pearl earrings, "
                 "jewelry, necklace, pendant, choker, accessories, piercings, "
             )
-            guidance = 9.8
+            guidance = 10.8
         elif hair_length == "medium":
             pos_suffix = (
                 ", medium length hair, shoulder-length hair, "
@@ -2398,7 +2409,7 @@ class MirrAISDPipeline:
         # → 원본 긴머리 identity가 생성에 과도하게 영향주는 것 방지
         if hair_length == "short":
             ip_scale = 0.0
-            control_scale = min(self.config.controlnet_conditioning_scale, 0.08)
+            control_scale = min(self.config.controlnet_conditioning_scale, 0.05)
         elif hair_length == "medium":
             ip_scale = 0.18
             control_scale = min(self.config.controlnet_conditioning_scale, 0.20)
