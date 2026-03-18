@@ -381,7 +381,7 @@ class MirrAISDPipeline:
             face_h = max(y2f - y1f, 1)
 
             if hair_length == "short":
-                cutoff_y = int(y2f + face_h * 0.12)   # 턱~윗목 사이 (하드컷 완화)
+                cutoff_y = int(y2f + face_h * 0.02)   # 턱선 바로 아래
             else:
                 cutoff_y = int(y2f + face_h * 0.54)   # 어깨 위 (끝선 명확도 강화)
             cutoff_y = min(cutoff_y, H - 1)
@@ -414,17 +414,17 @@ class MirrAISDPipeline:
             gen_mask = long_hair_mask.copy()
             gen_soft_bottom = min(
                 H,
-                cutoff_y + max(10, int(face_h * (0.08 if hair_length == "short" else 0.16))),
+                cutoff_y + max(8, int(face_h * (0.03 if hair_length == "short" else 0.16))),
             )
             gen_mask[gen_soft_bottom:, :] = 0.0
 
             # 직사각 corridor 대신 타원형 head prior를 더해 사각형 artifact를 줄인다.
-            corridor_y_pad = max(14, int(face_h * (0.10 if hair_length == "short" else 0.22)))
+            corridor_y_pad = max(8, int(face_h * (0.03 if hair_length == "short" else 0.22)))
             cx = int(0.5 * (x1f + x2f))
             cy = int(y1f + face_h * (0.34 if hair_length == "short" else 0.40))
             ellipse_axes = (
-                max(24, int(face_w * (0.86 if hair_length == "short" else 1.00))),
-                max(30, int(face_h * (0.92 if hair_length == "short" else 1.10))),
+                max(24, int(face_w * (0.78 if hair_length == "short" else 1.00))),
+                max(26, int(face_h * (0.78 if hair_length == "short" else 1.10))),
             )
             ellipse_u8 = np.zeros((H, W), dtype=np.uint8)
             cv2.ellipse(ellipse_u8, (cx, cy), ellipse_axes, 0, 0, 360, 255, -1)
@@ -502,6 +502,7 @@ class MirrAISDPipeline:
                     img_rgb_preclean = self._lama_inpaint(
                         img_rgb,
                         (np.clip(preclean_mask_for_input, 0.0, 1.0) > 0.35).astype(np.uint8) * 255,
+                        force_single_pass=True,
                     )
                     preclean_debug["lama_preclean_method"] = "lama"
                     preclean_debug["pipeline_lama_preclean_result"] = img_rgb_preclean
@@ -822,7 +823,12 @@ class MirrAISDPipeline:
         self._lama = SimpleLama()
         logger.info("[SDPipeline] LaMa 로드 완료")
 
-    def _lama_inpaint(self, img_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    def _lama_inpaint(
+        self,
+        img_rgb: np.ndarray,
+        mask: np.ndarray,
+        force_single_pass: bool = False,
+    ) -> np.ndarray:
         """
         LaMa로 대규모 영역 inpainting (progressive 방식).
 
@@ -844,8 +850,8 @@ class MirrAISDPipeline:
         # PIL Image 변환 (simple-lama-inpainting 호환성 보장)
         img_pil = Image.fromarray(img_rgb)
 
-        # 작은 마스크(이미지의 15% 미만)는 단일 패스
-        if total_pixels < image_pixels * 0.15:
+        # 작은 마스크 또는 hair-removal 강제 단일 패스는 바로 처리
+        if force_single_pass or total_pixels < image_pixels * 0.15:
             mask_pil = Image.fromarray(mask_u8)
             result_pil = self._lama(img_pil, mask_pil)
             return np.array(result_pil)
@@ -2290,7 +2296,7 @@ class MirrAISDPipeline:
         residual_mask = residual_u8.astype(np.float32) / 255.0
 
         # LaMa로 잔존 hair 영역 제거
-        result_rgb = self._lama_inpaint(img_rgb, residual_u8)
+        result_rgb = self._lama_inpaint(img_rgb, residual_u8, force_single_pass=True)
         if return_debug:
             return result_rgb, {
                 "pipeline_lama_residual_mask": residual_mask,
@@ -2407,7 +2413,7 @@ class MirrAISDPipeline:
         force_mask = force_u8.astype(np.float32) / 255.0
 
         # LaMa로 잔존 hair 제거
-        result_rgb = self._lama_inpaint(img_rgb, force_u8)
+        result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
         if return_debug:
             return result_rgb, {
                 "pipeline_lama_post_cleanup_mask": force_mask,
