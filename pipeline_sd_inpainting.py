@@ -510,8 +510,14 @@ class MirrAISDPipeline:
             if expanded_lower_mask.shape == (H, W):
                 lower_rewrite_mask = np.clip(expanded_lower_mask.astype(np.float32), 0.0, 1.0)
 
-            gen_mask_base = np.clip(gen_mask_base - feature_protect_mask, 0.0, 1.0)
-            lower_rewrite_mask = np.clip(lower_rewrite_mask - feature_protect_mask, 0.0, 1.0)
+            feature_protect_for_generation = feature_protect_mask
+            if hair_length == "short":
+                feature_protect_for_generation = feature_protect_mask.copy()
+                relax_top = min(H, max(0, int(y2f + face_h * 0.05)))
+                feature_protect_for_generation[relax_top:, :] = 0.0
+
+            gen_mask_base = np.clip(gen_mask_base - feature_protect_for_generation, 0.0, 1.0)
+            lower_rewrite_mask = np.clip(lower_rewrite_mask - feature_protect_for_generation, 0.0, 1.0)
             if shoulder_protect_for_post is not None and shoulder_protect_for_post.shape == (H, W):
                 # 단발 silhouette 생성 영역은 기존 보호 강도를 유지하되,
                 # lower rewrite mask는 더 약하게 보호해서 긴 스트랜드 제거를 우선한다.
@@ -623,7 +629,7 @@ class MirrAISDPipeline:
                     img_rgb_cleaned,
                     hair_mask_for_sd,
                     face_bbox=face_bbox,
-                    protect_mask=feature_protect_mask,
+                    protect_mask=feature_protect_for_generation,
                     shoulder_protect=shoulder_protect_for_post,
                 )
                 _store_rgb("pipeline_short_generation_input_neutralized_rgb", img_rgb_for_sd)
