@@ -654,6 +654,8 @@ class MirrAISDPipeline:
             img_rgb_for_sd, hair_mask_for_sd,
             canny_suppress_mask=canny_suppress,
         )
+        if hair_length == "short":
+            canny_512 = Image.new("RGB", (SD_SIZE, SD_SIZE), (0, 0, 0))
         if debug_images_common is not None:
             debug_images_common["sd_input_512"] = cv2.cvtColor(
                 np.array(img_512), cv2.COLOR_RGB2BGR
@@ -2494,7 +2496,7 @@ class MirrAISDPipeline:
         # → 원본 긴머리 identity가 생성에 과도하게 영향주는 것 방지
         if hair_length == "short":
             ip_scale = 0.0
-            control_scale = min(self.config.controlnet_conditioning_scale, 0.05)
+            control_scale = 0.0
         elif hair_length == "medium":
             ip_scale = 0.18
             control_scale = min(self.config.controlnet_conditioning_scale, 0.20)
