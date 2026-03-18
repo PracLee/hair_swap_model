@@ -2076,73 +2076,45 @@ class MirrAISDPipeline:
     ) -> np.ndarray:
         """
         단발 인페인팅용 구조 가이드.
-        원본 긴머리 edge 대신 두상, 턱선 아래의 짧은 실루엣, 목/어깨 라인을 스케치로 제공한다.
+        원본 긴머리 edge 대신 단발 외곽 실루엣만 제공한다.
+        내부 선분이 직접 결과에 새겨지는 문제를 피하기 위해 contour만 사용한다.
         """
         H, W = generation_mask.shape[:2]
         x1, y1, x2, y2 = face_bbox
         face_w = max(int(x2 - x1), 1)
         face_h = max(int(y2 - y1), 1)
-        cx = int(0.5 * (x1 + x2))
 
         guide = np.zeros((H, W), dtype=np.uint8)
         gen_u8 = (np.clip(generation_mask, 0.0, 1.0) > 0.40).astype(np.uint8) * 255
         if int((gen_u8 > 0).sum()) < 80:
             return guide
 
-        # 두상 외곽은 턱선 약간 아래까지만 남겨 길게 떨어지는 구조 힌트를 차단한다.
+        # 턱선 약간 아래까지만 사용해서 단발 아웃라인만 남긴다.
         upper_mask = gen_u8.copy()
-        upper_bottom = min(H, int(cutoff_y + face_h * 0.14))
+        upper_bottom = min(H, int(cutoff_y + face_h * 0.18))
         upper_mask[upper_bottom:, :] = 0
         upper_mask = cv2.morphologyEx(
             upper_mask,
             cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        )
+        upper_mask = cv2.erode(
+            upper_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
         )
         contours, _ = cv2.findContours(upper_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             contour = max(contours, key=cv2.contourArea)
-            cv2.drawContours(guide, [contour], -1, 255, thickness=max(3, int(face_w * 0.020)))
+            cv2.drawContours(
+                guide,
+                [contour],
+                -1,
+                200,
+                thickness=max(2, int(face_w * 0.016)),
+            )
 
-        # 턱 아래에서 목으로 이어지는 짧은 수직 구조 가이드.
-        neck_top = int(y2 + face_h * 0.02)
-        neck_mid = min(H - 1, int(y2 + face_h * 0.34))
-        neck_bot = min(H - 1, int(y2 + face_h * 0.72))
-        left_path = np.array([
-            [int(x1 + face_w * 0.18), neck_top],
-            [int(cx - face_w * 0.16), neck_mid],
-            [int(cx - face_w * 0.24), neck_bot],
-        ], dtype=np.int32)
-        right_path = np.array([
-            [int(x2 - face_w * 0.18), neck_top],
-            [int(cx + face_w * 0.16), neck_mid],
-            [int(cx + face_w * 0.24), neck_bot],
-        ], dtype=np.int32)
-        cv2.polylines(guide, [left_path], False, 255, thickness=max(2, int(face_w * 0.014)))
-        cv2.polylines(guide, [right_path], False, 255, thickness=max(2, int(face_w * 0.014)))
-
-        # 보브/허쉬컷의 끝선 힌트: 턱선 근처의 얕은 U자형 cutoff guide.
-        arc_y = min(H - 1, int(cutoff_y + face_h * 0.10))
-        arc_pts = np.array([
-            [int(x1 - face_w * 0.20), arc_y],
-            [int(x1 + face_w * 0.08), int(arc_y + face_h * 0.05)],
-            [cx, int(arc_y + face_h * 0.08)],
-            [int(x2 - face_w * 0.08), int(arc_y + face_h * 0.05)],
-            [int(x2 + face_w * 0.20), arc_y],
-        ], dtype=np.int32)
-        cv2.polylines(guide, [arc_pts], False, 255, thickness=max(2, int(face_w * 0.013)))
-
-        if shoulder_protect is not None and shoulder_protect.shape == (H, W):
-            shoulder_u8 = (np.clip(shoulder_protect, 0.0, 1.0) > 0.82).astype(np.uint8) * 255
-            shoulder_u8[:neck_mid, :] = 0
-            if int((shoulder_u8 > 0).sum()) > 0:
-                shoulder_edges = cv2.morphologyEx(
-                    shoulder_u8,
-                    cv2.MORPH_GRADIENT,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-                )
-                guide = cv2.bitwise_or(guide, shoulder_edges)
-
-        guide = cv2.GaussianBlur(guide, (0, 0), sigmaX=0.8, sigmaY=0.8)
+        guide = cv2.GaussianBlur(guide, (0, 0), sigmaX=1.2, sigmaY=1.2)
         return guide
 
     def _crop_face(
@@ -2620,11 +2592,43 @@ class MirrAISDPipeline:
         diffusers는 generator를 리스트로 받으면 num_images_per_prompt 개의
         이미지를 각자 다른 seed로 한 번의 파이프라인 실행에 처리함.
         """
+        def run_sd(
+            base_image: Image.Image,
+            control_image: Image.Image,
+            use_prompt: str,
+            use_negative_prompt: str,
+            use_guidance: float,
+            use_control_scale: float,
+            use_strength: float,
+            use_seeds: List[int],
+        ) -> List[Image.Image]:
+            gens = [
+                torch.Generator(device=self.device).manual_seed(s) for s in use_seeds
+            ]
+            with torch.inference_mode():
+                out = self._sd_pipe(
+                    prompt=use_prompt,
+                    negative_prompt=use_negative_prompt,
+                    image=base_image,
+                    mask_image=mask_512,
+                    control_image=control_image,
+                    ip_adapter_image=[face_crop_pil],
+                    height=SD_SIZE,
+                    width=SD_SIZE,
+                    num_inference_steps=self.config.num_inference_steps,
+                    guidance_scale=use_guidance,
+                    controlnet_conditioning_scale=use_control_scale,
+                    num_images_per_prompt=len(use_seeds),
+                    generator=gens,
+                    strength=use_strength,
+                )
+            return out.images
+
         # 숏컷/중단발 변환 시 IP-Adapter scale을 낮춤
         # → 원본 긴머리 identity가 생성에 과도하게 영향주는 것 방지
         if hair_length == "short":
             ip_scale = 0.0
-            control_scale = min(self.config.controlnet_conditioning_scale, 0.16)
+            control_scale = min(self.config.controlnet_conditioning_scale, 0.12)
         elif hair_length == "medium":
             ip_scale = 0.18
             control_scale = min(self.config.controlnet_conditioning_scale, 0.20)
@@ -2639,31 +2643,59 @@ class MirrAISDPipeline:
         )
 
         n = len(seeds)
-        generators = [
-            torch.Generator(device=self.device).manual_seed(s) for s in seeds
-        ]
         logger.info(f"[SDPipeline] 배치 생성 시작 (n={n}, seeds={seeds})")
 
-        with torch.inference_mode():
-            out = self._sd_pipe(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                image=img_512,
-                mask_image=mask_512,
+        if hair_length == "short":
+            coarse_prompt = (
+                f"{prompt}, compact bob silhouette, exposed neckline, "
+                "jaw-length outline, no long front panels"
+            )
+            coarse_negative = (
+                negative_prompt
+                + ", long front ribbons, center-parted long curtains, "
+                "collarbone-length front sections, long strands hanging on chest"
+            )
+            coarse_images = run_sd(
+                base_image=img_512,
                 control_image=canny_512,
-                ip_adapter_image=[face_crop_pil],
-                height=SD_SIZE,
-                width=SD_SIZE,
-                num_inference_steps=self.config.num_inference_steps,
-                guidance_scale=guidance_scale,
-                controlnet_conditioning_scale=control_scale,
-                num_images_per_prompt=n,
-                generator=generators,
-                strength=1.0,
+                use_prompt=coarse_prompt,
+                use_negative_prompt=coarse_negative,
+                use_guidance=max(guidance_scale, 11.2),
+                use_control_scale=max(control_scale, 0.10),
+                use_strength=1.0,
+                use_seeds=seeds,
             )
 
-        logger.info(f"[SDPipeline] 배치 생성 완료 → {len(out.images)}장")
-        return out.images
+            refined_images: List[Image.Image] = []
+            for coarse_img, seed in zip(coarse_images, seeds):
+                refined = run_sd(
+                    base_image=coarse_img,
+                    control_image=canny_512,
+                    use_prompt=prompt,
+                    use_negative_prompt=negative_prompt,
+                    use_guidance=guidance_scale,
+                    use_control_scale=min(control_scale, 0.08),
+                    use_strength=0.72,
+                    use_seeds=[seed],
+                )
+                refined_images.append(refined[0])
+
+            logger.info(f"[SDPipeline] short coarse-to-fine 생성 완료 → {len(refined_images)}장")
+            return refined_images
+
+        images = run_sd(
+            base_image=img_512,
+            control_image=canny_512,
+            use_prompt=prompt,
+            use_negative_prompt=negative_prompt,
+            use_guidance=guidance_scale,
+            use_control_scale=control_scale,
+            use_strength=1.0,
+            use_seeds=seeds,
+        )
+
+        logger.info(f"[SDPipeline] 배치 생성 완료 → {len(images)}장")
+        return images
 
     def _sd_refine_removed_region(
         self,
