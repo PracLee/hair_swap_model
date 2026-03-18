@@ -476,8 +476,8 @@ class MirrAISDPipeline:
             ellipse_mask[min(H, cutoff_y + corridor_y_pad):, :] = 0.0
             gen_mask = np.clip(np.maximum(gen_mask, ellipse_mask), 0.0, 1.0)
 
-            gen_kx = max(11, int(face_w * (0.10 if hair_length == "short" else 0.13)))
-            gen_ky = max(11, int(face_h * (0.08 if hair_length == "short" else 0.12)))
+            gen_kx = max(9, int(face_w * (0.065 if hair_length == "short" else 0.13)))
+            gen_ky = max(9, int(face_h * (0.055 if hair_length == "short" else 0.12)))
             if gen_kx % 2 == 0:
                 gen_kx += 1
             if gen_ky % 2 == 0:
@@ -493,6 +493,12 @@ class MirrAISDPipeline:
                 cv2.MORPH_CLOSE,
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
             )
+            if hair_length == "short":
+                gen_u8 = cv2.erode(
+                    gen_u8,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                    iterations=1,
+                )
             gen_mask_base = (gen_u8 > 0).astype(np.float32)
 
             # short/medium에서는 턱 아래 남아 있는 기존 long-hair 영역도
@@ -546,6 +552,19 @@ class MirrAISDPipeline:
                     cutoff_y=cutoff_y,
                     cloth_mask=cloth_mask_dilated,
                     hair_length=hair_length,
+                )
+
+            short_structure_guide = None
+            if hair_length == "short":
+                short_structure_guide = self._build_short_structure_guide(
+                    gen_mask,
+                    face_bbox=face_bbox,
+                    cutoff_y=cutoff_y,
+                    shoulder_protect=shoulder_protect_for_post,
+                )
+                _store_mask(
+                    "pipeline_short_structure_guide",
+                    (short_structure_guide.astype(np.float32) / 255.0),
                 )
 
             logger.info(
@@ -647,6 +666,7 @@ class MirrAISDPipeline:
         # short/medium에서는 기존 long-hair 윤곽도 억제해 ControlNet이
         # 원본 긴머리 edge를 새 단발 형상으로 따라가지 않게 한다.
         canny_suppress = None
+        canny_suppress_kernel = 15
         if hair_length in ("short", "medium"):
             canny_suppress = np.clip(
                 np.maximum(
@@ -656,12 +676,18 @@ class MirrAISDPipeline:
                 0.0,
                 1.0,
             )
+            if hair_length == "short":
+                canny_suppress_kernel = 9
         img_512, mask_512, canny_512, scale, pad = self._prepare_sd_inputs(
             img_rgb_for_sd, hair_mask_for_sd,
             canny_suppress_mask=canny_suppress,
+            canny_suppress_kernel_size=canny_suppress_kernel,
         )
         if hair_length == "short":
-            canny_512 = Image.new("RGB", (SD_SIZE, SD_SIZE), (0, 0, 0))
+            structure_guide = self._render_structure_guide_to_sd(short_structure_guide, scale, pad)
+            canny_arr = np.array(canny_512)
+            structure_arr = np.array(structure_guide)
+            canny_512 = Image.fromarray(np.maximum(canny_arr, structure_arr))
         if debug_images_common is not None:
             debug_images_common["sd_input_512"] = cv2.cvtColor(
                 np.array(img_512), cv2.COLOR_RGB2BGR
@@ -1956,6 +1982,7 @@ class MirrAISDPipeline:
         hair_mask: np.ndarray,   # H×W float32
         mask_edge_suppression: float = 1.0,  # 0.0=엣지 보존, 1.0=마스크 내부 엣지 완전 제거
         canny_suppress_mask: Optional[np.ndarray] = None,  # H×W float32 — 이 영역의 canny edge도 제거
+        canny_suppress_kernel_size: int = 15,
     ) -> Tuple[Image.Image, Image.Image, Image.Image, float, Tuple[int, int]]:
         """
         Letter-box resize → 512×512.
@@ -2002,7 +2029,10 @@ class MirrAISDPipeline:
             sup_canvas = np.zeros((SD_SIZE, SD_SIZE), dtype=np.float32)
             sup_canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = sup_rs
             # dilate: 경계 blur 잔여물까지 제거
-            k_sup = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            k_sup_size = max(3, int(canny_suppress_kernel_size))
+            if k_sup_size % 2 == 0:
+                k_sup_size += 1
+            k_sup = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_sup_size, k_sup_size))
             sup_hard = cv2.dilate(
                 (sup_canvas > 0.3).astype(np.uint8), k_sup, iterations=1
             ).astype(np.float32)
@@ -2022,6 +2052,98 @@ class MirrAISDPipeline:
         canny_512 = Image.fromarray(canny_rgb)
 
         return img_512, mask_512, canny_512, scale, (pad_l, pad_t)
+
+    @staticmethod
+    def _render_structure_guide_to_sd(
+        guide_u8: np.ndarray,
+        scale: float,
+        pad: Tuple[int, int],
+    ) -> Image.Image:
+        H, W = guide_u8.shape[:2]
+        new_w, new_h = int(W * scale), int(H * scale)
+        pad_l, pad_t = pad
+        rs = cv2.resize(guide_u8, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        canvas = np.zeros((SD_SIZE, SD_SIZE), dtype=np.uint8)
+        canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = rs
+        return Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_GRAY2RGB))
+
+    def _build_short_structure_guide(
+        self,
+        generation_mask: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        cutoff_y: int,
+        shoulder_protect: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        단발 인페인팅용 구조 가이드.
+        원본 긴머리 edge 대신 두상, 턱선 아래의 짧은 실루엣, 목/어깨 라인을 스케치로 제공한다.
+        """
+        H, W = generation_mask.shape[:2]
+        x1, y1, x2, y2 = face_bbox
+        face_w = max(int(x2 - x1), 1)
+        face_h = max(int(y2 - y1), 1)
+        cx = int(0.5 * (x1 + x2))
+
+        guide = np.zeros((H, W), dtype=np.uint8)
+        gen_u8 = (np.clip(generation_mask, 0.0, 1.0) > 0.40).astype(np.uint8) * 255
+        if int((gen_u8 > 0).sum()) < 80:
+            return guide
+
+        # 두상 외곽은 턱선 약간 아래까지만 남겨 길게 떨어지는 구조 힌트를 차단한다.
+        upper_mask = gen_u8.copy()
+        upper_bottom = min(H, int(cutoff_y + face_h * 0.14))
+        upper_mask[upper_bottom:, :] = 0
+        upper_mask = cv2.morphologyEx(
+            upper_mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        )
+        contours, _ = cv2.findContours(upper_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            contour = max(contours, key=cv2.contourArea)
+            cv2.drawContours(guide, [contour], -1, 255, thickness=max(3, int(face_w * 0.020)))
+
+        # 턱 아래에서 목으로 이어지는 짧은 수직 구조 가이드.
+        neck_top = int(y2 + face_h * 0.02)
+        neck_mid = min(H - 1, int(y2 + face_h * 0.34))
+        neck_bot = min(H - 1, int(y2 + face_h * 0.72))
+        left_path = np.array([
+            [int(x1 + face_w * 0.18), neck_top],
+            [int(cx - face_w * 0.16), neck_mid],
+            [int(cx - face_w * 0.24), neck_bot],
+        ], dtype=np.int32)
+        right_path = np.array([
+            [int(x2 - face_w * 0.18), neck_top],
+            [int(cx + face_w * 0.16), neck_mid],
+            [int(cx + face_w * 0.24), neck_bot],
+        ], dtype=np.int32)
+        cv2.polylines(guide, [left_path], False, 255, thickness=max(2, int(face_w * 0.014)))
+        cv2.polylines(guide, [right_path], False, 255, thickness=max(2, int(face_w * 0.014)))
+
+        # 보브/허쉬컷의 끝선 힌트: 턱선 근처의 얕은 U자형 cutoff guide.
+        arc_y = min(H - 1, int(cutoff_y + face_h * 0.10))
+        arc_pts = np.array([
+            [int(x1 - face_w * 0.20), arc_y],
+            [int(x1 + face_w * 0.08), int(arc_y + face_h * 0.05)],
+            [cx, int(arc_y + face_h * 0.08)],
+            [int(x2 - face_w * 0.08), int(arc_y + face_h * 0.05)],
+            [int(x2 + face_w * 0.20), arc_y],
+        ], dtype=np.int32)
+        cv2.polylines(guide, [arc_pts], False, 255, thickness=max(2, int(face_w * 0.013)))
+
+        if shoulder_protect is not None and shoulder_protect.shape == (H, W):
+            shoulder_u8 = (np.clip(shoulder_protect, 0.0, 1.0) > 0.82).astype(np.uint8) * 255
+            shoulder_u8[:neck_mid, :] = 0
+            if int((shoulder_u8 > 0).sum()) > 0:
+                shoulder_edges = cv2.morphologyEx(
+                    shoulder_u8,
+                    cv2.MORPH_GRADIENT,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                )
+                guide = cv2.bitwise_or(guide, shoulder_edges)
+
+        guide = cv2.GaussianBlur(guide, (0, 0), sigmaX=0.8, sigmaY=0.8)
+        return guide
 
     def _crop_face(
         self,
@@ -2502,7 +2624,7 @@ class MirrAISDPipeline:
         # → 원본 긴머리 identity가 생성에 과도하게 영향주는 것 방지
         if hair_length == "short":
             ip_scale = 0.0
-            control_scale = 0.0
+            control_scale = min(self.config.controlnet_conditioning_scale, 0.16)
         elif hair_length == "medium":
             ip_scale = 0.18
             control_scale = min(self.config.controlnet_conditioning_scale, 0.20)
@@ -2679,8 +2801,8 @@ class MirrAISDPipeline:
             return np.clip(removal_mask, 0.0, 1.0).astype(np.float32)
 
         # 기존 full pre-clean보다 훨씬 좁게 확장한다.
-        kx = max(11, int(face_w * (0.26 if hair_length == "short" else 0.28)))
-        ky = max(13, int(face_h * (0.24 if hair_length == "short" else 0.26)))
+        kx = max(9, int(face_w * (0.18 if hair_length == "short" else 0.28)))
+        ky = max(11, int(face_h * (0.17 if hair_length == "short" else 0.26)))
         if kx % 2 == 0:
             kx += 1
         if ky % 2 == 0:
@@ -2713,7 +2835,7 @@ class MirrAISDPipeline:
                     cloth_u8,
                     cv2.getStructuringElement(
                         cv2.MORPH_ELLIPSE,
-                        (21, 21) if hair_length == "short" else (21, 21),
+                        (15, 15) if hair_length == "short" else (21, 21),
                     ),
                     iterations=1,
                 )
@@ -2759,10 +2881,13 @@ class MirrAISDPipeline:
         ] = 255
         preclean_u8 = cv2.bitwise_and(preclean_u8, cv2.bitwise_not(center_cut))
 
-        close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        close_k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (7, 7) if hair_length == "short" else (9, 9),
+        )
         preclean_u8 = cv2.morphologyEx(preclean_u8, cv2.MORPH_CLOSE, close_k)
 
-        max_ratio = 0.22 if hair_length == "short" else 0.24
+        max_ratio = 0.18 if hair_length == "short" else 0.24
         max_px = int(H * W * max_ratio)
         cur_px = int((preclean_u8 > 0).sum())
         if cur_px > max_px:
