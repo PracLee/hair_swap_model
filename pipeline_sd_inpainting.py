@@ -822,6 +822,10 @@ class MirrAISDPipeline:
                         shoulder_protect=shoulder_protect_for_post,
                         hair_length=hair_length,
                         return_debug=post_debug_enabled,
+                        min_pixels=24 if hair_length == "short" else 60,
+                        open_kernel_size=3 if hair_length == "short" else 5,
+                        dilate_kernel_size=17 if hair_length == "short" else 9,
+                        top_offset_px=-(max(6, int((face_bbox[3] - face_bbox[1]) * 0.05))) if hair_length == "short" else 0,
                     )
                     if post_debug_enabled:
                         post_rgb, residual_cleanup_debug = residual_cleanup
@@ -3483,12 +3487,12 @@ class MirrAISDPipeline:
             center_half = max(18, int(face_w * 0.42))
             side_zone = corridor.copy()
             side_zone[:, max(0, cx - center_half):min(W, cx + center_half)] = 0
-            side_fallback_u8 = ((force > 0.78).astype(np.uint8) * 255)
+            side_fallback_u8 = ((force > 0.66).astype(np.uint8) * 255)
             side_fallback_u8 = cv2.bitwise_and(side_fallback_u8, side_zone)
 
             # 중심부의 가는 세로 스트랜드는 SegFace miss가 잦다.
             # 턱선보다 충분히 아래에서만 보수적으로 fallback을 허용한다.
-            center_force_u8 = ((force > 0.70).astype(np.uint8) * 255)
+            center_force_u8 = ((force > 0.60).astype(np.uint8) * 255)
             center_zone = np.zeros((H, W), dtype=np.uint8)
             center_top = min(H, int(cutoff_y + face_h * 0.18))
             center_bottom = min(H, int(cutoff_y + face_h * 1.45))
@@ -3521,8 +3525,51 @@ class MirrAISDPipeline:
                         iterations=1,
                     )
 
+            # 길게 아래로 내려오는 front panel은 SegFace hair mask와 교집합이 약한 경우가 많다.
+            # removal_mask 자체에서 tall component를 다시 골라 강제 cleanup 대상으로 포함한다.
+            panel_seed_u8 = ((force > 0.42).astype(np.uint8) * 255)
+            panel_zone = np.zeros((H, W), dtype=np.uint8)
+            panel_top = min(H, int(cutoff_y + face_h * 0.10))
+            panel_zone[panel_top:, :] = 255
+            panel_seed_u8 = cv2.bitwise_and(panel_seed_u8, corridor)
+            panel_seed_u8 = cv2.bitwise_and(panel_seed_u8, panel_zone)
+
+            panel_fallback_u8 = np.zeros_like(panel_seed_u8)
+            if int((panel_seed_u8 > 0).sum()) > 0:
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                    panel_seed_u8,
+                    connectivity=8,
+                )
+                min_panel_area = max(96, int(face_w * 0.22))
+                min_panel_height = max(42, int(face_h * 0.44))
+                max_panel_width = max(48, int(face_w * 1.05))
+                for label_idx in range(1, num_labels):
+                    x, y, w, h, area = stats[label_idx]
+                    if area < min_panel_area:
+                        continue
+                    if h < min_panel_height:
+                        continue
+                    if w > max_panel_width:
+                        continue
+                    comp_cx = x + (w * 0.5)
+                    if abs(comp_cx - cx) > face_w * 1.55:
+                        continue
+                    panel_fallback_u8[labels == label_idx] = 255
+                if int((panel_fallback_u8 > 0).sum()) > 0:
+                    panel_fallback_u8 = cv2.morphologyEx(
+                        panel_fallback_u8,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
+                    )
+                    panel_fallback_u8 = cv2.dilate(
+                        panel_fallback_u8,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
+                        iterations=1,
+                    )
+
             force_u8 = cv2.bitwise_or(hair_inter_u8, side_fallback_u8)
             force_u8 = cv2.bitwise_or(force_u8, center_fallback_u8)
+            force_u8 = cv2.bitwise_or(force_u8, panel_fallback_u8)
         else:
             # medium도 SegFace miss 보완용 fallback force 일부 허용
             fallback_u8 = ((force > 0.74).astype(np.uint8) * 255)
@@ -3555,71 +3602,26 @@ class MirrAISDPipeline:
 
         k = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
-            (9, 9) if hair_length == "short" else (7, 7),
+            (11, 11) if hair_length == "short" else (7, 7),
         )
+        if hair_length == "short":
+            force_u8 = cv2.morphologyEx(
+                force_u8,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
+            )
         force_u8 = cv2.dilate(force_u8, k, iterations=1)
         force_mask = force_u8.astype(np.float32) / 255.0
 
-        # 1차: LaMa로 잔존 hair를 먼저 지우고
-        # 2차: short에서는 SD refine로 neckline/cloth texture를 다시 정리한다.
+        # short post-cleanup은 비용과 artifact를 줄이기 위해
+        # 추가 SD refine 없이 LaMa만 사용한다.
         result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
-        sd_cleanup_applied = False
-        roi_debug: Dict[str, Any] = {}
-        if (
-            hair_length == "short"
-            and face_crop_pil is not None
-            and seed is not None
-            and force_pixels >= 80
-        ):
-            refine_seed = (int(seed) ^ 0x13579BDF) & 0x7FFFFFFF
-            try:
-                roi_info = self._build_lower_panel_cleanup_roi(
-                    force_mask,
-                    face_bbox=face_bbox,
-                    cutoff_y=cutoff_y,
-                    shoulder_protect=shoulder_protect,
-                )
-                if roi_info is not None:
-                    roi_y, roi_x, roi_face_bbox, roi_meta = roi_info
-                    roi_input_rgb = result_rgb[roi_y, roi_x].copy()
-                    roi_mask = force_mask[roi_y, roi_x].copy()
-                    roi_protect = None
-                    roi_cloth = None
-                    if protect_mask is not None and protect_mask.shape == (H, W):
-                        roi_protect = protect_mask[roi_y, roi_x].copy()
-                    if cloth_mask is not None and cloth_mask.shape == (H, W):
-                        roi_cloth = cloth_mask[roi_y, roi_x].copy()
-
-                    roi_result = self._sd_refine_removed_region(
-                        roi_input_rgb,
-                        roi_mask,
-                        face_bbox=roi_face_bbox,
-                        face_crop_pil=face_crop_pil,
-                        protect_mask=roi_protect,
-                        cloth_mask=roi_cloth,
-                        hair_length=hair_length,
-                        seed=refine_seed,
-                        target_size=384,
-                    )
-                    result_rgb = result_rgb.copy()
-                    result_rgb[roi_y, roi_x] = roi_result
-                    sd_cleanup_applied = True
-                    roi_debug = {
-                        **roi_meta,
-                        "pipeline_post_cleanup_roi_input_rgb": roi_input_rgb,
-                        "pipeline_post_cleanup_roi_result_rgb": roi_result,
-                        "pipeline_post_cleanup_roi_mask": roi_mask,
-                    }
-            except Exception as e:
-                logger.warning(f"[SDPipeline] short post SD cleanup 실패, LaMa 결과 유지: {e}")
         if return_debug:
             return result_rgb, {
-                **roi_debug,
                 "pipeline_lama_post_cleanup_mask": force_mask,
                 "pipeline_lama_post_cleanup_result": result_rgb,
                 "lama_post_cleanup_applied": True,
                 "lama_post_cleanup_pixels": force_pixels,
-                "sd_post_cleanup_applied": sd_cleanup_applied,
             }
         return result_rgb
 
