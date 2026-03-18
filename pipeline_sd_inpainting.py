@@ -3614,15 +3614,42 @@ class MirrAISDPipeline:
         force_mask = force_u8.astype(np.float32) / 255.0
 
         # short post-cleanup은 비용과 artifact를 줄이기 위해
-        # 추가 SD refine 없이 LaMa만 사용한다.
+        # 추가 SD refine 없이 LaMa를 기본으로 쓰고,
+        # lower panel의 어두운 얼룩만 cv2 inpaint 결과를 약하게 섞어 정리한다.
         result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
+        cv2_post_rgb: Optional[np.ndarray] = None
+        if hair_length == "short":
+            lower_blend_mask = force_mask.copy()
+            lower_blend_top = min(H, int(cutoff_y + face_h * 0.12))
+            lower_blend_mask[:lower_blend_top, :] = 0.0
+            if int((lower_blend_mask > 0.35).sum()) >= 80:
+                cv2_post_rgb = self._cv2_inpaint_region(
+                    result_rgb,
+                    lower_blend_mask,
+                    protect_mask=protect_mask,
+                )
+                lower_blend_mask = cv2.GaussianBlur(
+                    np.clip(lower_blend_mask, 0.0, 1.0),
+                    (0, 0),
+                    sigmaX=5.0,
+                    sigmaY=5.0,
+                )
+                lower_blend_alpha = np.clip(lower_blend_mask * 0.42, 0.0, 0.42)[..., np.newaxis]
+                result_rgb = (
+                    cv2_post_rgb.astype(np.float32) * lower_blend_alpha
+                    + result_rgb.astype(np.float32) * (1.0 - lower_blend_alpha)
+                )
+                result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
         if return_debug:
-            return result_rgb, {
+            debug_bundle = {
                 "pipeline_lama_post_cleanup_mask": force_mask,
                 "pipeline_lama_post_cleanup_result": result_rgb,
                 "lama_post_cleanup_applied": True,
                 "lama_post_cleanup_pixels": force_pixels,
             }
+            if cv2_post_rgb is not None:
+                debug_bundle["pipeline_cv2_post_cleanup_result"] = cv2_post_rgb
+            return result_rgb, debug_bundle
         return result_rgb
 
     # ──────────────────────────────────────────────────────────────────────────
