@@ -378,7 +378,7 @@ class MirrAISDPipeline:
         # 하단 긴머리를 먼저 부분 선철거한 뒤 새 short를 생성하고,
         # 마지막에 잔여 long-hair만 차집합 마스크로 정리한다.
         cutoff_y_for_post: Optional[int] = None
-        removal_mask_for_post: Optional[np.ndarray] = None
+        long_hair_mask_for_post: Optional[np.ndarray] = None
         shoulder_protect_for_post: Optional[np.ndarray] = None
         preclean_mask_for_input: Optional[np.ndarray] = None
         if hair_length in ("short", "medium"):
@@ -411,9 +411,10 @@ class MirrAISDPipeline:
             head_y1  = max(0, y1f - int(face_h * 0.6))   # 정수리 위까지
             head_y2  = cutoff_y
 
-            # removal_mask_for_post = 기존 긴 머리 전체에서 새 short 영역 후보를 뺀 잔여물 마스크
-            # 옷 위로 떨어진 머리카락도 지워야 하므로 cloth는 여기서 빼지 않는다.
+            # 기존 긴 머리 전체 마스크.
+            # post cleanup에서는 실제 생성 결과의 short mask와 차집합을 다시 계산한다.
             long_hair_mask = np.clip(hair_mask_for_removal - feature_protect_mask, 0.0, 1.0)
+            long_hair_mask_for_post = long_hair_mask.copy()
 
             # gen_mask = 기존 헤어 상단 + 얼굴 주변 corridor를 합쳐 새 단발이 생성될 영역만 열어 준다.
             # 직사각형 전체 head box를 쓰면 배경 패치가 같이 생겨 사각형 artifact가 남기 쉽다.
@@ -460,18 +461,6 @@ class MirrAISDPipeline:
             if shoulder_protect_for_post is not None and shoulder_protect_for_post.shape == (H, W):
                 gen_mask = np.clip(gen_mask - (shoulder_protect_for_post * 0.55), 0.0, 1.0)
 
-            # 새 short 생성 영역을 dilate해 잔여물 cleanup 대상에서 제외한다.
-            # -> 새 단발 끝선이 LaMa 후처리에 다시 지워지는 문제를 줄인다.
-            exclude_u8 = (gen_mask > 0.18).astype(np.uint8) * 255
-            exclude_u8 = cv2.dilate(
-                exclude_u8,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
-                iterations=1,
-            )
-            exclude_mask = (exclude_u8 > 0).astype(np.float32)
-            removal_mask_for_post = np.clip(long_hair_mask - exclude_mask, 0.0, 1.0)
-
-            _store_mask("pipeline_short_removal_mask", removal_mask_for_post)
             _store_mask("pipeline_short_generation_mask", gen_mask)
 
             preclean_seed_mask = long_hair_mask.copy()
@@ -488,7 +477,7 @@ class MirrAISDPipeline:
                 )
 
             logger.info(
-                f"[SDPipeline] hybrid: removal_px={removal_mask_for_post.sum():.0f}, "
+                f"[SDPipeline] hybrid: long_px={long_hair_mask.sum():.0f}, "
                 f"gen_px={gen_mask.sum():.0f}, preclean_px={preclean_mask_for_input.sum():.0f}, "
                 f"cutoff_y={cutoff_y}, head_box=({head_x1},{head_y1})-({head_x2},{head_y2})"
             )
@@ -609,7 +598,7 @@ class MirrAISDPipeline:
             if (
                 hair_length in ("short", "medium")
                 and cutoff_y_for_post is not None
-                and removal_mask_for_post is not None
+                and long_hair_mask_for_post is not None
             ):
                 try:
                     post_rgb = cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)
@@ -622,6 +611,22 @@ class MirrAISDPipeline:
                                 "cutoff_cleanup",
                                 "residual_cleanup",
                             ]
+                    remnant_info = self._build_real_short_remnant_mask(
+                        post_rgb,
+                        original_long_hair_mask=long_hair_mask_for_post,
+                        face_bbox=face_bbox,
+                        cutoff_y=cutoff_y_for_post,
+                        protect_mask=feature_protect_mask,
+                        hair_length=hair_length,
+                        return_debug=post_debug_enabled,
+                    )
+                    if post_debug_enabled:
+                        removal_mask_for_post, current_short_mask_for_post, remnant_debug = remnant_info
+                        _store_mask("pipeline_short_real_mask", current_short_mask_for_post)
+                        _store_mask("pipeline_short_removal_mask", removal_mask_for_post)
+                        _store_debug_bundle(remnant_debug)
+                    else:
+                        removal_mask_for_post, current_short_mask_for_post = remnant_info
                     post_cleanup = self._final_cutoff_cleanup(
                         post_rgb,
                         face_bbox=face_bbox,
@@ -629,6 +634,7 @@ class MirrAISDPipeline:
                         cutoff_y=cutoff_y_for_post,
                         shoulder_protect=shoulder_protect_for_post,
                         hair_length=hair_length,
+                        current_hair_mask=current_short_mask_for_post,
                         return_debug=post_debug_enabled,
                     )
                     if post_debug_enabled:
@@ -2280,6 +2286,84 @@ class MirrAISDPipeline:
         precleaned = gen_orig.astype(np.float32) * alpha + base_rgb.astype(np.float32) * (1.0 - alpha)
         return np.clip(precleaned, 0, 255).astype(np.uint8)
 
+    def _build_real_short_remnant_mask(
+        self,
+        img_rgb: np.ndarray,
+        original_long_hair_mask: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        cutoff_y: int,
+        protect_mask: Optional[np.ndarray] = None,
+        hair_length: str = "short",
+        return_debug: bool = False,
+    ) -> Any:
+        """
+        실제 생성 결과에서 short hair mask를 다시 추출한 뒤,
+        M_remnant = M_long - M_short_real 을 계산한다.
+        이후 remnant를 dilate하여 LaMa cleanup 경계 artifact를 줄인다.
+        """
+        H, W = img_rgb.shape[:2]
+        if original_long_hair_mask.shape != (H, W):
+            empty = np.zeros((H, W), dtype=np.float32)
+            if return_debug:
+                return empty, empty, {
+                    "short_real_mask_pixels": 0,
+                    "short_remnant_pixels": 0,
+                }
+            return empty, empty
+
+        _, y1, _, y2 = face_bbox
+        face_h = max(int(y2 - y1), 1)
+
+        current_hair_mask, _, _ = self._segface_hair_mask(img_rgb, face_bbox)
+        if protect_mask is not None and protect_mask.shape == (H, W):
+            current_hair_mask = np.clip(current_hair_mask - np.clip(protect_mask, 0.0, 1.0), 0.0, 1.0)
+
+        # 실제 short silhouette로 인정할 하단 범위를 제한한다.
+        keep_bottom = min(
+            H - 1,
+            int(cutoff_y + face_h * (0.10 if hair_length == "short" else 0.26)),
+        )
+        short_real = current_hair_mask.copy()
+        short_real[keep_bottom + 1 :, :] = 0.0
+
+        short_real_u8 = (short_real > 0.45).astype(np.uint8) * 255
+        short_real_u8 = cv2.morphologyEx(
+            short_real_u8,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        )
+
+        long_u8 = (np.clip(original_long_hair_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
+        remnant_u8 = cv2.bitwise_and(long_u8, cv2.bitwise_not(short_real_u8))
+        remnant_u8[:cutoff_y, :] = 0
+
+        if protect_mask is not None and protect_mask.shape == (H, W):
+            protect_u8 = (np.clip(protect_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
+            remnant_u8 = cv2.bitwise_and(remnant_u8, cv2.bitwise_not(protect_u8))
+
+        remnant_u8 = cv2.morphologyEx(
+            remnant_u8,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        )
+        remnant_u8 = cv2.dilate(
+            remnant_u8,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (9, 9) if hair_length == "short" else (7, 7),
+            ),
+            iterations=1,
+        )
+
+        short_real_mask = short_real_u8.astype(np.float32) / 255.0
+        remnant_mask = remnant_u8.astype(np.float32) / 255.0
+        if return_debug:
+            return remnant_mask, short_real_mask, {
+                "short_real_mask_pixels": int((short_real_u8 > 0).sum()),
+                "short_remnant_pixels": int((remnant_u8 > 0).sum()),
+            }
+        return remnant_mask, short_real_mask
+
     def _build_shoulder_protect_mask(
         self,
         cloth_mask: np.ndarray,
@@ -2426,6 +2510,7 @@ class MirrAISDPipeline:
         cutoff_y: int,
         shoulder_protect: Optional[np.ndarray] = None,
         hair_length: str = "short",
+        current_hair_mask: Optional[np.ndarray] = None,
         return_debug: bool = False,
     ) -> Any:
         """
@@ -2471,7 +2556,10 @@ class MirrAISDPipeline:
         force_u8 = cv2.bitwise_and(force_u8, corridor)
 
         # 실제 남아있는 hair 픽셀과 교집합을 우선 적용해 의상/배경 훼손 방지
-        hair_now, _, _ = self._segface_hair_mask(img_rgb, face_bbox)
+        if current_hair_mask is not None and current_hair_mask.shape == (H, W):
+            hair_now = np.clip(current_hair_mask.astype(np.float32), 0.0, 1.0)
+        else:
+            hair_now, _, _ = self._segface_hair_mask(img_rgb, face_bbox)
         hair_now[:cutoff_y, :] = 0.0
         hair_now_u8 = (hair_now > 0.5).astype(np.uint8) * 255
         if int((hair_now_u8 > 0).sum()) > 0:

@@ -62,6 +62,7 @@ INTERMEDIATE_KEY_ALIASES = {
     "short_preclean_mask": "pipeline_short_preclean_mask",
     "short_removal_mask": "pipeline_short_removal_mask",
     "short_generation_mask": "pipeline_short_generation_mask",
+    "short_real_mask": "pipeline_short_real_mask",
     "face_feature_protect_mask": "pipeline_face_feature_protect_mask",
     "lama_preclean_mask": "pipeline_lama_preclean_mask",
     "lama_preclean_result": "pipeline_lama_preclean_result",
