@@ -3621,7 +3621,7 @@ class MirrAISDPipeline:
         cv2_post_rgb: Optional[np.ndarray] = None
         if hair_length == "short":
             lower_blend_mask = force_mask.copy()
-            lower_blend_top = min(H, int(cutoff_y + face_h * 0.08))
+            lower_blend_top = min(H, int(cutoff_y + face_h * 0.10))
             lower_blend_mask[:lower_blend_top, :] = 0.0
             if int((lower_blend_mask > 0.35).sum()) >= 80:
                 cv2_post_rgb = self._cv2_inpaint_region(
@@ -3632,7 +3632,7 @@ class MirrAISDPipeline:
                 lower_ramp = np.zeros((H, 1), dtype=np.float32)
                 if lower_blend_top < H:
                     lower_ramp[lower_blend_top:, 0] = np.linspace(
-                        0.55,
+                        0.40,
                         1.0,
                         H - lower_blend_top,
                         dtype=np.float32,
@@ -3644,7 +3644,18 @@ class MirrAISDPipeline:
                     sigmaX=5.0,
                     sigmaY=5.0,
                 )
-                lower_blend_alpha = np.clip(lower_blend_mask * 0.58, 0.0, 0.58)[..., np.newaxis]
+                lama_luma = (
+                    0.2126 * lama_only_rgb[..., 0]
+                    + 0.7152 * lama_only_rgb[..., 1]
+                    + 0.0722 * lama_only_rgb[..., 2]
+                ).astype(np.float32)
+                dark_gate = np.clip((118.0 - lama_luma) / 50.0, 0.0, 1.0)
+                dark_gate = cv2.GaussianBlur(dark_gate, (0, 0), sigmaX=5.0, sigmaY=5.0)
+                lower_blend_alpha = np.clip(
+                    lower_blend_mask * (0.24 + 0.24 * dark_gate),
+                    0.0,
+                    0.48,
+                )[..., np.newaxis]
                 result_rgb = (
                     cv2_post_rgb.astype(np.float32) * lower_blend_alpha
                     + result_rgb.astype(np.float32) * (1.0 - lower_blend_alpha)
