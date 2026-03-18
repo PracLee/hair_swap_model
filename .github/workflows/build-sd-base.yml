@@ -124,6 +124,8 @@ jobs:
           platforms: linux/amd64
           push: true
           provenance: false
+          cache-from: type=gha,scope=sd-base
+          cache-to: type=gha,scope=sd-base,mode=max
           tags: |
             ${{ secrets.DOCKER_USERNAME }}/sd:base-${{ steps.meta.outputs.VERSION }}
             ${{ secrets.DOCKER_USERNAME }}/sd:base-latest

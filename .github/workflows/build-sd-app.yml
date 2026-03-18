@@ -175,6 +175,8 @@ jobs:
           pull: true
           push: true
           provenance: false
+          cache-from: type=gha,scope=sd-app
+          cache-to: type=gha,scope=sd-app,mode=max
           tags: |
             ${{ secrets.DOCKER_USERNAME }}/sd:${{ steps.meta.outputs.VERSION }}
             ${{ secrets.DOCKER_USERNAME }}/sd:latest
