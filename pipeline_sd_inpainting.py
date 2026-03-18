@@ -3558,10 +3558,14 @@ class MirrAISDPipeline:
                     panel_fallback_u8[labels == label_idx] = 255
                     # 긴 side panel의 하단 잔존 blob은 원래 component보다 아래에서 남는다.
                     # 채움 강도는 그대로 두고, tail shape만 더 내려서 cleanup 마스크에 포함한다.
-                    tail_inset_x = max(2, int(w * 0.04))
-                    tail_pad_x = max(8, int(face_w * 0.05))
-                    tail_x1 = max(0, x - tail_pad_x + tail_inset_x)
-                    tail_x2 = min(W, x + w + tail_pad_x - tail_inset_x)
+                    tail_inner_inset_x = max(6, int(w * 0.12))
+                    tail_outer_pad_x = max(10, int(face_w * 0.06))
+                    if comp_cx <= cx:
+                        tail_x1 = max(0, x - tail_outer_pad_x)
+                        tail_x2 = min(W, x + w - tail_inner_inset_x)
+                    else:
+                        tail_x1 = max(0, x + tail_inner_inset_x)
+                        tail_x2 = min(W, x + w + tail_outer_pad_x)
                     tail_y1 = min(H, y + max(0, int(h * 0.44)))
                     tail_extra_h = max(42, int(face_h * 0.52))
                     tail_y2 = min(H, y + h + tail_extra_h)
