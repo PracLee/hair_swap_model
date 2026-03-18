@@ -493,7 +493,7 @@ class MirrAISDPipeline:
                 cv2.MORPH_CLOSE,
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
             )
-            gen_mask = (gen_u8 > 0).astype(np.float32)
+            gen_mask_base = (gen_u8 > 0).astype(np.float32)
 
             # short/medium에서는 턱 아래 남아 있는 기존 long-hair 영역도
             # SD가 다시 쓰도록 generation mask에 포함시킨다.
@@ -506,12 +506,26 @@ class MirrAISDPipeline:
                 W=W,
                 hair_length=hair_length,
             )
+            lower_rewrite_mask = np.zeros((H, W), dtype=np.float32)
             if expanded_lower_mask.shape == (H, W):
-                gen_mask = np.clip(np.maximum(gen_mask, expanded_lower_mask), 0.0, 1.0)
+                lower_rewrite_mask = np.clip(expanded_lower_mask.astype(np.float32), 0.0, 1.0)
 
-            gen_mask = np.clip(gen_mask - feature_protect_mask, 0.0, 1.0)
+            gen_mask_base = np.clip(gen_mask_base - feature_protect_mask, 0.0, 1.0)
+            lower_rewrite_mask = np.clip(lower_rewrite_mask - feature_protect_mask, 0.0, 1.0)
             if shoulder_protect_for_post is not None and shoulder_protect_for_post.shape == (H, W):
-                gen_mask = np.clip(gen_mask - (shoulder_protect_for_post * 0.55), 0.0, 1.0)
+                # 단발 silhouette 생성 영역은 기존 보호 강도를 유지하되,
+                # lower rewrite mask는 더 약하게 보호해서 긴 스트랜드 제거를 우선한다.
+                gen_mask_base = np.clip(gen_mask_base - (shoulder_protect_for_post * 0.55), 0.0, 1.0)
+                lower_rewrite_mask = np.clip(lower_rewrite_mask - (shoulder_protect_for_post * 0.18), 0.0, 1.0)
+
+            gen_mask = np.clip(np.maximum(gen_mask_base, lower_rewrite_mask), 0.0, 1.0)
+
+            if debug_data_common is not None:
+                debug_data_common["short_generation_mask_stats"] = {
+                    "base_pixels": int((gen_mask_base > 0.35).sum()),
+                    "lower_rewrite_pixels": int((lower_rewrite_mask > 0.35).sum()),
+                    "final_pixels": int((gen_mask > 0.35).sum()),
+                }
 
             _store_mask("pipeline_short_generation_mask", gen_mask)
 
