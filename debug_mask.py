@@ -1,6 +1,7 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
+import argparse
 import sys
 import cv2
 import numpy as np
@@ -12,7 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipeline_sd_inpainting import MirrAISDPipeline, SDInpaintConfig
 
-IMAGE_PATH = str(PROJECT_ROOT / "images" / "1234.jpeg")
+IMAGE_PATH = str(PROJECT_ROOT / "images" / "12345.png")
 OUTPUT_DIR = PROJECT_ROOT
 
 
@@ -34,10 +35,21 @@ def draw_points(img_bgr, pos_pts, neg_pts, sam_bbox):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="SAM2/BiSeNet mask debug")
+    parser.add_argument(
+        "--image",
+        default=IMAGE_PATH,
+        help="입력 이미지 경로 (기본: images/12345.png)",
+    )
+    args = parser.parse_args()
+
     pipeline = MirrAISDPipeline(config=SDInpaintConfig(device="cpu", dtype="bfloat16"))
     pipeline._load_bisenet()
+    pipeline._load_mediapipe()
 
-    img_bgr = cv2.imread(IMAGE_PATH)
+    img_bgr = cv2.imread(str(args.image))
+    if img_bgr is None:
+        raise FileNotFoundError(f"이미지를 읽을 수 없습니다: {args.image}")
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     H, W = img_rgb.shape[:2]
 
@@ -46,9 +58,10 @@ def main():
     print(f"BiSeNet hair pixels: {hair_mask.sum():.0f}")
     print(f"BiSeNet face pixels: {face_mask.sum():.0f}")
 
-    # ── 얼굴 bbox (1234.jpeg 기준 하드코딩, 1000x1000)
-    x1, y1, x2, y2 = 310, 90, 620, 430
-    face_bbox = (x1, y1, x2, y2)
+    face_bbox = pipeline._detect_face(img_rgb)
+    if face_bbox is None:
+        raise RuntimeError("얼굴 bbox를 검출하지 못했습니다.")
+    x1, y1, x2, y2 = face_bbox
     bw, bh = x2 - x1, y2 - y1
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
     print(f"face_bbox: {face_bbox}")

@@ -569,9 +569,10 @@ class MirrAISDPipeline:
                     hair_length=hair_length,
                     return_debug=debug_images_common is not None,
                     debug_prefix="preclean_residual",
-                    min_pixels=36 if hair_length == "short" else 48,
-                    open_kernel_size=5,
-                    dilate_kernel_size=11 if hair_length == "short" else 9,
+                    min_pixels=24 if hair_length == "short" else 48,
+                    open_kernel_size=3 if hair_length == "short" else 5,
+                    dilate_kernel_size=15 if hair_length == "short" else 9,
+                    top_offset_px=-(max(8, int(face_h * 0.06))) if hair_length == "short" else 0,
                 )
                 if debug_images_common is not None:
                     img_rgb_cleaned, preclean_residual_debug = preclean_residual_cleanup
@@ -2596,17 +2597,20 @@ class MirrAISDPipeline:
         if int((fill_mask > 0).sum()) < 80:
             return base_rgb
 
+        fill_edge_suppress = 0.58 if hair_length == "short" else 0.32
         img_512, mask_512, canny_512, scale, pad = self._prepare_sd_inputs(
             base_rgb,
             fill_mask,
-            mask_edge_suppression=0.22,
+            mask_edge_suppression=fill_edge_suppress,
+            canny_suppress_mask=fill_mask,
         )
 
         if hair_length == "short":
             clean_prompt = (
                 "professional portrait photo, tightly tied-back slicked-back hair silhouette, "
-                "clean exposed neck and shoulders, no dangling side hair strands, "
-                "no hair below jawline in masked region, coherent background and clothing texture, "
+                "clean exposed neck and shoulder line, bare collar area in masked region, "
+                "no dangling side hair strands, no visible hanging strand over clothing, "
+                "no hair below jawline in masked region, coherent sweater neckline and clothing texture, "
                 "photorealistic details"
             )
         else:
@@ -2618,6 +2622,7 @@ class MirrAISDPipeline:
             )
         clean_negative = (
             "long hanging hair, side locks over chest, loose strands, visible ponytail, braid, "
+            "single long strand on shoulder, dark strand on clothing, dangling strand by neck, "
             "hat, cap, beanie, helmet, hairnet, headscarf, bandana, head covering, "
             "wavy long hair, hair below shoulders, messy flyaway clumps, wig-like texture, "
             "artifacts, blurred texture, melted details, cartoon, painting"
@@ -2625,9 +2630,16 @@ class MirrAISDPipeline:
 
         self._sd_pipe.set_ip_adapter_scale(0.0)
         generator = torch.Generator(device=self.device).manual_seed(int(seed))
-        clean_control = float(np.clip(self.config.controlnet_conditioning_scale * 0.45, 0.08, 0.16))
-        clean_steps = max(26, self.config.num_inference_steps - 2)
-        clean_strength = float(np.clip(self.config.preclean_strength, 0.86, 0.99))
+        if hair_length == "short":
+            clean_control = float(np.clip(self.config.controlnet_conditioning_scale * 0.22, 0.04, 0.09))
+            clean_steps = max(28, self.config.num_inference_steps)
+            clean_strength = float(np.clip(max(self.config.preclean_strength, 0.985), 0.94, 0.995))
+            clean_guidance = 7.9
+        else:
+            clean_control = float(np.clip(self.config.controlnet_conditioning_scale * 0.45, 0.08, 0.16))
+            clean_steps = max(26, self.config.num_inference_steps - 2)
+            clean_strength = float(np.clip(self.config.preclean_strength, 0.86, 0.99))
+            clean_guidance = 7.3
 
         with torch.inference_mode():
             out = self._sd_pipe(
@@ -2640,7 +2652,7 @@ class MirrAISDPipeline:
                 height=SD_SIZE,
                 width=SD_SIZE,
                 num_inference_steps=clean_steps,
-                guidance_scale=7.3,
+                guidance_scale=clean_guidance,
                 controlnet_conditioning_scale=clean_control,
                 num_images_per_prompt=1,
                 generator=generator,
@@ -2819,6 +2831,7 @@ class MirrAISDPipeline:
         min_pixels: int = 60,
         open_kernel_size: int = 5,
         dilate_kernel_size: int = 9,
+        top_offset_px: int = 0,
     ) -> Any:
         """
         short/medium 변환 후 cutoff 아래에 남은 머리카락을 재검출해 정리.
@@ -2827,12 +2840,13 @@ class MirrAISDPipeline:
         cutoff_y = int(np.clip(cutoff_y, 0, H - 1))
         _, y1, _, y2 = face_bbox
         face_h = max(int(y2 - y1), 1)
+        cleanup_start_y = int(np.clip(cutoff_y + int(top_offset_px), 0, H - 1))
         soft_zone = max(10, int(face_h * 0.22))
-        soft_end = min(H - 1, cutoff_y + soft_zone)
+        soft_end = min(H - 1, cleanup_start_y + soft_zone)
 
         hair_now, _, _ = self._segface_hair_mask(img_rgb, face_bbox)
         residual = hair_now.copy()
-        residual[:cutoff_y, :] = 0.0
+        residual[:cleanup_start_y, :] = 0.0
 
         # 작은 노이즈 제거
         residual_u8 = (residual > 0.5).astype(np.uint8) * 255
@@ -2856,11 +2870,11 @@ class MirrAISDPipeline:
                 residual_u8 = cv2.bitwise_and(residual_u8, cv2.bitwise_not(protect_u8))
 
         # cutoff 바로 아래는 완만히 제거해 단발 끝선이 일자로 잘린 느낌을 완화
-        if soft_end > cutoff_y:
+        if soft_end > cleanup_start_y:
             ramp = np.ones((H,), dtype=np.float32)
-            ramp[:cutoff_y] = 0.0
-            ramp[cutoff_y:soft_end + 1] = np.linspace(
-                0.0, 1.0, soft_end - cutoff_y + 1, dtype=np.float32
+            ramp[:cleanup_start_y] = 0.0
+            ramp[cleanup_start_y:soft_end + 1] = np.linspace(
+                0.0, 1.0, soft_end - cleanup_start_y + 1, dtype=np.float32
             )
             residual_soft = (residual_u8.astype(np.float32) / 255.0) * ramp[:, np.newaxis]
             residual_u8 = (residual_soft > 0.50).astype(np.uint8) * 255
