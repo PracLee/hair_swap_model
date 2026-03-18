@@ -3483,6 +3483,8 @@ class MirrAISDPipeline:
 
         hair_inter_u8 = cv2.bitwise_and(force_u8, hair_now_u8)
         lower_center_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
+        front_cleanup_u8 = np.zeros((H, W), dtype=np.uint8)
+        side_cleanup_u8 = np.zeros((H, W), dtype=np.uint8)
         if hair_length == "short":
             # SegFace miss를 보완하기 위해 side-zone에 한해 high-confidence force를 추가 반영
             center_half = max(18, int(face_w * 0.42))
@@ -3544,6 +3546,11 @@ class MirrAISDPipeline:
                 keepout_top:keepout_bottom,
                 max(0, cx - keepout_half):min(W, cx + keepout_half),
             ] = 255
+            front_panel_fallback_u8 = np.zeros_like(panel_seed_u8)
+            side_panel_fallback_u8 = np.zeros_like(panel_seed_u8)
+            front_tail_u8 = np.zeros_like(panel_seed_u8)
+            side_tail_u8 = np.zeros_like(panel_seed_u8)
+            front_zone_u8 = np.zeros_like(panel_seed_u8)
             if int((panel_seed_u8 > 0).sum()) > 0:
                 num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
                     panel_seed_u8,
@@ -3552,10 +3559,7 @@ class MirrAISDPipeline:
                 min_panel_area = max(80, int(face_w * 0.18))
                 min_panel_height = max(42, int(face_h * 0.44))
                 max_panel_width = max(60, int(face_w * 1.18))
-                left_panel_u8 = np.zeros_like(panel_seed_u8)
-                right_panel_u8 = np.zeros_like(panel_seed_u8)
-                left_tail_u8 = np.zeros_like(panel_seed_u8)
-                right_tail_u8 = np.zeros_like(panel_seed_u8)
+                center_band_half = max(18, int(face_w * 0.16))
                 for label_idx in range(1, num_labels):
                     x, y, w, h, area = stats[label_idx]
                     if area < min_panel_area:
@@ -3568,63 +3572,135 @@ class MirrAISDPipeline:
                     if abs(comp_cx - cx) > face_w * 1.70:
                         continue
                     component_mask = (labels == label_idx)
-                    # 긴 side panel의 하단 잔존 blob은 원래 component보다 아래에서 남는다.
-                    # 채움 강도는 그대로 두고, tail shape만 더 내려서 cleanup 마스크에 포함한다.
-                    tail_inner_inset_x = max(6, int(w * 0.12))
-                    tail_outer_pad_x = max(10, int(face_w * 0.06))
-                    if comp_cx <= cx:
-                        left_panel_u8[component_mask] = 255
-                        tail_x1 = max(0, x - tail_outer_pad_x)
-                        tail_x2 = min(W, x + w - tail_inner_inset_x)
-                        tail_target_u8 = left_tail_u8
+                    center_overlap_w = max(
+                        0,
+                        min(x + w, cx + center_band_half) - max(x, cx - center_band_half),
+                    )
+                    center_overlap_ratio = center_overlap_w / max(w, 1)
+                    crosses_center = x <= cx <= (x + w)
+                    is_front_panel = (
+                        crosses_center
+                        or center_overlap_ratio >= 0.22
+                        or (
+                            abs(comp_cx - cx) <= face_w * 0.22
+                            and (h / max(w, 1)) >= 1.25
+                        )
+                    )
+                    if is_front_panel:
+                        front_panel_fallback_u8[component_mask] = 255
+                        front_zone_margin_x = max(8, int(face_w * 0.10))
+                        zone_y1 = max(0, y)
+                        zone_y2 = min(H, y + h + max(28, int(face_h * 0.36)))
+                        front_zone_u8[
+                            zone_y1:zone_y2,
+                            max(0, x - front_zone_margin_x):min(W, x + w + front_zone_margin_x),
+                        ] = 255
+                        tail_inset_x = max(6, int(w * 0.16))
+                        tail_x1 = max(0, x + tail_inset_x)
+                        tail_x2 = min(W, x + w - tail_inset_x)
+                        tail_y1 = min(H, y + max(0, int(h * 0.46)))
+                        tail_extra_h = max(32, int(face_h * 0.42))
+                        tail_target_u8 = front_tail_u8
                     else:
-                        right_panel_u8[component_mask] = 255
-                        tail_x1 = max(0, x + tail_inner_inset_x)
-                        tail_x2 = min(W, x + w + tail_outer_pad_x)
-                        tail_target_u8 = right_tail_u8
-                    tail_y1 = min(H, y + max(0, int(h * 0.44)))
-                    tail_extra_h = max(42, int(face_h * 0.52))
+                        side_panel_fallback_u8[component_mask] = 255
+                        # 긴 side panel의 하단 잔존 blob은 원래 component보다 아래에서 남는다.
+                        # 채움 강도는 그대로 두고, tail shape만 더 내려서 cleanup 마스크에 포함한다.
+                        tail_inner_inset_x = max(6, int(w * 0.12))
+                        tail_outer_pad_x = max(10, int(face_w * 0.06))
+                        if comp_cx <= cx:
+                            tail_x1 = max(0, x - tail_outer_pad_x)
+                            tail_x2 = min(W, x + w - tail_inner_inset_x)
+                        else:
+                            tail_x1 = max(0, x + tail_inner_inset_x)
+                            tail_x2 = min(W, x + w + tail_outer_pad_x)
+                        tail_y1 = min(H, y + max(0, int(h * 0.44)))
+                        tail_extra_h = max(42, int(face_h * 0.52))
+                        tail_target_u8 = side_tail_u8
                     tail_y2 = min(H, y + h + tail_extra_h)
                     if tail_x1 < tail_x2 and tail_y1 < tail_y2:
                         tail_target_u8[tail_y1:tail_y2, tail_x1:tail_x2] = 255
-                panel_fallback_u8 = cv2.bitwise_or(left_panel_u8, right_panel_u8)
-                if int((panel_fallback_u8 > 0).sum()) > 0:
-                    panel_fallback_u8 = cv2.morphologyEx(
-                        panel_fallback_u8,
+                if int((front_panel_fallback_u8 > 0).sum()) > 0:
+                    front_panel_fallback_u8 = cv2.morphologyEx(
+                        front_panel_fallback_u8,
                         cv2.MORPH_CLOSE,
                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
                     )
-                    panel_fallback_u8 = cv2.dilate(
-                        panel_fallback_u8,
+                    front_panel_fallback_u8 = cv2.dilate(
+                        front_panel_fallback_u8,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 9)),
+                        iterations=1,
+                    )
+                if int((front_tail_u8 > 0).sum()) > 0:
+                    front_tail_u8 = cv2.bitwise_and(front_tail_u8, corridor)
+                    front_tail_u8 = cv2.morphologyEx(
+                        front_tail_u8,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 15)),
+                    )
+                    front_tail_u8 = cv2.dilate(
+                        front_tail_u8,
                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
                         iterations=1,
                     )
-                panel_tail_u8 = cv2.bitwise_or(left_tail_u8, right_tail_u8)
-                if int((panel_tail_u8 > 0).sum()) > 0:
-                    panel_tail_u8 = cv2.bitwise_and(panel_tail_u8, corridor)
-                    panel_tail_u8 = cv2.bitwise_and(
-                        panel_tail_u8,
+                    front_panel_fallback_u8 = cv2.bitwise_or(front_panel_fallback_u8, front_tail_u8)
+                if int((side_panel_fallback_u8 > 0).sum()) > 0:
+                    side_panel_fallback_u8 = cv2.morphologyEx(
+                        side_panel_fallback_u8,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
+                    )
+                    side_panel_fallback_u8 = cv2.dilate(
+                        side_panel_fallback_u8,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
+                        iterations=1,
+                    )
+                if int((side_tail_u8 > 0).sum()) > 0:
+                    side_tail_u8 = cv2.bitwise_and(side_tail_u8, corridor)
+                    side_tail_u8 = cv2.bitwise_and(
+                        side_tail_u8,
                         cv2.bitwise_not(lower_center_keepout_u8),
                     )
-                    panel_tail_u8 = cv2.morphologyEx(
-                        panel_tail_u8,
+                    side_tail_u8 = cv2.morphologyEx(
+                        side_tail_u8,
                         cv2.MORPH_CLOSE,
                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 21)),
                     )
-                    panel_tail_u8 = cv2.dilate(
-                        panel_tail_u8,
+                    side_tail_u8 = cv2.dilate(
+                        side_tail_u8,
                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 19)),
                         iterations=1,
                     )
-                    panel_tail_u8 = cv2.bitwise_and(
-                        panel_tail_u8,
+                    side_tail_u8 = cv2.bitwise_and(
+                        side_tail_u8,
                         cv2.bitwise_not(lower_center_keepout_u8),
                     )
-                    panel_fallback_u8 = cv2.bitwise_or(panel_fallback_u8, panel_tail_u8)
+                    side_panel_fallback_u8 = cv2.bitwise_or(side_panel_fallback_u8, side_tail_u8)
+            front_zone_top = min(H, int(cutoff_y + face_h * 0.10))
+            front_zone_bottom = min(H, int(cutoff_y + face_h * 1.80))
+            front_zone_half = max(20, int(face_w * 0.28))
+            front_zone_u8[
+                front_zone_top:front_zone_bottom,
+                max(0, cx - front_zone_half):min(W, cx + front_zone_half),
+            ] = 255
+            if int((front_panel_fallback_u8 > 0).sum()) > 0:
+                front_zone_u8 = cv2.bitwise_or(
+                    front_zone_u8,
+                    cv2.dilate(
+                        front_panel_fallback_u8,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 17)),
+                        iterations=1,
+                    ),
+                )
+            front_hair_inter_u8 = cv2.bitwise_and(hair_inter_u8, front_zone_u8)
+            side_hair_inter_u8 = cv2.bitwise_and(hair_inter_u8, cv2.bitwise_not(front_zone_u8))
+            front_cleanup_u8 = cv2.bitwise_or(front_hair_inter_u8, center_fallback_u8)
+            front_cleanup_u8 = cv2.bitwise_or(front_cleanup_u8, front_panel_fallback_u8)
+            side_cleanup_u8 = cv2.bitwise_or(side_hair_inter_u8, side_fallback_u8)
+            side_cleanup_u8 = cv2.bitwise_or(side_cleanup_u8, side_panel_fallback_u8)
+            panel_fallback_u8 = cv2.bitwise_or(front_panel_fallback_u8, side_panel_fallback_u8)
+            panel_tail_u8 = cv2.bitwise_or(front_tail_u8, side_tail_u8)
 
-            force_u8 = cv2.bitwise_or(hair_inter_u8, side_fallback_u8)
-            force_u8 = cv2.bitwise_or(force_u8, center_fallback_u8)
-            force_u8 = cv2.bitwise_or(force_u8, panel_fallback_u8)
+            force_u8 = cv2.bitwise_or(front_cleanup_u8, side_cleanup_u8)
         else:
             # medium도 SegFace miss 보완용 fallback force 일부 허용
             fallback_u8 = ((force > 0.74).astype(np.uint8) * 255)
@@ -3673,39 +3749,64 @@ class MirrAISDPipeline:
         # lower panel의 어두운 얼룩만 cv2 inpaint 결과를 약하게 섞어 정리한다.
         result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
         cv2_post_rgb: Optional[np.ndarray] = None
+        cv2_front_rgb: Optional[np.ndarray] = None
+        cv2_side_rgb: Optional[np.ndarray] = None
         residual_cv2_rgb: Optional[np.ndarray] = None
         residual_cleanup_mask = np.zeros((H, W), dtype=np.float32)
         if hair_length == "short":
-            lower_blend_mask = force_mask.copy()
+            front_blend_mask = front_cleanup_u8.astype(np.float32) / 255.0
+            side_blend_mask = side_cleanup_u8.astype(np.float32) / 255.0
             lower_blend_top = min(H, int(cutoff_y + face_h * 0.12))
-            lower_blend_mask[:lower_blend_top, :] = 0.0
+            front_blend_mask[:lower_blend_top, :] = 0.0
+            side_blend_mask[:lower_blend_top, :] = 0.0
             if int((lower_center_keepout_u8 > 0).sum()) > 0:
-                lower_blend_mask = lower_blend_mask * (
+                side_blend_mask = side_blend_mask * (
                     cv2.bitwise_not(lower_center_keepout_u8).astype(np.float32) / 255.0
                 )
-            if int((lower_blend_mask > 0.35).sum()) >= 80:
-                cv2_post_rgb = self._cv2_inpaint_region(
+            if int((front_blend_mask > 0.35).sum()) >= 48:
+                cv2_front_rgb = self._cv2_inpaint_region(
                     result_rgb,
-                    lower_blend_mask,
+                    front_blend_mask,
                     protect_mask=protect_mask,
                 )
-                lower_blend_mask = cv2.GaussianBlur(
-                    np.clip(lower_blend_mask, 0.0, 1.0),
+                front_blend_mask = cv2.GaussianBlur(
+                    np.clip(front_blend_mask, 0.0, 1.0),
+                    (0, 0),
+                    sigmaX=4.0,
+                    sigmaY=4.0,
+                )
+                front_blend_alpha = np.clip(front_blend_mask * 0.26, 0.0, 0.26)[..., np.newaxis]
+                result_rgb = (
+                    cv2_front_rgb.astype(np.float32) * front_blend_alpha
+                    + result_rgb.astype(np.float32) * (1.0 - front_blend_alpha)
+                )
+                result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
+            if int((side_blend_mask > 0.35).sum()) >= 80:
+                cv2_side_rgb = self._cv2_inpaint_region(
+                    result_rgb,
+                    side_blend_mask,
+                    protect_mask=protect_mask,
+                )
+                side_blend_mask = cv2.GaussianBlur(
+                    np.clip(side_blend_mask, 0.0, 1.0),
                     (0, 0),
                     sigmaX=5.0,
                     sigmaY=5.0,
                 )
-                lower_blend_alpha = np.clip(lower_blend_mask * 0.42, 0.0, 0.42)[..., np.newaxis]
+                side_blend_alpha = np.clip(side_blend_mask * 0.32, 0.0, 0.32)[..., np.newaxis]
                 result_rgb = (
-                    cv2_post_rgb.astype(np.float32) * lower_blend_alpha
-                    + result_rgb.astype(np.float32) * (1.0 - lower_blend_alpha)
+                    cv2_side_rgb.astype(np.float32) * side_blend_alpha
+                    + result_rgb.astype(np.float32) * (1.0 - side_blend_alpha)
                 )
                 result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
+                cv2_post_rgb = cv2_side_rgb
+            elif cv2_front_rgb is not None:
+                cv2_post_rgb = cv2_front_rgb
 
             # 1차 cleanup 뒤에도 side-zone에 남는 작은 dark tuft만 추가로 정리한다.
             residual_gray = result_rgb.mean(axis=2).astype(np.float32)
             residual_u8 = (
-                ((force_mask > 0.38) & (residual_gray < 118.0)).astype(np.uint8) * 255
+                ((side_blend_mask > 0.28) & (residual_gray < 118.0)).astype(np.uint8) * 255
             )
             residual_u8[:lower_blend_top, :] = 0
             residual_u8 = cv2.bitwise_and(residual_u8, corridor)
@@ -3765,11 +3866,17 @@ class MirrAISDPipeline:
                 "pipeline_lama_post_cleanup_result": result_rgb,
                 "lama_post_cleanup_applied": True,
                 "lama_post_cleanup_pixels": force_pixels,
+                "pipeline_short_front_cleanup_mask": front_cleanup_u8.astype(np.float32) / 255.0,
+                "pipeline_short_side_cleanup_mask": side_cleanup_u8.astype(np.float32) / 255.0,
                 "pipeline_short_center_keepout_mask": lower_center_keepout_u8.astype(np.float32) / 255.0,
                 "pipeline_short_residual_cleanup_mask": residual_cleanup_mask,
             }
             if cv2_post_rgb is not None:
                 debug_bundle["pipeline_cv2_post_cleanup_result"] = cv2_post_rgb
+            if cv2_front_rgb is not None:
+                debug_bundle["pipeline_cv2_front_cleanup_result"] = cv2_front_rgb
+            if cv2_side_rgb is not None:
+                debug_bundle["pipeline_cv2_side_cleanup_result"] = cv2_side_rgb
             if residual_cv2_rgb is not None:
                 debug_bundle["pipeline_cv2_residual_cleanup_result"] = residual_cv2_rgb
             return result_rgb, debug_bundle
