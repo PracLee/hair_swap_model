@@ -977,6 +977,52 @@ class MirrAISDPipeline:
         self._lama = SimpleLama()
         logger.info("[SDPipeline] LaMa 로드 완료")
 
+    def _ensure_rgb_image_shape(
+        self,
+        img: np.ndarray,
+        expected_hw: Tuple[int, int],
+        *,
+        context: str,
+    ) -> np.ndarray:
+        """
+        일부 inpainting 백엔드가 stride padding 결과를 원복하지 않고 반환하는 케이스를 방어한다.
+        """
+        expected_h, expected_w = expected_hw
+
+        if img.ndim == 2:
+            img = cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+        elif img.ndim == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8), cv2.COLOR_RGBA2RGB)
+        elif img.ndim == 3 and img.shape[2] == 1:
+            img = np.repeat(np.clip(img, 0, 255).astype(np.uint8), 3, axis=2)
+        elif img.ndim != 3 or img.shape[2] < 3:
+            raise ValueError(f"{context}: unexpected image shape {img.shape}")
+        else:
+            if img.dtype != np.uint8:
+                img = np.clip(img, 0, 255).astype(np.uint8)
+            elif img.shape[2] > 3:
+                img = img[..., :3]
+
+        cur_h, cur_w = img.shape[:2]
+        if (cur_h, cur_w) == (expected_h, expected_w):
+            return img
+
+        delta_h = cur_h - expected_h
+        delta_w = cur_w - expected_w
+        if delta_h >= 0 and delta_w >= 0 and delta_h <= 8 and delta_w <= 8:
+            logger.warning(
+                f"[SDPipeline] {context} shape mismatch → crop to original size: "
+                f"got={(cur_h, cur_w)}, expected={(expected_h, expected_w)}"
+            )
+            return img[:expected_h, :expected_w].copy()
+
+        interpolation = cv2.INTER_AREA if (cur_h > expected_h or cur_w > expected_w) else cv2.INTER_LINEAR
+        logger.warning(
+            f"[SDPipeline] {context} shape mismatch → resize to original size: "
+            f"got={(cur_h, cur_w)}, expected={(expected_h, expected_w)}"
+        )
+        return cv2.resize(img, (expected_w, expected_h), interpolation=interpolation)
+
     def _lama_inpaint(
         self,
         img_rgb: np.ndarray,
@@ -1003,12 +1049,17 @@ class MirrAISDPipeline:
 
         # PIL Image 변환 (simple-lama-inpainting 호환성 보장)
         img_pil = Image.fromarray(img_rgb)
+        expected_hw = img_rgb.shape[:2]
 
         # 작은 마스크 또는 hair-removal 강제 단일 패스는 바로 처리
         if force_single_pass or total_pixels < image_pixels * 0.15:
             mask_pil = Image.fromarray(mask_u8)
             result_pil = self._lama(img_pil, mask_pil)
-            return np.array(result_pil)
+            return self._ensure_rgb_image_shape(
+                np.array(result_pil),
+                expected_hw,
+                context="lama_single_pass",
+            )
 
         # ── Progressive inpainting: 바깥→안쪽 단계적 처리 ──────────────
         # 큰 마스크를 3단계로 나눠서 테두리부터 인페인팅
@@ -1050,7 +1101,11 @@ class MirrAISDPipeline:
             img_pil_stage = Image.fromarray(current_img)
             mask_pil_stage = Image.fromarray(stage_mask)
             result_pil = self._lama(img_pil_stage, mask_pil_stage)
-            current_img = np.array(result_pil)
+            current_img = self._ensure_rgb_image_shape(
+                np.array(result_pil),
+                expected_hw,
+                context=f"lama_progressive_stage_{stage_i + 1}",
+            )
 
             # 처리 완료된 부분 제거
             remaining_mask = np.clip(
@@ -3061,6 +3116,23 @@ class MirrAISDPipeline:
         pad_l, pad_t = pad
         new_w = int(W * scale)
         new_h = int(H * scale)
+
+        if orig_rgb.shape[:2] != (H, W):
+            orig_rgb = self._ensure_rgb_image_shape(
+                orig_rgb,
+                (H, W),
+                context="composite_orig_rgb",
+            )
+        if hair_mask.shape != (H, W):
+            logger.warning(
+                f"[SDPipeline] composite hair_mask shape mismatch → resize: "
+                f"got={hair_mask.shape}, expected={(H, W)}"
+            )
+            hair_mask = cv2.resize(
+                hair_mask.astype(np.float32),
+                (W, H),
+                interpolation=cv2.INTER_LINEAR,
+            )
 
         # letterbox 제거 → 원본 비율로 crop
         gen_np = np.array(gen_pil)   # 512×512×3 RGB

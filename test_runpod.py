@@ -128,7 +128,11 @@ def poll_job(endpoint_id: str, api_key: str, job_id: str) -> dict:
             return output
 
         if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
-            error = data.get("error") or data.get("output", {}).get("error", "")
+            output = data.get("output", {}) or {}
+            error = data.get("error") or output.get("error", "")
+            traceback_text = output.get("traceback")
+            if traceback_text:
+                raise RuntimeError(f"Job {status}: {error}\n{traceback_text}")
             raise RuntimeError(f"Job {status}: {error}")
 
         elapsed = int(TIMEOUT_SEC - (deadline - time.time()))
