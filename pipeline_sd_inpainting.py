@@ -3485,6 +3485,7 @@ class MirrAISDPipeline:
         lower_center_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
         front_cleanup_u8 = np.zeros((H, W), dtype=np.uint8)
         side_cleanup_u8 = np.zeros((H, W), dtype=np.uint8)
+        side_outer_cleanup_u8 = np.zeros((H, W), dtype=np.uint8)
         if hair_length == "short":
             # SegFace miss를 보완하기 위해 side-zone에 한해 high-confidence force를 추가 반영
             center_half = max(18, int(face_w * 0.42))
@@ -3550,6 +3551,7 @@ class MirrAISDPipeline:
             side_panel_fallback_u8 = np.zeros_like(panel_seed_u8)
             front_tail_u8 = np.zeros_like(panel_seed_u8)
             side_tail_u8 = np.zeros_like(panel_seed_u8)
+            side_outer_tail_u8 = np.zeros_like(panel_seed_u8)
             front_zone_u8 = np.zeros_like(panel_seed_u8)
             if int((panel_seed_u8 > 0).sum()) > 0:
                 num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -3610,12 +3612,20 @@ class MirrAISDPipeline:
                         if comp_cx <= cx:
                             tail_x1 = max(0, x - tail_outer_pad_x)
                             tail_x2 = min(W, x + w - tail_inner_inset_x)
+                            outer_x1 = max(0, x - max(14, int(face_w * 0.10)))
+                            outer_x2 = min(W, x + max(6, int(w * 0.52)))
                         else:
                             tail_x1 = max(0, x + tail_inner_inset_x)
                             tail_x2 = min(W, x + w + tail_outer_pad_x)
+                            outer_x1 = max(0, x + min(w - 6, max(6, int(w * 0.48))))
+                            outer_x2 = min(W, x + w + max(14, int(face_w * 0.10)))
                         tail_y1 = min(H, y + max(0, int(h * 0.44)))
                         tail_extra_h = max(42, int(face_h * 0.52))
                         tail_target_u8 = side_tail_u8
+                        outer_y1 = min(H, y + max(0, int(h * 0.34)))
+                        outer_y2 = min(H, y + h + max(46, int(face_h * 0.58)))
+                        if outer_x1 < outer_x2 and outer_y1 < outer_y2:
+                            side_outer_tail_u8[outer_y1:outer_y2, outer_x1:outer_x2] = 255
                     tail_y2 = min(H, y + h + tail_extra_h)
                     if tail_x1 < tail_x2 and tail_y1 < tail_y2:
                         tail_target_u8[tail_y1:tail_y2, tail_x1:tail_x2] = 255
@@ -3675,6 +3685,30 @@ class MirrAISDPipeline:
                         cv2.bitwise_not(lower_center_keepout_u8),
                     )
                     side_panel_fallback_u8 = cv2.bitwise_or(side_panel_fallback_u8, side_tail_u8)
+                if int((side_outer_tail_u8 > 0).sum()) > 0:
+                    side_outer_tail_u8 = cv2.bitwise_and(side_outer_tail_u8, corridor)
+                    side_outer_tail_u8 = cv2.bitwise_and(
+                        side_outer_tail_u8,
+                        cv2.bitwise_not(lower_center_keepout_u8),
+                    )
+                    side_outer_tail_u8 = cv2.morphologyEx(
+                        side_outer_tail_u8,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 19)),
+                    )
+                    side_outer_tail_u8 = cv2.dilate(
+                        side_outer_tail_u8,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 15)),
+                        iterations=1,
+                    )
+                    side_outer_tail_u8 = cv2.bitwise_and(
+                        side_outer_tail_u8,
+                        cv2.bitwise_not(lower_center_keepout_u8),
+                    )
+                    side_outer_cleanup_u8 = cv2.bitwise_or(
+                        side_outer_cleanup_u8,
+                        side_outer_tail_u8,
+                    )
             front_zone_top = min(H, int(cutoff_y + face_h * 0.10))
             front_zone_bottom = min(H, int(cutoff_y + face_h * 1.80))
             front_zone_half = max(20, int(face_w * 0.28))
@@ -3697,6 +3731,7 @@ class MirrAISDPipeline:
             front_cleanup_u8 = cv2.bitwise_or(front_cleanup_u8, front_panel_fallback_u8)
             side_cleanup_u8 = cv2.bitwise_or(side_hair_inter_u8, side_fallback_u8)
             side_cleanup_u8 = cv2.bitwise_or(side_cleanup_u8, side_panel_fallback_u8)
+            side_cleanup_u8 = cv2.bitwise_or(side_cleanup_u8, side_outer_cleanup_u8)
             panel_fallback_u8 = cv2.bitwise_or(front_panel_fallback_u8, side_panel_fallback_u8)
             panel_tail_u8 = cv2.bitwise_or(front_tail_u8, side_tail_u8)
 
@@ -3756,11 +3791,16 @@ class MirrAISDPipeline:
         if hair_length == "short":
             front_blend_mask = front_cleanup_u8.astype(np.float32) / 255.0
             side_blend_mask = side_cleanup_u8.astype(np.float32) / 255.0
+            side_outer_blend_mask = side_outer_cleanup_u8.astype(np.float32) / 255.0
             lower_blend_top = min(H, int(cutoff_y + face_h * 0.12))
             front_blend_mask[:lower_blend_top, :] = 0.0
             side_blend_mask[:lower_blend_top, :] = 0.0
+            side_outer_blend_mask[:lower_blend_top, :] = 0.0
             if int((lower_center_keepout_u8 > 0).sum()) > 0:
                 side_blend_mask = side_blend_mask * (
+                    cv2.bitwise_not(lower_center_keepout_u8).astype(np.float32) / 255.0
+                )
+                side_outer_blend_mask = side_outer_blend_mask * (
                     cv2.bitwise_not(lower_center_keepout_u8).astype(np.float32) / 255.0
                 )
             if int((front_blend_mask > 0.35).sum()) >= 48:
@@ -3803,10 +3843,32 @@ class MirrAISDPipeline:
             elif cv2_front_rgb is not None:
                 cv2_post_rgb = cv2_front_rgb
 
+            if int((side_outer_blend_mask > 0.25).sum()) >= 64:
+                cv2_side_outer_rgb = self._cv2_inpaint_region(
+                    result_rgb,
+                    side_outer_blend_mask,
+                    protect_mask=protect_mask,
+                )
+                side_outer_blend_mask = cv2.GaussianBlur(
+                    np.clip(side_outer_blend_mask, 0.0, 1.0),
+                    (0, 0),
+                    sigmaX=4.5,
+                    sigmaY=4.5,
+                )
+                side_outer_alpha = np.clip(side_outer_blend_mask * 0.22, 0.0, 0.22)[..., np.newaxis]
+                result_rgb = (
+                    cv2_side_outer_rgb.astype(np.float32) * side_outer_alpha
+                    + result_rgb.astype(np.float32) * (1.0 - side_outer_alpha)
+                )
+                result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
+
             # 1차 cleanup 뒤에도 side-zone에 남는 작은 dark tuft만 추가로 정리한다.
             residual_gray = result_rgb.mean(axis=2).astype(np.float32)
             residual_u8 = (
-                ((side_blend_mask > 0.28) & (residual_gray < 118.0)).astype(np.uint8) * 255
+                (
+                    ((side_blend_mask > 0.28) | (side_outer_blend_mask > 0.18))
+                    & (residual_gray < 122.0)
+                ).astype(np.uint8) * 255
             )
             residual_u8[:lower_blend_top, :] = 0
             residual_u8 = cv2.bitwise_and(residual_u8, corridor)
@@ -3868,6 +3930,7 @@ class MirrAISDPipeline:
                 "lama_post_cleanup_pixels": force_pixels,
                 "pipeline_short_front_cleanup_mask": front_cleanup_u8.astype(np.float32) / 255.0,
                 "pipeline_short_side_cleanup_mask": side_cleanup_u8.astype(np.float32) / 255.0,
+                "pipeline_short_side_outer_cleanup_mask": side_outer_cleanup_u8.astype(np.float32) / 255.0,
                 "pipeline_short_center_keepout_mask": lower_center_keepout_u8.astype(np.float32) / 255.0,
                 "pipeline_short_residual_cleanup_mask": residual_cleanup_mask,
             }
