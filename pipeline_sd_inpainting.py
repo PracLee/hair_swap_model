@@ -3535,6 +3535,7 @@ class MirrAISDPipeline:
             panel_seed_u8 = cv2.bitwise_and(panel_seed_u8, panel_zone)
 
             panel_fallback_u8 = np.zeros_like(panel_seed_u8)
+            panel_tail_u8 = np.zeros_like(panel_seed_u8)
             if int((panel_seed_u8 > 0).sum()) > 0:
                 num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
                     panel_seed_u8,
@@ -3555,6 +3556,16 @@ class MirrAISDPipeline:
                     if abs(comp_cx - cx) > face_w * 1.55:
                         continue
                     panel_fallback_u8[labels == label_idx] = 255
+                    # 긴 side panel의 하단 잔존 blob은 원래 component보다 아래에서 남는다.
+                    # 채움 강도는 그대로 두고, tail shape만 더 내려서 cleanup 마스크에 포함한다.
+                    tail_margin_x = max(8, int(w * 0.12))
+                    tail_x1 = max(0, x + tail_margin_x)
+                    tail_x2 = min(W, x + w - tail_margin_x)
+                    tail_y1 = min(H, y + max(0, int(h * 0.56)))
+                    tail_extra_h = max(28, int(face_h * 0.34))
+                    tail_y2 = min(H, y + h + tail_extra_h)
+                    if tail_x1 < tail_x2 and tail_y1 < tail_y2:
+                        panel_tail_u8[tail_y1:tail_y2, tail_x1:tail_x2] = 255
                 if int((panel_fallback_u8 > 0).sum()) > 0:
                     panel_fallback_u8 = cv2.morphologyEx(
                         panel_fallback_u8,
@@ -3566,6 +3577,19 @@ class MirrAISDPipeline:
                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
                         iterations=1,
                     )
+                if int((panel_tail_u8 > 0).sum()) > 0:
+                    panel_tail_u8 = cv2.bitwise_and(panel_tail_u8, corridor)
+                    panel_tail_u8 = cv2.morphologyEx(
+                        panel_tail_u8,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 17)),
+                    )
+                    panel_tail_u8 = cv2.dilate(
+                        panel_tail_u8,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 15)),
+                        iterations=1,
+                    )
+                    panel_fallback_u8 = cv2.bitwise_or(panel_fallback_u8, panel_tail_u8)
 
             force_u8 = cv2.bitwise_or(hair_inter_u8, side_fallback_u8)
             force_u8 = cv2.bitwise_or(force_u8, center_fallback_u8)
@@ -3617,11 +3641,10 @@ class MirrAISDPipeline:
         # 추가 SD refine 없이 LaMa를 기본으로 쓰고,
         # lower panel의 어두운 얼룩만 cv2 inpaint 결과를 약하게 섞어 정리한다.
         result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
-        lama_only_rgb = result_rgb.copy()
         cv2_post_rgb: Optional[np.ndarray] = None
         if hair_length == "short":
             lower_blend_mask = force_mask.copy()
-            lower_blend_top = min(H, int(cutoff_y + face_h * 0.10))
+            lower_blend_top = min(H, int(cutoff_y + face_h * 0.12))
             lower_blend_mask[:lower_blend_top, :] = 0.0
             if int((lower_blend_mask > 0.35).sum()) >= 80:
                 cv2_post_rgb = self._cv2_inpaint_region(
@@ -3629,33 +3652,13 @@ class MirrAISDPipeline:
                     lower_blend_mask,
                     protect_mask=protect_mask,
                 )
-                lower_ramp = np.zeros((H, 1), dtype=np.float32)
-                if lower_blend_top < H:
-                    lower_ramp[lower_blend_top:, 0] = np.linspace(
-                        0.40,
-                        1.0,
-                        H - lower_blend_top,
-                        dtype=np.float32,
-                    )
-                lower_blend_mask = lower_blend_mask * lower_ramp
                 lower_blend_mask = cv2.GaussianBlur(
                     np.clip(lower_blend_mask, 0.0, 1.0),
                     (0, 0),
                     sigmaX=5.0,
                     sigmaY=5.0,
                 )
-                lama_luma = (
-                    0.2126 * lama_only_rgb[..., 0]
-                    + 0.7152 * lama_only_rgb[..., 1]
-                    + 0.0722 * lama_only_rgb[..., 2]
-                ).astype(np.float32)
-                dark_gate = np.clip((118.0 - lama_luma) / 50.0, 0.0, 1.0)
-                dark_gate = cv2.GaussianBlur(dark_gate, (0, 0), sigmaX=5.0, sigmaY=5.0)
-                lower_blend_alpha = np.clip(
-                    lower_blend_mask * (0.24 + 0.24 * dark_gate),
-                    0.0,
-                    0.48,
-                )[..., np.newaxis]
+                lower_blend_alpha = np.clip(lower_blend_mask * 0.42, 0.0, 0.42)[..., np.newaxis]
                 result_rgb = (
                     cv2_post_rgb.astype(np.float32) * lower_blend_alpha
                     + result_rgb.astype(np.float32) * (1.0 - lower_blend_alpha)
@@ -3664,8 +3667,7 @@ class MirrAISDPipeline:
         if return_debug:
             debug_bundle = {
                 "pipeline_lama_post_cleanup_mask": force_mask,
-                "pipeline_lama_post_cleanup_result": lama_only_rgb,
-                "pipeline_post_cleanup_blended_result": result_rgb,
+                "pipeline_lama_post_cleanup_result": result_rgb,
                 "lama_post_cleanup_applied": True,
                 "lama_post_cleanup_pixels": force_pixels,
             }
