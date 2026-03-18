@@ -3482,6 +3482,7 @@ class MirrAISDPipeline:
             hair_now_u8 = cv2.dilate(hair_now_u8, hair_k, iterations=1)
 
         hair_inter_u8 = cv2.bitwise_and(force_u8, hair_now_u8)
+        lower_center_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
         if hair_length == "short":
             # SegFace miss를 보완하기 위해 side-zone에 한해 high-confidence force를 추가 반영
             center_half = max(18, int(face_w * 0.42))
@@ -3536,6 +3537,13 @@ class MirrAISDPipeline:
 
             panel_fallback_u8 = np.zeros_like(panel_seed_u8)
             panel_tail_u8 = np.zeros_like(panel_seed_u8)
+            keepout_top = min(H, int(cutoff_y + face_h * 0.36))
+            keepout_bottom = min(H, int(cutoff_y + face_h * 1.95))
+            keepout_half = max(18, int(face_w * 0.20))
+            lower_center_keepout_u8[
+                keepout_top:keepout_bottom,
+                max(0, cx - keepout_half):min(W, cx + keepout_half),
+            ] = 255
             if int((panel_seed_u8 > 0).sum()) > 0:
                 num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
                     panel_seed_u8,
@@ -3544,6 +3552,10 @@ class MirrAISDPipeline:
                 min_panel_area = max(80, int(face_w * 0.18))
                 min_panel_height = max(42, int(face_h * 0.44))
                 max_panel_width = max(60, int(face_w * 1.18))
+                left_panel_u8 = np.zeros_like(panel_seed_u8)
+                right_panel_u8 = np.zeros_like(panel_seed_u8)
+                left_tail_u8 = np.zeros_like(panel_seed_u8)
+                right_tail_u8 = np.zeros_like(panel_seed_u8)
                 for label_idx in range(1, num_labels):
                     x, y, w, h, area = stats[label_idx]
                     if area < min_panel_area:
@@ -3555,22 +3567,27 @@ class MirrAISDPipeline:
                     comp_cx = x + (w * 0.5)
                     if abs(comp_cx - cx) > face_w * 1.70:
                         continue
-                    panel_fallback_u8[labels == label_idx] = 255
+                    component_mask = (labels == label_idx)
                     # 긴 side panel의 하단 잔존 blob은 원래 component보다 아래에서 남는다.
                     # 채움 강도는 그대로 두고, tail shape만 더 내려서 cleanup 마스크에 포함한다.
                     tail_inner_inset_x = max(6, int(w * 0.12))
                     tail_outer_pad_x = max(10, int(face_w * 0.06))
                     if comp_cx <= cx:
+                        left_panel_u8[component_mask] = 255
                         tail_x1 = max(0, x - tail_outer_pad_x)
                         tail_x2 = min(W, x + w - tail_inner_inset_x)
+                        tail_target_u8 = left_tail_u8
                     else:
+                        right_panel_u8[component_mask] = 255
                         tail_x1 = max(0, x + tail_inner_inset_x)
                         tail_x2 = min(W, x + w + tail_outer_pad_x)
+                        tail_target_u8 = right_tail_u8
                     tail_y1 = min(H, y + max(0, int(h * 0.44)))
                     tail_extra_h = max(42, int(face_h * 0.52))
                     tail_y2 = min(H, y + h + tail_extra_h)
                     if tail_x1 < tail_x2 and tail_y1 < tail_y2:
-                        panel_tail_u8[tail_y1:tail_y2, tail_x1:tail_x2] = 255
+                        tail_target_u8[tail_y1:tail_y2, tail_x1:tail_x2] = 255
+                panel_fallback_u8 = cv2.bitwise_or(left_panel_u8, right_panel_u8)
                 if int((panel_fallback_u8 > 0).sum()) > 0:
                     panel_fallback_u8 = cv2.morphologyEx(
                         panel_fallback_u8,
@@ -3582,8 +3599,13 @@ class MirrAISDPipeline:
                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
                         iterations=1,
                     )
+                panel_tail_u8 = cv2.bitwise_or(left_tail_u8, right_tail_u8)
                 if int((panel_tail_u8 > 0).sum()) > 0:
                     panel_tail_u8 = cv2.bitwise_and(panel_tail_u8, corridor)
+                    panel_tail_u8 = cv2.bitwise_and(
+                        panel_tail_u8,
+                        cv2.bitwise_not(lower_center_keepout_u8),
+                    )
                     panel_tail_u8 = cv2.morphologyEx(
                         panel_tail_u8,
                         cv2.MORPH_CLOSE,
@@ -3593,6 +3615,10 @@ class MirrAISDPipeline:
                         panel_tail_u8,
                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 19)),
                         iterations=1,
+                    )
+                    panel_tail_u8 = cv2.bitwise_and(
+                        panel_tail_u8,
+                        cv2.bitwise_not(lower_center_keepout_u8),
                     )
                     panel_fallback_u8 = cv2.bitwise_or(panel_fallback_u8, panel_tail_u8)
 
@@ -3647,10 +3673,16 @@ class MirrAISDPipeline:
         # lower panel의 어두운 얼룩만 cv2 inpaint 결과를 약하게 섞어 정리한다.
         result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
         cv2_post_rgb: Optional[np.ndarray] = None
+        residual_cv2_rgb: Optional[np.ndarray] = None
+        residual_cleanup_mask = np.zeros((H, W), dtype=np.float32)
         if hair_length == "short":
             lower_blend_mask = force_mask.copy()
             lower_blend_top = min(H, int(cutoff_y + face_h * 0.12))
             lower_blend_mask[:lower_blend_top, :] = 0.0
+            if int((lower_center_keepout_u8 > 0).sum()) > 0:
+                lower_blend_mask = lower_blend_mask * (
+                    cv2.bitwise_not(lower_center_keepout_u8).astype(np.float32) / 255.0
+                )
             if int((lower_blend_mask > 0.35).sum()) >= 80:
                 cv2_post_rgb = self._cv2_inpaint_region(
                     result_rgb,
@@ -3669,15 +3701,77 @@ class MirrAISDPipeline:
                     + result_rgb.astype(np.float32) * (1.0 - lower_blend_alpha)
                 )
                 result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
+
+            # 1차 cleanup 뒤에도 side-zone에 남는 작은 dark tuft만 추가로 정리한다.
+            residual_gray = result_rgb.mean(axis=2).astype(np.float32)
+            residual_u8 = (
+                ((force_mask > 0.38) & (residual_gray < 118.0)).astype(np.uint8) * 255
+            )
+            residual_u8[:lower_blend_top, :] = 0
+            residual_u8 = cv2.bitwise_and(residual_u8, corridor)
+            if int((lower_center_keepout_u8 > 0).sum()) > 0:
+                residual_u8 = cv2.bitwise_and(
+                    residual_u8,
+                    cv2.bitwise_not(lower_center_keepout_u8),
+                )
+            if int((residual_u8 > 0).sum()) > 0:
+                filtered_residual_u8 = np.zeros_like(residual_u8)
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                    residual_u8,
+                    connectivity=8,
+                )
+                min_residual_area = max(24, int(face_w * 0.10))
+                min_residual_height = max(18, int(face_h * 0.18))
+                for label_idx in range(1, num_labels):
+                    _, _, _, h, area = stats[label_idx]
+                    if area < min_residual_area:
+                        continue
+                    if h < min_residual_height:
+                        continue
+                    filtered_residual_u8[labels == label_idx] = 255
+                residual_u8 = filtered_residual_u8
+            if int((residual_u8 > 0).sum()) >= 48:
+                residual_u8 = cv2.morphologyEx(
+                    residual_u8,
+                    cv2.MORPH_CLOSE,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 9)),
+                )
+                residual_u8 = cv2.dilate(
+                    residual_u8,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 7)),
+                    iterations=1,
+                )
+                residual_cleanup_mask = residual_u8.astype(np.float32) / 255.0
+                residual_cv2_rgb = self._cv2_inpaint_region(
+                    result_rgb,
+                    residual_cleanup_mask,
+                    protect_mask=protect_mask,
+                )
+                residual_alpha = cv2.GaussianBlur(
+                    residual_cleanup_mask,
+                    (0, 0),
+                    sigmaX=3.0,
+                    sigmaY=3.0,
+                )
+                residual_alpha = np.clip(residual_alpha * 0.20, 0.0, 0.20)[..., np.newaxis]
+                result_rgb = (
+                    residual_cv2_rgb.astype(np.float32) * residual_alpha
+                    + result_rgb.astype(np.float32) * (1.0 - residual_alpha)
+                )
+                result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
         if return_debug:
             debug_bundle = {
                 "pipeline_lama_post_cleanup_mask": force_mask,
                 "pipeline_lama_post_cleanup_result": result_rgb,
                 "lama_post_cleanup_applied": True,
                 "lama_post_cleanup_pixels": force_pixels,
+                "pipeline_short_center_keepout_mask": lower_center_keepout_u8.astype(np.float32) / 255.0,
+                "pipeline_short_residual_cleanup_mask": residual_cleanup_mask,
             }
             if cv2_post_rgb is not None:
                 debug_bundle["pipeline_cv2_post_cleanup_result"] = cv2_post_rgb
+            if residual_cv2_rgb is not None:
+                debug_bundle["pipeline_cv2_residual_cleanup_result"] = residual_cv2_rgb
             return result_rgb, debug_bundle
         return result_rgb
 
