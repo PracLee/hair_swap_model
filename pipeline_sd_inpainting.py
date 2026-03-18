@@ -3541,9 +3541,9 @@ class MirrAISDPipeline:
                     panel_seed_u8,
                     connectivity=8,
                 )
-                min_panel_area = max(96, int(face_w * 0.22))
+                min_panel_area = max(80, int(face_w * 0.18))
                 min_panel_height = max(42, int(face_h * 0.44))
-                max_panel_width = max(48, int(face_w * 1.05))
+                max_panel_width = max(60, int(face_w * 1.18))
                 for label_idx in range(1, num_labels):
                     x, y, w, h, area = stats[label_idx]
                     if area < min_panel_area:
@@ -3553,16 +3553,17 @@ class MirrAISDPipeline:
                     if w > max_panel_width:
                         continue
                     comp_cx = x + (w * 0.5)
-                    if abs(comp_cx - cx) > face_w * 1.55:
+                    if abs(comp_cx - cx) > face_w * 1.70:
                         continue
                     panel_fallback_u8[labels == label_idx] = 255
                     # 긴 side panel의 하단 잔존 blob은 원래 component보다 아래에서 남는다.
                     # 채움 강도는 그대로 두고, tail shape만 더 내려서 cleanup 마스크에 포함한다.
-                    tail_margin_x = max(8, int(w * 0.12))
-                    tail_x1 = max(0, x + tail_margin_x)
-                    tail_x2 = min(W, x + w - tail_margin_x)
-                    tail_y1 = min(H, y + max(0, int(h * 0.56)))
-                    tail_extra_h = max(28, int(face_h * 0.34))
+                    tail_inset_x = max(2, int(w * 0.04))
+                    tail_pad_x = max(8, int(face_w * 0.05))
+                    tail_x1 = max(0, x - tail_pad_x + tail_inset_x)
+                    tail_x2 = min(W, x + w + tail_pad_x - tail_inset_x)
+                    tail_y1 = min(H, y + max(0, int(h * 0.44)))
+                    tail_extra_h = max(42, int(face_h * 0.52))
                     tail_y2 = min(H, y + h + tail_extra_h)
                     if tail_x1 < tail_x2 and tail_y1 < tail_y2:
                         panel_tail_u8[tail_y1:tail_y2, tail_x1:tail_x2] = 255
@@ -3582,11 +3583,11 @@ class MirrAISDPipeline:
                     panel_tail_u8 = cv2.morphologyEx(
                         panel_tail_u8,
                         cv2.MORPH_CLOSE,
-                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 17)),
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 21)),
                     )
                     panel_tail_u8 = cv2.dilate(
                         panel_tail_u8,
-                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 15)),
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 19)),
                         iterations=1,
                     )
                     panel_fallback_u8 = cv2.bitwise_or(panel_fallback_u8, panel_tail_u8)
