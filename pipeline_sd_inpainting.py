@@ -289,6 +289,20 @@ class MirrAISDPipeline:
                 return
             debug_images_common[name] = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
 
+        def _store_debug_bundle(bundle: Optional[Dict[str, Any]]) -> None:
+            if not bundle:
+                return
+            for name, value in bundle.items():
+                if value is None:
+                    continue
+                if isinstance(value, np.ndarray):
+                    if value.ndim == 2:
+                        _store_mask(name, value.astype(np.float32))
+                    elif value.ndim == 3 and value.shape[2] == 3:
+                        _store_rgb(name, value.astype(np.uint8))
+                elif debug_data_common is not None and isinstance(value, (bool, int, float, str)):
+                    debug_data_common[name] = value
+
         if debug_images_common is not None:
             debug_images_common["pipeline_input_image"] = image.copy()
 
@@ -455,7 +469,8 @@ class MirrAISDPipeline:
             _store_mask("pipeline_short_generation_mask", gen_mask)
 
             preclean_seed_mask = long_hair_mask.copy()
-            preclean_seed_mask[:cutoff_y, :] = 0.0
+            preclean_top = max(0, int(cutoff_y - face_h * 0.03))
+            preclean_seed_mask[:preclean_top, :] = 0.0
             preclean_mask_for_input = preclean_seed_mask.copy()
             if self.config.enable_two_step_preclean:
                 preclean_mask_for_input = self._build_preclean_mask_for_two_step(
@@ -479,11 +494,17 @@ class MirrAISDPipeline:
                 preclean_seed = int(seeds[0]) ^ 0x5A5A5A5A
                 preclean_seed &= 0x7FFFFFFF
                 face_crop_preclean = self._crop_face(Image.fromarray(img_rgb), face_bbox)
+                preclean_debug: Dict[str, Any] = {
+                    "pipeline_lama_preclean_mask": (np.clip(preclean_mask_for_input, 0.0, 1.0) > 0.35).astype(np.float32),
+                    "lama_preclean_pixels": preclean_pixels,
+                }
                 try:
                     img_rgb_preclean = self._lama_inpaint(
                         img_rgb,
                         (np.clip(preclean_mask_for_input, 0.0, 1.0) > 0.35).astype(np.uint8) * 255,
                     )
+                    preclean_debug["lama_preclean_method"] = "lama"
+                    preclean_debug["pipeline_lama_preclean_result"] = img_rgb_preclean
                 except Exception as e:
                     logger.warning(f"[SDPipeline] hybrid LaMa preclean 실패 → cv2 fallback: {e}")
                     img_rgb_preclean = self._cv2_inpaint_region(
@@ -491,6 +512,9 @@ class MirrAISDPipeline:
                         preclean_mask_for_input,
                         protect_mask=face_region_mask,
                     )
+                    preclean_debug["lama_preclean_method"] = "cv2_fallback"
+                    preclean_debug["pipeline_cv2_preclean_result"] = img_rgb_preclean
+                _store_debug_bundle(preclean_debug)
                 if str(self.config.bg_fill_mode).lower() == "sd":
                     img_rgb_cleaned = self._sd_preclean_long_hair_region(
                         img_rgb_preclean,
@@ -582,21 +606,34 @@ class MirrAISDPipeline:
             ):
                 try:
                     post_rgb = cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)
-                    post_rgb = self._final_cutoff_cleanup(
+                    post_debug_enabled = debug_images_common is not None and gen_idx == 0
+                    post_cleanup = self._final_cutoff_cleanup(
                         post_rgb,
                         face_bbox=face_bbox,
                         removal_mask=removal_mask_for_post,
                         cutoff_y=cutoff_y_for_post,
                         shoulder_protect=shoulder_protect_for_post,
                         hair_length=hair_length,
+                        return_debug=post_debug_enabled,
                     )
-                    post_rgb = self._remove_residual_hair_below_cutoff(
+                    if post_debug_enabled:
+                        post_rgb, post_cleanup_debug = post_cleanup
+                        _store_debug_bundle(post_cleanup_debug)
+                    else:
+                        post_rgb = post_cleanup
+                    residual_cleanup = self._remove_residual_hair_below_cutoff(
                         post_rgb,
                         face_bbox=face_bbox,
                         cutoff_y=cutoff_y_for_post,
                         shoulder_protect=shoulder_protect_for_post,
                         hair_length=hair_length,
+                        return_debug=post_debug_enabled,
                     )
+                    if post_debug_enabled:
+                        post_rgb, residual_cleanup_debug = residual_cleanup
+                        _store_debug_bundle(residual_cleanup_debug)
+                    else:
+                        post_rgb = residual_cleanup
                     composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
                 except Exception as e:
                     logger.warning(f"[SDPipeline] short/medium 잔여물 cleanup 실패(무시): {e}")
@@ -1688,16 +1725,18 @@ class MirrAISDPipeline:
             pos_suffix = (
                 ", short chin-length bob, soft layered ends, feathered tapered tips, "
                 "natural uneven hairline near jaw, clear neckline, visible neck, "
+                "hair ends stop around jawline, does not touch shoulders, "
                 "mostly above jawline with a few natural wispy strands"
             )
             neg_prefix = (
                 "very long hair, flowing long hair, hair below shoulders, "
+                "hair below chin, hair touching shoulders, hair covering chest, "
                 "waist-length hair, side long locks over chest, "
                 "blunt horizontal cut line, helmet hair, bowl-shaped edge, "
                 "earrings, earring, dangling earrings, hoop earrings, pearl earrings, "
                 "jewelry, necklace, pendant, choker, accessories, piercings, "
             )
-            guidance = 9.4
+            guidance = 9.8
         elif hair_length == "medium":
             pos_suffix = (
                 ", medium length hair, shoulder-length hair, "
@@ -1759,8 +1798,8 @@ class MirrAISDPipeline:
         # 숏컷/중단발 변환 시 IP-Adapter scale을 낮춤
         # → 원본 긴머리 identity가 생성에 과도하게 영향주는 것 방지
         if hair_length == "short":
-            ip_scale = 0.05
-            control_scale = min(self.config.controlnet_conditioning_scale, 0.12)
+            ip_scale = 0.0
+            control_scale = min(self.config.controlnet_conditioning_scale, 0.08)
         elif hair_length == "medium":
             ip_scale = 0.18
             control_scale = min(self.config.controlnet_conditioning_scale, 0.20)
@@ -1961,19 +2000,10 @@ class MirrAISDPipeline:
             corridor_u8[:, x_min:x_max] = 255
             preclean_u8 = cv2.bitwise_and(preclean_u8, corridor_u8)
 
-        # 목 바로 아래는 hair 제거를 허용하고, 더 아래 torso 중앙만 carve-out 한다.
-        center_half = max(18, int(face_w * (0.24 if hair_length == "short" else 0.22)))
-        center_top = min(H, int(cutoff_y + face_h * (0.32 if hair_length == "short" else 0.42)))
-        center_bottom = min(H, int(cutoff_y + face_h * (1.00 if hair_length == "short" else 1.20)))
-        center_cut = np.zeros((H, W), dtype=np.uint8)
-        center_cut[center_top:center_bottom, max(0, cx - center_half):min(W, cx + center_half)] = 255
-        preclean_u8 = cv2.bitwise_and(preclean_u8, cv2.bitwise_not(center_cut))
-
         # 옷 경계 쪽 잔머리는 조금 더 포함하되, side corridor 안에서만 넓힌다.
         if cloth_mask is not None and cloth_mask.shape == (H, W):
             cloth_u8 = (np.clip(cloth_mask, 0.0, 1.0) > 0.18).astype(np.uint8) * 255
             cloth_u8 = cv2.bitwise_and(cloth_u8, corridor_u8)
-            cloth_u8 = cv2.bitwise_and(cloth_u8, cv2.bitwise_not(center_cut))
             cloth_u8[:top_y, :] = 0
             if int((cloth_u8 > 0).sum()) > 20:
                 cloth_band = cv2.dilate(
@@ -1991,6 +2021,40 @@ class MirrAISDPipeline:
                 )
                 cloth_band = cv2.bitwise_and(cloth_band, base_support)
                 preclean_u8 = cv2.bitwise_or(preclean_u8, cloth_band)
+
+        # neck/upper-chest band에서는 좌우 hair blob 사이를 메워
+        # 중앙 아래로 내려온 긴머리 스트랜드도 같이 지운다.
+        bridge_bottom = min(H, int(cutoff_y + face_h * (0.64 if hair_length == "short" else 0.82)))
+        bridge_fill = np.zeros((H, W), dtype=np.uint8)
+        gap_limit = int(face_w * (0.72 if hair_length == "short" else 0.86))
+        for row_y in range(top_y, bridge_bottom):
+            row = preclean_u8[row_y, :] > 0
+            left = np.flatnonzero(row[:cx])
+            right = np.flatnonzero(row[cx:])
+            if left.size == 0 or right.size == 0:
+                continue
+            left_inner = int(left.max())
+            right_inner = int(cx + right.min())
+            if 0 < (right_inner - left_inner) <= gap_limit:
+                bridge_fill[row_y, left_inner:right_inner + 1] = 255
+        if int((bridge_fill > 0).sum()) > 0:
+            bridge_fill = cv2.dilate(
+                bridge_fill,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+                iterations=1,
+            )
+            preclean_u8 = cv2.bitwise_or(preclean_u8, bridge_fill)
+
+        # torso 중앙 보호는 더 아래쪽에서만 얇게 적용한다.
+        center_half = max(12, int(face_w * (0.14 if hair_length == "short" else 0.18)))
+        center_top = min(H, int(cutoff_y + face_h * (0.78 if hair_length == "short" else 0.90)))
+        center_bottom = min(H, int(cutoff_y + face_h * (1.28 if hair_length == "short" else 1.42)))
+        center_cut = np.zeros((H, W), dtype=np.uint8)
+        center_cut[
+            center_top:center_bottom,
+            max(0, cx - center_half):min(W, cx + center_half),
+        ] = 255
+        preclean_u8 = cv2.bitwise_and(preclean_u8, cv2.bitwise_not(center_cut))
 
         close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
         preclean_u8 = cv2.morphologyEx(preclean_u8, cv2.MORPH_CLOSE, close_k)
@@ -2169,7 +2233,8 @@ class MirrAISDPipeline:
         cutoff_y: int,
         shoulder_protect: Optional[np.ndarray] = None,
         hair_length: str = "short",
-    ) -> np.ndarray:
+        return_debug: bool = False,
+    ) -> Any:
         """
         short/medium 변환 후 cutoff 아래에 남은 머리카락을 재검출해 정리.
         """
@@ -2190,12 +2255,12 @@ class MirrAISDPipeline:
         residual_u8 = cv2.morphologyEx(residual_u8, cv2.MORPH_OPEN, open_k)
 
         if shoulder_protect is not None and shoulder_protect.shape == (H, W):
-            protect_threshold = 0.72 if hair_length == "short" else 0.34
+            protect_threshold = 0.84 if hair_length == "short" else 0.34
             protect_u8 = (shoulder_protect > protect_threshold).astype(np.uint8) * 255
             if hair_length == "short" and int((protect_u8 > 0).sum()) > 0:
                 protect_u8 = cv2.erode(
                     protect_u8,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
                     iterations=1,
                 )
             if int((protect_u8 > 0).sum()) > 0:
@@ -2211,14 +2276,28 @@ class MirrAISDPipeline:
             residual_soft = (residual_u8.astype(np.float32) / 255.0) * ramp[:, np.newaxis]
             residual_u8 = (residual_soft > 0.50).astype(np.uint8) * 255
 
+        residual_mask = residual_u8.astype(np.float32) / 255.0
         if int((residual_u8 > 0).sum()) < 60:
+            if return_debug:
+                return img_rgb, {
+                    "pipeline_lama_residual_mask": residual_mask,
+                    "lama_residual_applied": False,
+                }
             return img_rgb
 
         dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
         residual_u8 = cv2.dilate(residual_u8, dilate_k, iterations=1)
+        residual_mask = residual_u8.astype(np.float32) / 255.0
 
         # LaMa로 잔존 hair 영역 제거
-        return self._lama_inpaint(img_rgb, residual_u8)
+        result_rgb = self._lama_inpaint(img_rgb, residual_u8)
+        if return_debug:
+            return result_rgb, {
+                "pipeline_lama_residual_mask": residual_mask,
+                "pipeline_lama_residual_result": result_rgb,
+                "lama_residual_applied": True,
+            }
+        return result_rgb
 
     def _final_cutoff_cleanup(
         self,
@@ -2228,12 +2307,18 @@ class MirrAISDPipeline:
         cutoff_y: int,
         shoulder_protect: Optional[np.ndarray] = None,
         hair_length: str = "short",
-    ) -> np.ndarray:
+        return_debug: bool = False,
+    ) -> Any:
         """
         최종 결과에서 cutoff 아래 long-hair 제거 마스크 영역을 한 번 더 정리.
         """
         H, W = img_rgb.shape[:2]
         if removal_mask.shape != (H, W):
+            if return_debug:
+                return img_rgb, {
+                    "pipeline_lama_post_cleanup_mask": np.zeros((H, W), dtype=np.float32),
+                    "lama_post_cleanup_applied": False,
+                }
             return img_rgb
 
         x1, y1, x2, y2 = face_bbox
@@ -2293,19 +2378,25 @@ class MirrAISDPipeline:
             force_u8 = cv2.bitwise_or(hair_inter_u8, fallback_u8)
 
         if shoulder_protect is not None and shoulder_protect.shape == (H, W):
-            protect_threshold = 0.72 if hair_length == "short" else 0.34
+            protect_threshold = 0.84 if hair_length == "short" else 0.34
             protect_u8 = (shoulder_protect > protect_threshold).astype(np.uint8) * 255
             if hair_length == "short" and int((protect_u8 > 0).sum()) > 0:
                 protect_u8 = cv2.erode(
                     protect_u8,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
                     iterations=1,
                 )
             if int((protect_u8 > 0).sum()) > 0:
                 force_u8 = cv2.bitwise_and(force_u8, cv2.bitwise_not(protect_u8))
 
         min_cleanup_px = 28 if hair_length == "short" else 40
+        force_mask = force_u8.astype(np.float32) / 255.0
         if int((force_u8 > 0).sum()) < min_cleanup_px:
+            if return_debug:
+                return img_rgb, {
+                    "pipeline_lama_post_cleanup_mask": force_mask,
+                    "lama_post_cleanup_applied": False,
+                }
             return img_rgb
 
         k = cv2.getStructuringElement(
@@ -2313,9 +2404,17 @@ class MirrAISDPipeline:
             (9, 9) if hair_length == "short" else (7, 7),
         )
         force_u8 = cv2.dilate(force_u8, k, iterations=1)
+        force_mask = force_u8.astype(np.float32) / 255.0
 
         # LaMa로 잔존 hair 제거
-        return self._lama_inpaint(img_rgb, force_u8)
+        result_rgb = self._lama_inpaint(img_rgb, force_u8)
+        if return_debug:
+            return result_rgb, {
+                "pipeline_lama_post_cleanup_mask": force_mask,
+                "pipeline_lama_post_cleanup_result": result_rgb,
+                "lama_post_cleanup_applied": True,
+            }
+        return result_rgb
 
     # ──────────────────────────────────────────────────────────────────────────
     # Compositing
