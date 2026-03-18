@@ -3617,10 +3617,11 @@ class MirrAISDPipeline:
         # 추가 SD refine 없이 LaMa를 기본으로 쓰고,
         # lower panel의 어두운 얼룩만 cv2 inpaint 결과를 약하게 섞어 정리한다.
         result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
+        lama_only_rgb = result_rgb.copy()
         cv2_post_rgb: Optional[np.ndarray] = None
         if hair_length == "short":
             lower_blend_mask = force_mask.copy()
-            lower_blend_top = min(H, int(cutoff_y + face_h * 0.12))
+            lower_blend_top = min(H, int(cutoff_y + face_h * 0.08))
             lower_blend_mask[:lower_blend_top, :] = 0.0
             if int((lower_blend_mask > 0.35).sum()) >= 80:
                 cv2_post_rgb = self._cv2_inpaint_region(
@@ -3628,13 +3629,22 @@ class MirrAISDPipeline:
                     lower_blend_mask,
                     protect_mask=protect_mask,
                 )
+                lower_ramp = np.zeros((H, 1), dtype=np.float32)
+                if lower_blend_top < H:
+                    lower_ramp[lower_blend_top:, 0] = np.linspace(
+                        0.55,
+                        1.0,
+                        H - lower_blend_top,
+                        dtype=np.float32,
+                    )
+                lower_blend_mask = lower_blend_mask * lower_ramp
                 lower_blend_mask = cv2.GaussianBlur(
                     np.clip(lower_blend_mask, 0.0, 1.0),
                     (0, 0),
                     sigmaX=5.0,
                     sigmaY=5.0,
                 )
-                lower_blend_alpha = np.clip(lower_blend_mask * 0.42, 0.0, 0.42)[..., np.newaxis]
+                lower_blend_alpha = np.clip(lower_blend_mask * 0.58, 0.0, 0.58)[..., np.newaxis]
                 result_rgb = (
                     cv2_post_rgb.astype(np.float32) * lower_blend_alpha
                     + result_rgb.astype(np.float32) * (1.0 - lower_blend_alpha)
@@ -3643,7 +3653,8 @@ class MirrAISDPipeline:
         if return_debug:
             debug_bundle = {
                 "pipeline_lama_post_cleanup_mask": force_mask,
-                "pipeline_lama_post_cleanup_result": result_rgb,
+                "pipeline_lama_post_cleanup_result": lama_only_rgb,
+                "pipeline_post_cleanup_blended_result": result_rgb,
                 "lama_post_cleanup_applied": True,
                 "lama_post_cleanup_pixels": force_pixels,
             }
