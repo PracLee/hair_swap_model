@@ -2018,35 +2018,41 @@ class MirrAISDPipeline:
         mask_edge_suppression: float = 1.0,  # 0.0=엣지 보존, 1.0=마스크 내부 엣지 완전 제거
         canny_suppress_mask: Optional[np.ndarray] = None,  # H×W float32 — 이 영역의 canny edge도 제거
         canny_suppress_kernel_size: int = 15,
+        target_size: int = SD_SIZE,
     ) -> Tuple[Image.Image, Image.Image, Image.Image, float, Tuple[int, int]]:
         """
-        Letter-box resize → 512×512.
+        Letter-box resize → target_size×target_size.
 
         Args:
             canny_suppress_mask: short/medium에서 사용. 기존 long-hair 영역의 canny edge를
                                  추가로 제거하여 ControlNet이 원본 긴머리 윤곽을 따라가지 않게 함.
 
         Returns:
-            img_512:    PIL RGB 512×512 (full image)
-            mask_512:   PIL L  512×512 (흰색=inpaint)
-            canny_512:  PIL RGB 512×512 (ControlNet conditioning)
+            img_512:    PIL RGB target_size×target_size (full image)
+            mask_512:   PIL L  target_size×target_size (흰색=inpaint)
+            canny_512:  PIL RGB target_size×target_size (ControlNet conditioning)
             scale:      resize 비율
             pad:        (pad_left, pad_top) pixels
         """
+        target_size = max(64, int(target_size))
+        if target_size % 8 != 0:
+            target_size -= target_size % 8
+            target_size = max(64, target_size)
         H, W = img_rgb.shape[:2]
-        scale = SD_SIZE / max(H, W)
-        new_w, new_h = int(W * scale), int(H * scale)
-        pad_l = (SD_SIZE - new_w) // 2
-        pad_t = (SD_SIZE - new_h) // 2
+        scale = target_size / max(H, W)
+        new_w = max(1, int(round(W * scale)))
+        new_h = max(1, int(round(H * scale)))
+        pad_l = (target_size - new_w) // 2
+        pad_t = (target_size - new_h) // 2
 
         # ── image letterbox
         img_rs = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        canvas = np.zeros((SD_SIZE, SD_SIZE, 3), dtype=np.uint8)
+        canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
         canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = img_rs
 
         # ── mask letterbox
         msk_rs = cv2.resize(hair_mask, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        msk_canvas = np.zeros((SD_SIZE, SD_SIZE), dtype=np.float32)
+        msk_canvas = np.zeros((target_size, target_size), dtype=np.float32)
         msk_canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = msk_rs
 
         # ── Canny edge
@@ -2061,7 +2067,7 @@ class MirrAISDPipeline:
         # → LaMa 잔여 블러 윤곽이 ControlNet에 전달되지 않음
         if canny_suppress_mask is not None:
             sup_rs = cv2.resize(canny_suppress_mask, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            sup_canvas = np.zeros((SD_SIZE, SD_SIZE), dtype=np.float32)
+            sup_canvas = np.zeros((target_size, target_size), dtype=np.float32)
             sup_canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = sup_rs
             # dilate: 경계 blur 잔여물까지 제거
             k_sup_size = max(3, int(canny_suppress_kernel_size))
@@ -2733,6 +2739,82 @@ class MirrAISDPipeline:
         logger.info(f"[SDPipeline] 배치 생성 완료 → {len(images)}장")
         return images
 
+    def _build_lower_panel_cleanup_roi(
+        self,
+        removal_mask: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        cutoff_y: int,
+        shoulder_protect: Optional[np.ndarray] = None,
+    ) -> Optional[Tuple[slice, slice, Tuple[int, int, int, int], Dict[str, Any]]]:
+        """
+        lower-panel cleanup용 ROI를 계산한다.
+        목 아래 긴 패널 영역만 crop해 post-cleanup SD 비용과 영향 범위를 줄인다.
+        """
+        H, W = removal_mask.shape[:2]
+        if removal_mask.shape != (H, W):
+            return None
+
+        force_u8 = (np.clip(removal_mask, 0.0, 1.0) > 0.50).astype(np.uint8) * 255
+        if int((force_u8 > 0).sum()) < 40:
+            return None
+
+        ys, xs = np.where(force_u8 > 0)
+        if ys.size == 0 or xs.size == 0:
+            return None
+
+        x1, y1, x2, y2 = face_bbox
+        face_w = max(int(x2 - x1), 1)
+        face_h = max(int(y2 - y1), 1)
+
+        crop_x1 = max(0, int(xs.min()) - max(24, int(face_w * 0.30)))
+        crop_x2 = min(W, int(xs.max()) + 1 + max(24, int(face_w * 0.30)))
+        crop_y1 = max(
+            0,
+            min(
+                int(np.clip(cutoff_y - face_h * 0.08, 0, H - 1)),
+                int(ys.min()) - max(12, int(face_h * 0.05)),
+            ),
+        )
+        crop_y2 = min(
+            H,
+            max(
+                int(ys.max()) + 1 + max(28, int(face_h * 0.42)),
+                int(np.clip(cutoff_y + face_h * 1.30, 0, H)),
+            ),
+        )
+
+        if shoulder_protect is not None and shoulder_protect.shape == (H, W):
+            shoulder_u8 = (np.clip(shoulder_protect, 0.0, 1.0) > 0.24).astype(np.uint8) * 255
+            shoulder_ys, shoulder_xs = np.where(shoulder_u8 > 0)
+            if shoulder_ys.size > 0 and shoulder_xs.size > 0:
+                crop_x1 = max(0, min(crop_x1, int(shoulder_xs.min()) - 12))
+                crop_x2 = min(W, max(crop_x2, int(shoulder_xs.max()) + 13))
+                crop_y2 = min(H, max(crop_y2, int(shoulder_ys.max()) + 13))
+
+        if crop_x2 - crop_x1 < 64 or crop_y2 - crop_y1 < 64:
+            return None
+
+        local_face_bbox = (
+            int(np.clip(x1 - crop_x1, 0, crop_x2 - crop_x1 - 1)),
+            int(np.clip(y1 - crop_y1, 0, crop_y2 - crop_y1 - 1)),
+            int(np.clip(x2 - crop_x1, 1, crop_x2 - crop_x1)),
+            int(np.clip(y2 - crop_y1, 1, crop_y2 - crop_y1)),
+        )
+        debug = {
+            "post_cleanup_roi_bbox": {
+                "x1": crop_x1,
+                "y1": crop_y1,
+                "x2": crop_x2,
+                "y2": crop_y2,
+            }
+        }
+        return (
+            slice(crop_y1, crop_y2),
+            slice(crop_x1, crop_x2),
+            local_face_bbox,
+            debug,
+        )
+
     def _sd_refine_removed_region(
         self,
         base_rgb: np.ndarray,          # H×W×3 RGB (cv2 inpaint 1차 결과)
@@ -2743,6 +2825,7 @@ class MirrAISDPipeline:
         cloth_mask: Optional[np.ndarray],    # H×W float32 (의상 영역)
         hair_length: str,
         seed: int,
+        target_size: int = SD_SIZE,
     ) -> np.ndarray:
         """
         긴머리 제거 후 남는 어색한 영역(목/어깨/배경)을 SD로 한 번 더 정리.
@@ -2753,11 +2836,13 @@ class MirrAISDPipeline:
 
         # removal 영역 중심으로만 SD를 적용하기 위해 그대로 letterbox 변환
         fill_mask = (removal_mask > 0.5).astype(np.float32)
+        fill_edge_suppress = 0.24 if hair_length == "short" else 0.45
         img_512, mask_512, canny_512, scale, pad = self._prepare_sd_inputs(
             base_rgb,
             fill_mask,
-            mask_edge_suppression=0.45,
+            mask_edge_suppression=fill_edge_suppress,
             canny_suppress_mask=fill_mask,
+            target_size=target_size,
         )
 
         if hair_length == "short":
@@ -2790,9 +2875,9 @@ class MirrAISDPipeline:
         self._sd_pipe.set_ip_adapter_scale(0.0)
         generator = torch.Generator(device=self.device).manual_seed(int(seed))
         if hair_length == "short":
-            fill_control = float(np.clip(self.config.controlnet_conditioning_scale * 0.32, 0.04, 0.10))
-            fill_steps = max(28, self.config.num_inference_steps)
-            fill_strength = 0.94
+            fill_control = float(np.clip(self.config.controlnet_conditioning_scale * 0.18, 0.03, 0.07))
+            fill_steps = 18
+            fill_strength = 0.86
         else:
             fill_control = float(np.clip(max(self.config.controlnet_conditioning_scale, 0.18), 0.12, 0.30))
             fill_steps = max(24, self.config.num_inference_steps - 4)
@@ -2806,8 +2891,8 @@ class MirrAISDPipeline:
                 mask_image=mask_512,
                 control_image=canny_512,
                 ip_adapter_image=[face_crop_pil],
-                height=SD_SIZE,
-                width=SD_SIZE,
+                height=target_size,
+                width=target_size,
                 num_inference_steps=fill_steps,
                 guidance_scale=fill_guidance,
                 controlnet_conditioning_scale=fill_control,
@@ -2820,8 +2905,8 @@ class MirrAISDPipeline:
 
         # letterbox 역변환
         pad_l, pad_t = pad
-        new_w = int(W * scale)
-        new_h = int(H * scale)
+        new_w = max(1, int(round(W * scale)))
+        new_h = max(1, int(round(H * scale)))
         gen_cropped = gen_np[pad_t:pad_t + new_h, pad_l:pad_l + new_w]
         gen_orig = cv2.resize(gen_cropped, (W, H), interpolation=cv2.INTER_LANCZOS4)
 
@@ -3479,6 +3564,7 @@ class MirrAISDPipeline:
         # 2차: short에서는 SD refine로 neckline/cloth texture를 다시 정리한다.
         result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
         sd_cleanup_applied = False
+        roi_debug: Dict[str, Any] = {}
         if (
             hair_length == "short"
             and face_crop_pil is not None
@@ -3487,21 +3573,48 @@ class MirrAISDPipeline:
         ):
             refine_seed = (int(seed) ^ 0x13579BDF) & 0x7FFFFFFF
             try:
-                result_rgb = self._sd_refine_removed_region(
-                    result_rgb,
+                roi_info = self._build_lower_panel_cleanup_roi(
                     force_mask,
                     face_bbox=face_bbox,
-                    face_crop_pil=face_crop_pil,
-                    protect_mask=protect_mask,
-                    cloth_mask=cloth_mask,
-                    hair_length=hair_length,
-                    seed=refine_seed,
+                    cutoff_y=cutoff_y,
+                    shoulder_protect=shoulder_protect,
                 )
-                sd_cleanup_applied = True
+                if roi_info is not None:
+                    roi_y, roi_x, roi_face_bbox, roi_meta = roi_info
+                    roi_input_rgb = result_rgb[roi_y, roi_x].copy()
+                    roi_mask = force_mask[roi_y, roi_x].copy()
+                    roi_protect = None
+                    roi_cloth = None
+                    if protect_mask is not None and protect_mask.shape == (H, W):
+                        roi_protect = protect_mask[roi_y, roi_x].copy()
+                    if cloth_mask is not None and cloth_mask.shape == (H, W):
+                        roi_cloth = cloth_mask[roi_y, roi_x].copy()
+
+                    roi_result = self._sd_refine_removed_region(
+                        roi_input_rgb,
+                        roi_mask,
+                        face_bbox=roi_face_bbox,
+                        face_crop_pil=face_crop_pil,
+                        protect_mask=roi_protect,
+                        cloth_mask=roi_cloth,
+                        hair_length=hair_length,
+                        seed=refine_seed,
+                        target_size=384,
+                    )
+                    result_rgb = result_rgb.copy()
+                    result_rgb[roi_y, roi_x] = roi_result
+                    sd_cleanup_applied = True
+                    roi_debug = {
+                        **roi_meta,
+                        "pipeline_post_cleanup_roi_input_rgb": roi_input_rgb,
+                        "pipeline_post_cleanup_roi_result_rgb": roi_result,
+                        "pipeline_post_cleanup_roi_mask": roi_mask,
+                    }
             except Exception as e:
                 logger.warning(f"[SDPipeline] short post SD cleanup 실패, LaMa 결과 유지: {e}")
         if return_debug:
             return result_rgb, {
+                **roi_debug,
                 "pipeline_lama_post_cleanup_mask": force_mask,
                 "pipeline_lama_post_cleanup_result": result_rgb,
                 "lama_post_cleanup_applied": True,
