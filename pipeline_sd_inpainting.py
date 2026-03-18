@@ -330,6 +330,12 @@ class MirrAISDPipeline:
         _store_mask("segface_hair_mask", hair_mask_base)
         _store_mask("segface_face_region_mask", face_region_mask)
         _store_mask("segface_cloth_mask", cloth_mask)
+        feature_protect_mask = self._build_feature_protect_mask(
+            face_region_mask,
+            face_bbox=face_bbox,
+            landmarks_px=mesh_px,
+        )
+        _store_mask("pipeline_face_feature_protect_mask", feature_protect_mask)
 
         # ── Step 3: SAM2 refinement ───────────────────────────────────────────
         hair_mask, mask_source = self._refine_with_sam2(
@@ -349,7 +355,7 @@ class MirrAISDPipeline:
         logger.info(f"[SDPipeline] 헤어 길이 분류: {hair_length}")
 
         # ── Step 3-c: SegFace 얼굴 픽셀 제거 (bbox 직사각형 대신 픽셀 단위 보정) ─
-        hair_mask = np.clip(hair_mask - face_region_mask, 0.0, 1.0)
+        hair_mask = np.clip(hair_mask - feature_protect_mask, 0.0, 1.0)
         # short/medium 긴머리 제거 단계에서는 "옷 위로 떨어진 머리카락"도 지워야 하므로
         # cloth 제거 전 마스크를 별도로 보관한다.
         hair_mask_for_removal = hair_mask.copy()
@@ -407,7 +413,7 @@ class MirrAISDPipeline:
 
             # removal_mask_for_post = 기존 긴 머리 전체에서 새 short 영역 후보를 뺀 잔여물 마스크
             # 옷 위로 떨어진 머리카락도 지워야 하므로 cloth는 여기서 빼지 않는다.
-            long_hair_mask = np.clip(hair_mask_for_removal - face_region_mask, 0.0, 1.0)
+            long_hair_mask = np.clip(hair_mask_for_removal - feature_protect_mask, 0.0, 1.0)
 
             # gen_mask = 기존 헤어 상단 + 얼굴 주변 corridor를 합쳐 새 단발이 생성될 영역만 열어 준다.
             # 직사각형 전체 head box를 쓰면 배경 패치가 같이 생겨 사각형 artifact가 남기 쉽다.
@@ -450,7 +456,7 @@ class MirrAISDPipeline:
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
             )
             gen_mask = (gen_u8 > 0).astype(np.float32)
-            gen_mask = np.clip(gen_mask - face_region_mask, 0.0, 1.0)
+            gen_mask = np.clip(gen_mask - feature_protect_mask, 0.0, 1.0)
             if shoulder_protect_for_post is not None and shoulder_protect_for_post.shape == (H, W):
                 gen_mask = np.clip(gen_mask - (shoulder_protect_for_post * 0.55), 0.0, 1.0)
 
@@ -511,7 +517,7 @@ class MirrAISDPipeline:
                     img_rgb_preclean = self._cv2_inpaint_region(
                         img_rgb,
                         preclean_mask_for_input,
-                        protect_mask=face_region_mask,
+                        protect_mask=feature_protect_mask,
                     )
                     preclean_debug["lama_preclean_method"] = "cv2_fallback"
                     preclean_debug["pipeline_cv2_preclean_result"] = img_rgb_preclean
@@ -522,7 +528,7 @@ class MirrAISDPipeline:
                         preclean_mask_for_input,
                         face_bbox=face_bbox,
                         face_crop_pil=face_crop_preclean,
-                        protect_mask=face_region_mask,
+                        protect_mask=feature_protect_mask,
                         hair_length=hair_length,
                         seed=preclean_seed,
                     )
@@ -596,7 +602,7 @@ class MirrAISDPipeline:
             composited_bgr = self._composite(
                 composite_base_bgr, composite_base_rgb,
                 gen_pil, hair_mask_for_sd, scale, pad, (W, H),
-                protect_mask=face_region_mask,   # 얼굴 영역 alpha 침범 방지
+                protect_mask=feature_protect_mask,   # 얼굴/귀/눈썹 영역 alpha 침범 방지
                 hair_length=hair_length,
             )
 
@@ -608,6 +614,14 @@ class MirrAISDPipeline:
                 try:
                     post_rgb = cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)
                     post_debug_enabled = debug_images_common is not None and gen_idx == 0
+                    if post_debug_enabled:
+                        _store_rgb("pipeline_post_composite_input_rgb", post_rgb)
+                        if debug_data_common is not None:
+                            debug_data_common["postprocess_sequence"] = [
+                                "composite_input",
+                                "cutoff_cleanup",
+                                "residual_cleanup",
+                            ]
                     post_cleanup = self._final_cutoff_cleanup(
                         post_rgb,
                         face_bbox=face_bbox,
@@ -620,6 +634,7 @@ class MirrAISDPipeline:
                     if post_debug_enabled:
                         post_rgb, post_cleanup_debug = post_cleanup
                         _store_debug_bundle(post_cleanup_debug)
+                        _store_rgb("pipeline_post_after_cutoff_cleanup_rgb", post_rgb)
                     else:
                         post_rgb = post_cleanup
                     residual_cleanup = self._remove_residual_hair_below_cutoff(
@@ -633,6 +648,7 @@ class MirrAISDPipeline:
                     if post_debug_enabled:
                         post_rgb, residual_cleanup_debug = residual_cleanup
                         _store_debug_bundle(residual_cleanup_debug)
+                        _store_rgb("pipeline_post_after_residual_cleanup_rgb", post_rgb)
                     else:
                         post_rgb = residual_cleanup
                     composited_bgr = cv2.cvtColor(post_rgb, cv2.COLOR_RGB2BGR)
@@ -1160,6 +1176,100 @@ class MirrAISDPipeline:
             "mediapipe_face_mesh_contours": contour_bgr,
             "mediapipe_face_mesh_oval_mask": oval_mask_bgr,
         }
+
+    def _build_feature_protect_mask(
+        self,
+        face_region_mask: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        landmarks_px: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        얼굴 보호 마스크를 보강한다.
+        - SegFace face_region_mask를 기본으로 사용
+        - 눈썹/눈 주변은 FaceMesh로 정밀 보호
+        - 귀/옆얼굴은 얇은 side pad를 추가해 가짜 귀 생성 방지
+        """
+        H, W = face_region_mask.shape[:2]
+        x1, y1, x2, y2 = face_bbox
+        face_w = max(int(x2 - x1), 1)
+        face_h = max(int(y2 - y1), 1)
+
+        base_u8 = (np.clip(face_region_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
+        protect_u8 = cv2.dilate(
+            base_u8,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (
+                    max(9, int(face_w * 0.10)) | 1,
+                    max(9, int(face_h * 0.08)) | 1,
+                ),
+            ),
+            iterations=1,
+        )
+
+        # eyebrow/eye band 보호: bangs가 눈썹을 재합성하지 않게 막는다.
+        if landmarks_px is not None and len(landmarks_px) > 0:
+            try:
+                import mediapipe as mp
+
+                eye_brow_idxs = sorted({
+                    i
+                    for edges in (
+                        mp.solutions.face_mesh.FACEMESH_LEFT_EYE,
+                        mp.solutions.face_mesh.FACEMESH_RIGHT_EYE,
+                        mp.solutions.face_mesh.FACEMESH_LEFT_EYEBROW,
+                        mp.solutions.face_mesh.FACEMESH_RIGHT_EYEBROW,
+                    )
+                    for edge in edges
+                    for i in edge
+                    if i < len(landmarks_px)
+                })
+                if eye_brow_idxs:
+                    pts = np.asarray([landmarks_px[i] for i in eye_brow_idxs], dtype=np.int32)
+                    if len(pts) >= 3:
+                        hull = cv2.convexHull(pts.reshape(-1, 1, 2))
+                        eye_brow_mask = np.zeros((H, W), dtype=np.uint8)
+                        cv2.fillConvexPoly(eye_brow_mask, hull, 255)
+                        eye_brow_mask = cv2.dilate(
+                            eye_brow_mask,
+                            cv2.getStructuringElement(
+                                cv2.MORPH_ELLIPSE,
+                                (
+                                    max(19, int(face_w * 0.18)) | 1,
+                                    max(13, int(face_h * 0.12)) | 1,
+                                ),
+                            ),
+                            iterations=1,
+                        )
+                        protect_u8 = cv2.bitwise_or(protect_u8, eye_brow_mask)
+            except Exception:
+                pass
+        else:
+            brow_band = np.zeros((H, W), dtype=np.uint8)
+            brow_band[
+                max(0, int(y1 + face_h * 0.14)):min(H, int(y1 + face_h * 0.46)),
+                max(0, int(x1 - face_w * 0.06)):min(W, int(x2 + face_w * 0.06)),
+            ] = 255
+            protect_u8 = cv2.bitwise_or(protect_u8, brow_band)
+
+        # 귀/옆얼굴 보호: SD가 가짜 귀를 새로 그리는 것을 막는다.
+        ear_mask = np.zeros((H, W), dtype=np.uint8)
+        ear_y = int(y1 + face_h * 0.52)
+        ear_axes = (
+            max(10, int(face_w * 0.11)),
+            max(18, int(face_h * 0.20)),
+        )
+        left_center = (max(0, int(x1 - face_w * 0.02)), ear_y)
+        right_center = (min(W - 1, int(x2 + face_w * 0.02)), ear_y)
+        cv2.ellipse(ear_mask, left_center, ear_axes, 0, 0, 360, 255, -1)
+        cv2.ellipse(ear_mask, right_center, ear_axes, 0, 0, 360, 255, -1)
+        ear_mask[:max(0, int(y1 + face_h * 0.10)), :] = 0
+        ear_mask[min(H, int(y2 - face_h * 0.06)):, :] = 0
+        protect_u8 = cv2.bitwise_or(protect_u8, ear_mask)
+
+        # forehead 전체를 막지는 않되, brow band 위 경계는 부드럽게 보호
+        protect_u8 = cv2.GaussianBlur(protect_u8.astype(np.float32) / 255.0, (0, 0), 2.0, 2.0)
+        return np.clip(protect_u8, 0.0, 1.0).astype(np.float32)
 
     def _segface_hair_mask(self, img_rgb: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -2283,11 +2393,13 @@ class MirrAISDPipeline:
             residual_u8 = (residual_soft > 0.50).astype(np.uint8) * 255
 
         residual_mask = residual_u8.astype(np.float32) / 255.0
+        residual_pixels = int((residual_u8 > 0).sum())
         if int((residual_u8 > 0).sum()) < 60:
             if return_debug:
                 return img_rgb, {
                     "pipeline_lama_residual_mask": residual_mask,
                     "lama_residual_applied": False,
+                    "lama_residual_pixels": residual_pixels,
                 }
             return img_rgb
 
@@ -2302,6 +2414,7 @@ class MirrAISDPipeline:
                 "pipeline_lama_residual_mask": residual_mask,
                 "pipeline_lama_residual_result": result_rgb,
                 "lama_residual_applied": True,
+                "lama_residual_pixels": residual_pixels,
             }
         return result_rgb
 
@@ -2397,11 +2510,13 @@ class MirrAISDPipeline:
 
         min_cleanup_px = 28 if hair_length == "short" else 40
         force_mask = force_u8.astype(np.float32) / 255.0
+        force_pixels = int((force_u8 > 0).sum())
         if int((force_u8 > 0).sum()) < min_cleanup_px:
             if return_debug:
                 return img_rgb, {
                     "pipeline_lama_post_cleanup_mask": force_mask,
                     "lama_post_cleanup_applied": False,
+                    "lama_post_cleanup_pixels": force_pixels,
                 }
             return img_rgb
 
@@ -2419,6 +2534,7 @@ class MirrAISDPipeline:
                 "pipeline_lama_post_cleanup_mask": force_mask,
                 "pipeline_lama_post_cleanup_result": result_rgb,
                 "lama_post_cleanup_applied": True,
+                "lama_post_cleanup_pixels": force_pixels,
             }
         return result_rgb
 
