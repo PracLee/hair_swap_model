@@ -1263,11 +1263,19 @@ class MirrAISDPipeline:
         if int((neutral_u8 > 0).sum()) < 80:
             return img_rgb
 
-        neutralized = self._cv2_inpaint_region(
-            img_rgb,
-            neutral_u8.astype(np.float32) / 255.0,
-            protect_mask=protect_mask,
-        )
+        try:
+            neutralized = self._lama_inpaint(
+                img_rgb,
+                neutral_u8,
+                force_single_pass=False,
+            )
+        except Exception as e:
+            logger.warning(f"[SDPipeline] short generation neutralize LaMa 실패 → cv2 fallback: {e}")
+            neutralized = self._cv2_inpaint_region(
+                img_rgb,
+                neutral_u8.astype(np.float32) / 255.0,
+                protect_mask=protect_mask,
+            )
 
         # Edge hint가 남지 않도록 neutralized 결과를 마스크 내부에서 한 번 더 부드럽게 만든다.
         alpha = cv2.GaussianBlur(
