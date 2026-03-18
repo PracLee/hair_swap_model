@@ -2270,6 +2270,11 @@ class MirrAISDPipeline:
             positive_prompt, negative_prompt, guidance_scale
         """
         normalized_color = MirrAISDPipeline._normalize_color_text(color_text)
+        lowered_style = (hairstyle_text or "").lower()
+        explicit_flyaway_request = any(
+            token in lowered_style
+            for token in ("flyaway", "flyaways", "wispy", "잔머리", "뱅", "bang")
+        )
         parts = []
         if hairstyle_text:
             parts.append(hairstyle_text.strip())
@@ -2279,16 +2284,24 @@ class MirrAISDPipeline:
 
         # ── 길이별 positive/negative 보강 ────────────────────────────────────
         if hair_length == "short":
+            wispy_suffix = (
+                "soft wispy texture only near bangs and jawline tips, no dangling strands below jawline"
+                if explicit_flyaway_request
+                else "clean outer contour with softly feathered ends, no loose hanging tendrils below jawline"
+            )
             pos_suffix = (
                 ", short chin-length bob, soft layered ends, feathered tapered tips, "
                 "natural uneven hairline near jaw, clear neckline, visible neck, "
                 "hair ends stop around jawline, does not touch shoulders, "
-                "mostly above jawline with a few natural wispy strands"
+                f"mostly above jawline, {wispy_suffix}"
             )
             neg_prefix = (
                 "very long hair, flowing long hair, hair below shoulders, "
                 "hair below chin, hair touching shoulders, hair covering chest, "
                 "waist-length hair, side long locks over chest, "
+                "dangling front tendrils, face-framing strands below jawline, "
+                "wispy long strands on neck, flyaway strands below jawline, "
+                "thin hanging side pieces, stringy strands on chest, "
                 "blunt horizontal cut line, helmet hair, bowl-shaped edge, "
                 "earrings, earring, dangling earrings, hoop earrings, pearl earrings, "
                 "jewelry, necklace, pendant, choker, accessories, piercings, "
@@ -2665,7 +2678,9 @@ class MirrAISDPipeline:
                 "professional portrait photo, tightly tied-back slicked-back hair silhouette, "
                 "clean exposed neck and shoulder line, bare collar area in masked region, "
                 "no dangling side hair strands, no visible hanging strand over clothing, "
-                "no hair below jawline in masked region, coherent sweater neckline and clothing texture, "
+                "no hair below jawline in masked region, clean jawline contour, "
+                "no thin tendrils crossing neck, no flyaway strands below jawline, "
+                "coherent sweater neckline and clothing texture, "
                 "photorealistic details"
             )
         else:
@@ -2678,6 +2693,8 @@ class MirrAISDPipeline:
         clean_negative = (
             "long hanging hair, side locks over chest, loose strands, visible ponytail, braid, "
             "single long strand on shoulder, dark strand on clothing, dangling strand by neck, "
+            "face-framing tendrils below jawline, thin wispy strand crossing neck, "
+            "stringy flyaways below chin, long sideburn strand on collar, "
             "hat, cap, beanie, helmet, hairnet, headscarf, bandana, head covering, "
             "wavy long hair, hair below shoulders, messy flyaway clumps, wig-like texture, "
             "artifacts, blurred texture, melted details, cartoon, painting"
@@ -3040,9 +3057,46 @@ class MirrAISDPipeline:
             center_half = max(18, int(face_w * 0.42))
             side_zone = corridor.copy()
             side_zone[:, max(0, cx - center_half):min(W, cx + center_half)] = 0
-            fallback_u8 = ((force > 0.78).astype(np.uint8) * 255)
-            fallback_u8 = cv2.bitwise_and(fallback_u8, side_zone)
-            force_u8 = cv2.bitwise_or(hair_inter_u8, fallback_u8)
+            side_fallback_u8 = ((force > 0.78).astype(np.uint8) * 255)
+            side_fallback_u8 = cv2.bitwise_and(side_fallback_u8, side_zone)
+
+            # 중심부의 가는 세로 스트랜드는 SegFace miss가 잦다.
+            # 턱선보다 충분히 아래에서만 보수적으로 fallback을 허용한다.
+            center_force_u8 = ((force > 0.70).astype(np.uint8) * 255)
+            center_zone = np.zeros((H, W), dtype=np.uint8)
+            center_top = min(H, int(cutoff_y + face_h * 0.18))
+            center_bottom = min(H, int(cutoff_y + face_h * 1.45))
+            center_x_half = max(16, int(face_w * 0.24))
+            center_zone[
+                center_top:center_bottom,
+                max(0, cx - center_x_half):min(W, cx + center_x_half),
+            ] = 255
+            center_force_u8 = cv2.bitwise_and(center_force_u8, center_zone)
+
+            center_fallback_u8 = np.zeros_like(center_force_u8)
+            if int((center_force_u8 > 0).sum()) > 0:
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                    center_force_u8,
+                    connectivity=8,
+                )
+                min_center_area = max(18, int(face_w * 0.10))
+                min_center_height = max(16, int(face_h * 0.18))
+                for label_idx in range(1, num_labels):
+                    x, y, w, h, area = stats[label_idx]
+                    if area < min_center_area:
+                        continue
+                    if h < min_center_height:
+                        continue
+                    center_fallback_u8[labels == label_idx] = 255
+                if int((center_fallback_u8 > 0).sum()) > 0:
+                    center_fallback_u8 = cv2.dilate(
+                        center_fallback_u8,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 9)),
+                        iterations=1,
+                    )
+
+            force_u8 = cv2.bitwise_or(hair_inter_u8, side_fallback_u8)
+            force_u8 = cv2.bitwise_or(force_u8, center_fallback_u8)
         else:
             # medium도 SegFace miss 보완용 fallback force 일부 허용
             fallback_u8 = ((force > 0.74).astype(np.uint8) * 255)
