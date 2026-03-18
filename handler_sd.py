@@ -9,6 +9,7 @@ MirrAI SD Inpainting — RunPod Serverless Handler
     "hairstyle_text": "wolf cut, layered", // 헤어스타일 설명
     "color_text":     "auburn",            // 헤어 색상 (선택)
     "top_k":          3,                   // 결과 수 (1~5, 기본 3)
+    "bg_fill_mode":   "lama",             // "lama" | "sd" (기본: "lama")
     "return_base64":  true,                // true=base64, false=이미지 없이 메타만
     "return_intermediates": false          // true=중간 산출물(base64) 포함
   }
@@ -18,9 +19,12 @@ MirrAI SD Inpainting — RunPod Serverless Handler
 {
   "results": [
     {
-      "rank":         0,          // CLIP score 기준 0=best
+      "rank":         0,          // ranking score 기준 0=best
       "seed":         42,
-      "clip_score":   0.312,
+      "clip_score":   0.312,      // legacy score field (현재는 overall rank score)
+      "color_score":  0.201,
+      "silhouette_score": 0.711,
+      "rank_score":   0.572,
       "mask_used":    "sam2",     // "sam2" | "bisenet"
       "image_base64": "..."       // return_base64=true 일 때
     },
@@ -68,7 +72,7 @@ try:
     import cv2
     import numpy as np
     from PIL import Image
-    from pipeline_sd_inpainting import MirrAISDPipeline, SDInpaintConfig
+    from pipeline_sd_inpainting import MirrAISDPipeline, SDInpaintConfig, normalize_bg_fill_mode
 except Exception as _e:
     _IMPORT_ERROR = f"{type(_e).__name__}: {_e}\n{traceback.format_exc()}"
     logger.error(f"[handler_sd] import 실패:\n{_IMPORT_ERROR}")
@@ -232,7 +236,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         top_k          = max(1, min(5, int(inp.get("top_k", 3))))
         return_base64  = _coerce_bool(inp.get("return_base64"), default=True)
         return_intermediates = _coerce_bool(inp.get("return_intermediates"), default=False)
-        bg_fill_mode   = str(inp.get("bg_fill_mode", "cv2")).strip()  # "cv2" | "sd"
+        bg_fill_mode   = normalize_bg_fill_mode(inp.get("bg_fill_mode", "lama"))
 
         if not hairstyle_text and not color_text:
             return {"error": "hairstyle_text 또는 color_text 중 하나 이상 필요합니다."}
@@ -265,6 +269,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "rank":       r.rank,
                 "seed":       r.seed,
                 "clip_score": round(float(r.clip_score), 4),
+                "color_score": round(float(r.color_score), 4),
+                "silhouette_score": round(float(r.silhouette_score), 4),
+                "rank_score": round(float(r.rank_score), 4),
                 "mask_used":  r.mask_used,
             }
             if return_base64:

@@ -74,7 +74,8 @@ INTERMEDIATE_KEY_ALIASES = {
     "lama_post_cleanup_result": "pipeline_lama_post_cleanup_result",
     "lama_residual_mask": "pipeline_lama_residual_mask",
     "lama_residual_result": "pipeline_lama_residual_result",
-    "background_cleaned_rgb": "cv2_background_cleaned_rgb",
+    "background_cleaned_rgb": "pipeline_background_cleaned_rgb",
+    "cv2_background_cleaned_rgb": "pipeline_background_cleaned_rgb",
     "sd_mask_512": "sd_inpaint_mask_512",
     "canny_512": "controlnet_canny_512",
     "generated_rank0_512": "sd_generated_rank0_512",
@@ -170,6 +171,19 @@ def prefixed_name(prefix: str, base_name: str) -> str:
     if not clean_prefix:
         return base_name
     return f"{clean_prefix}_{base_name}"
+
+
+def normalize_bg_fill_mode_arg(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9_-]+", "", str(value)).strip().lower()
+    aliases = {
+        "lama": "lama",
+        "sd": "sd",
+        "cv2": "lama",  # legacy alias
+    }
+    resolved = aliases.get(normalized)
+    if resolved is None:
+        raise argparse.ArgumentTypeError("bg-fill must be one of: lama, sd")
+    return resolved
 
 
 def save_results(output: dict, out_dir: Path, file_prefix: str) -> list[Path]:
@@ -326,8 +340,8 @@ def main():
                         help="헤어 컬러 텍스트 (기본: 미지정=원본 톤 유지)")
     parser.add_argument("--top-k",     default=3, type=int,
                         help="결과 수 (기본: 3, 최대: 5)")
-    parser.add_argument("--bg-fill",   default="cv2", choices=["cv2", "sd"],
-                        help="하이브리드 pre-clean 모드: cv2=빠른 partial pre-clean, sd=partial pre-clean + SD refine")
+    parser.add_argument("--bg-fill",   default="lama", type=normalize_bg_fill_mode_arg, metavar="{lama,sd}",
+                        help="하이브리드 pre-clean 모드: lama=LaMa partial pre-clean only, sd=LaMa partial pre-clean + SD refine (legacy alias: cv2->lama)")
 
     # 기타
     parser.add_argument("--no-base64",    action="store_true",
