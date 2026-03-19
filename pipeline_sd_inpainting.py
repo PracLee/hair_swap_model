@@ -1394,6 +1394,107 @@ class MirrAISDPipeline:
 
         return result_rgb, applied_count
 
+    def _build_short_marker_cleanup_mask(
+        self,
+        img_rgb: np.ndarray,
+        seed_mask_u8: np.ndarray,
+        *,
+        corridor_u8: np.ndarray,
+        keepout_u8: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        cutoff_y: int,
+        protect_mask: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        short lower-panel의 큰 dark mass만 별도로 잡기 위한 marker-style cleanup mask.
+        실제 최종 결과에는 marker 색을 남기지 않고, 검출과 디버깅용으로만 사용한다.
+        """
+        H, W = img_rgb.shape[:2]
+        if seed_mask_u8.shape != (H, W):
+            return np.zeros((H, W), dtype=np.uint8), img_rgb
+
+        x1, y1, x2, y2 = face_bbox
+        face_h = max(int(y2 - y1), 1)
+        face_w = max(int(x2 - x1), 1)
+        gray = img_rgb.mean(axis=2).astype(np.float32)
+        hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+        sat = hsv[..., 1].astype(np.float32)
+
+        candidate_u8 = cv2.dilate(
+            (seed_mask_u8 > 0).astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 25)),
+            iterations=1,
+        )
+        candidate_u8 = cv2.bitwise_and(candidate_u8, corridor_u8)
+        if int((keepout_u8 > 0).sum()) > 0:
+            candidate_u8 = cv2.bitwise_and(candidate_u8, cv2.bitwise_not(keepout_u8))
+
+        lower_top = min(H, int(cutoff_y + face_h * 0.18))
+        lower_zone = np.zeros((H, W), dtype=np.uint8)
+        lower_zone[lower_top:, :] = 255
+        candidate_u8 = cv2.bitwise_and(candidate_u8, lower_zone)
+
+        dark_threshold = 136.0
+        low_sat_threshold = 108.0
+        marker_mask_u8 = (
+            ((candidate_u8 > 0) & (gray < dark_threshold) & (sat < low_sat_threshold)).astype(np.uint8) * 255
+        )
+
+        if protect_mask is not None and protect_mask.shape == (H, W):
+            protect_u8 = (np.clip(protect_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
+            protect_u8 = cv2.dilate(
+                protect_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+                iterations=1,
+            )
+            marker_mask_u8 = cv2.bitwise_and(marker_mask_u8, cv2.bitwise_not(protect_u8))
+
+        filtered_u8 = np.zeros_like(marker_mask_u8)
+        if int((marker_mask_u8 > 0).sum()) > 0:
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(marker_mask_u8, connectivity=8)
+            min_area = max(72, int(face_w * 0.14))
+            min_height = max(36, int(face_h * 0.36))
+            for label_idx in range(1, num_labels):
+                _, _, _, h, area = stats[label_idx]
+                if area < min_area:
+                    continue
+                if h < min_height:
+                    continue
+                filtered_u8[labels == label_idx] = 255
+
+        if int((filtered_u8 > 0).sum()) > 0:
+            filtered_u8 = cv2.morphologyEx(
+                filtered_u8,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 13)),
+            )
+            filtered_u8 = cv2.dilate(
+                filtered_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
+                iterations=1,
+            )
+
+        overlay_rgb = img_rgb.copy()
+        if int((filtered_u8 > 0).sum()) > 0:
+            alpha = cv2.GaussianBlur(
+                filtered_u8.astype(np.float32) / 255.0,
+                (0, 0),
+                sigmaX=3.0,
+                sigmaY=3.0,
+            )[..., np.newaxis]
+            marker_color = np.zeros_like(overlay_rgb, dtype=np.float32)
+            marker_color[..., 0] = 32.0
+            marker_color[..., 1] = 235.0
+            marker_color[..., 2] = 235.0
+            overlay_rgb = np.clip(
+                overlay_rgb.astype(np.float32) * (1.0 - alpha)
+                + marker_color * alpha,
+                0,
+                255,
+            ).astype(np.uint8)
+
+        return filtered_u8, overlay_rgb
+
     def _neutralize_short_generation_input(
         self,
         img_rgb: np.ndarray,
@@ -3928,6 +4029,10 @@ class MirrAISDPipeline:
         cv2_front_rgb: Optional[np.ndarray] = None
         cv2_side_rgb: Optional[np.ndarray] = None
         residual_cv2_rgb: Optional[np.ndarray] = None
+        marker_cleanup_mask = np.zeros((H, W), dtype=np.float32)
+        marker_overlay_rgb: Optional[np.ndarray] = None
+        marker_component_rgb: Optional[np.ndarray] = None
+        marker_component_count = 0
         residual_cleanup_mask = np.zeros((H, W), dtype=np.float32)
         if hair_length == "short":
             front_blend_mask = front_cleanup_u8.astype(np.float32) / 255.0
@@ -4081,6 +4186,43 @@ class MirrAISDPipeline:
                     + result_rgb.astype(np.float32) * (1.0 - residual_alpha)
                 )
                 result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
+
+            marker_keepout_u8 = residual_keepout_u8 if short_cleanup_pattern in {"front", "mixed"} else lower_center_keepout_u8
+            marker_seed_u8 = cv2.bitwise_or(front_cleanup_u8, side_cleanup_u8)
+            marker_seed_u8 = cv2.bitwise_or(marker_seed_u8, side_outer_cleanup_u8)
+            marker_seed_u8 = cv2.bitwise_and(marker_seed_u8, corridor)
+            marker_mask_u8, marker_overlay_rgb = self._build_short_marker_cleanup_mask(
+                result_rgb,
+                marker_seed_u8,
+                corridor_u8=corridor,
+                keepout_u8=marker_keepout_u8,
+                face_bbox=face_bbox,
+                cutoff_y=cutoff_y,
+                protect_mask=protect_mask,
+            )
+            if int((marker_mask_u8 > 0).sum()) >= 96:
+                marker_cleanup_mask = marker_mask_u8.astype(np.float32) / 255.0
+                marker_component_rgb, marker_component_count = self._lama_inpaint_component_rois(
+                    result_rgb,
+                    marker_mask_u8,
+                    pad_x=max(14, int(face_w * 0.16)),
+                    pad_y=max(18, int(face_h * 0.22)),
+                    protect_mask=protect_mask,
+                    min_component_area=max(56, int(face_w * 0.08)),
+                )
+                if marker_component_count > 0:
+                    marker_alpha = cv2.GaussianBlur(
+                        marker_cleanup_mask,
+                        (0, 0),
+                        sigmaX=3.2,
+                        sigmaY=3.2,
+                    )
+                    marker_alpha = np.clip(marker_alpha * 0.28, 0.0, 0.28)[..., np.newaxis]
+                    result_rgb = (
+                        marker_component_rgb.astype(np.float32) * marker_alpha
+                        + result_rgb.astype(np.float32) * (1.0 - marker_alpha)
+                    )
+                    result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
         if return_debug:
             debug_bundle = {
                 "pipeline_lama_post_cleanup_mask": force_mask,
@@ -4094,10 +4236,12 @@ class MirrAISDPipeline:
                 "pipeline_short_blend_keepout_mask": blend_keepout_u8.astype(np.float32) / 255.0,
                 "pipeline_short_residual_keepout_mask": residual_keepout_u8.astype(np.float32) / 255.0,
                 "pipeline_short_residual_cleanup_mask": residual_cleanup_mask,
+                "pipeline_short_marker_cleanup_mask": marker_cleanup_mask,
                 "short_cleanup_pattern": short_cleanup_pattern,
                 "short_side_outer_enabled": side_outer_enabled,
                 "lama_post_cleanup_mode": lama_post_mode,
                 "lama_post_cleanup_component_count": lama_component_count,
+                "short_marker_component_count": marker_component_count,
                 "short_front_panel_area": front_panel_area_total,
                 "short_side_panel_area": side_panel_area_total,
                 "short_front_panel_count": front_panel_count,
@@ -4111,6 +4255,10 @@ class MirrAISDPipeline:
                 debug_bundle["pipeline_cv2_side_cleanup_result"] = cv2_side_rgb
             if residual_cv2_rgb is not None:
                 debug_bundle["pipeline_cv2_residual_cleanup_result"] = residual_cv2_rgb
+            if marker_overlay_rgb is not None:
+                debug_bundle["pipeline_short_marker_overlay_rgb"] = marker_overlay_rgb
+            if marker_component_rgb is not None:
+                debug_bundle["pipeline_lama_marker_component_result"] = marker_component_rgb
             return result_rgb, debug_bundle
         return result_rgb
 
