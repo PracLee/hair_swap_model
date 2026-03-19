@@ -828,6 +828,7 @@ class MirrAISDPipeline:
                         face_crop_pil=face_crop_pil,
                         protect_mask=feature_protect_mask,
                         cloth_mask=cloth_mask_dilated,
+                        face_region_mask=face_region_mask,
                         seed=seed,
                         return_debug=post_debug_enabled,
                     )
@@ -3501,6 +3502,7 @@ class MirrAISDPipeline:
         face_crop_pil: Optional[Image.Image] = None,
         protect_mask: Optional[np.ndarray] = None,
         cloth_mask: Optional[np.ndarray] = None,
+        face_region_mask: Optional[np.ndarray] = None,
         seed: Optional[int] = None,
         return_debug: bool = False,
     ) -> Any:
@@ -3900,25 +3902,19 @@ class MirrAISDPipeline:
         split_skin_result: Optional[np.ndarray] = None
         split_background_result: Optional[np.ndarray] = None
         split_residual_result: Optional[np.ndarray] = None
+        split_background_pixels = 0
+        split_skin_pixels = 0
+        split_cloth_pixels = 0
+        split_residual_pixels = 0
         if hair_length == "short" and cloth_mask is not None and cloth_mask.shape == (H, W):
             cloth_u8 = (np.clip(cloth_mask, 0.0, 1.0) > 0.16).astype(np.uint8) * 255
             if int((cloth_u8 > 0).sum()) > 0:
                 cloth_u8 = cv2.dilate(
                     cloth_u8,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (29, 29)),
                     iterations=1,
                 )
-            cloth_zone_u8 = np.zeros((H, W), dtype=np.uint8)
-            cloth_zone_top = min(H, int(cutoff_y + face_h * 0.22))
-            cloth_zone_u8[cloth_zone_top:, :] = 255
-            upper_center_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
-            upper_center_keepout_u8[
-                min(H, int(cutoff_y + face_h * 0.04)):min(H, int(cutoff_y + face_h * 0.52)),
-                max(0, int(cx - face_w * 0.28)):min(W, int(cx + face_w * 0.28)),
-            ] = 255
             split_cloth_u8 = cv2.bitwise_and(force_u8, cloth_u8)
-            split_cloth_u8 = cv2.bitwise_and(split_cloth_u8, cloth_zone_u8)
-            split_cloth_u8 = cv2.bitwise_and(split_cloth_u8, cv2.bitwise_not(upper_center_keepout_u8))
             if int((split_cloth_u8 > 0).sum()) > 0:
                 split_cloth_u8 = cv2.morphologyEx(
                     split_cloth_u8,
@@ -3926,14 +3922,26 @@ class MirrAISDPipeline:
                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 13)),
                 )
 
-            skin_zone_u8 = np.zeros((H, W), dtype=np.uint8)
-            skin_poly = np.asarray([
-                [max(0, int(cx - face_w * 0.18)), min(H - 1, int(cutoff_y + face_h * 0.04))],
-                [min(W - 1, int(cx + face_w * 0.18)), min(H - 1, int(cutoff_y + face_h * 0.04))],
-                [min(W - 1, int(cx + face_w * 0.48)), min(H - 1, int(cutoff_y + face_h * 1.02))],
-                [max(0, int(cx - face_w * 0.48)), min(H - 1, int(cutoff_y + face_h * 1.02))],
+            skin_seed_u8 = np.zeros((H, W), dtype=np.uint8)
+            if face_region_mask is not None and face_region_mask.shape == (H, W):
+                skin_seed_u8 = (np.clip(face_region_mask, 0.0, 1.0) > 0.22).astype(np.uint8) * 255
+                if int((skin_seed_u8 > 0).sum()) > 0:
+                    skin_seed_u8 = cv2.dilate(
+                        skin_seed_u8,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
+                        iterations=1,
+                    )
+            skin_zone_u8 = skin_seed_u8.copy()
+            neck_skin_u8 = np.zeros((H, W), dtype=np.uint8)
+            neck_skin_poly = np.asarray([
+                [max(0, int(cx - face_w * 0.16)), min(H - 1, int(cutoff_y - face_h * 0.02))],
+                [min(W - 1, int(cx + face_w * 0.16)), min(H - 1, int(cutoff_y - face_h * 0.02))],
+                [min(W - 1, int(cx + face_w * 0.62)), min(H - 1, int(cutoff_y + face_h * 1.18))],
+                [max(0, int(cx - face_w * 0.62)), min(H - 1, int(cutoff_y + face_h * 1.18))],
             ], dtype=np.int32)
-            cv2.fillConvexPoly(skin_zone_u8, skin_poly, 255)
+            cv2.fillConvexPoly(neck_skin_u8, neck_skin_poly, 255)
+            skin_zone_u8 = cv2.bitwise_or(skin_zone_u8, neck_skin_u8)
+            skin_zone_u8 = cv2.bitwise_and(skin_zone_u8, cv2.bitwise_not(cloth_u8))
             split_skin_u8 = cv2.bitwise_and(force_u8, skin_zone_u8)
             split_skin_u8 = cv2.bitwise_and(split_skin_u8, cv2.bitwise_not(split_cloth_u8))
             if int((split_skin_u8 > 0).sum()) > 0:
@@ -3943,20 +3951,8 @@ class MirrAISDPipeline:
                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 9)),
                 )
 
-            background_zone_top = min(H, int(cutoff_y + face_h * 0.12))
-            background_zone_u8 = np.zeros((H, W), dtype=np.uint8)
-            left_bg_x1 = max(0, int(x1 - face_w * 0.92))
-            left_bg_x2 = max(0, int(x1 - face_w * 0.04))
-            right_bg_x1 = min(W, int(x2 + face_w * 0.04))
-            right_bg_x2 = min(W, int(x2 + face_w * 0.92))
-            if left_bg_x1 < left_bg_x2:
-                background_zone_u8[:, left_bg_x1:left_bg_x2] = 255
-            if right_bg_x1 < right_bg_x2:
-                background_zone_u8[:, right_bg_x1:right_bg_x2] = 255
+            background_zone_u8 = cv2.bitwise_not(cv2.bitwise_or(cloth_u8, skin_zone_u8))
             background_zone_u8 = cv2.bitwise_and(background_zone_u8, corridor)
-            background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(cloth_u8))
-            background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(skin_zone_u8))
-            background_zone_u8[:background_zone_top, :] = 0
             split_background_u8 = cv2.bitwise_and(force_u8, background_zone_u8)
             split_background_u8 = cv2.bitwise_and(split_background_u8, cv2.bitwise_not(split_cloth_u8))
             split_background_u8 = cv2.bitwise_and(split_background_u8, cv2.bitwise_not(split_skin_u8))
@@ -3971,29 +3967,14 @@ class MirrAISDPipeline:
                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 7)),
                     iterations=1,
                 )
-                filtered_background_u8 = np.zeros_like(split_background_u8)
-                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-                    split_background_u8,
-                    connectivity=8,
-                )
-                min_bg_area = max(24, int(face_w * 0.06))
-                min_bg_dist = face_w * 0.42
-                max_bg_width = max(18, int(face_w * 0.52))
-                for label_idx in range(1, num_labels):
-                    x, _, w, _, area = stats[label_idx]
-                    comp_cx = float(centroids[label_idx][0])
-                    if area < min_bg_area:
-                        continue
-                    if w > max_bg_width:
-                        continue
-                    if abs(comp_cx - cx) < min_bg_dist:
-                        continue
-                    filtered_background_u8[labels == label_idx] = 255
-                split_background_u8 = filtered_background_u8
 
             split_union_u8 = cv2.bitwise_or(split_cloth_u8, split_skin_u8)
             split_union_u8 = cv2.bitwise_or(split_union_u8, split_background_u8)
             split_residual_u8 = cv2.bitwise_and(force_u8, cv2.bitwise_not(split_union_u8))
+            split_background_pixels = int((split_background_u8 > 0).sum())
+            split_skin_pixels = int((split_skin_u8 > 0).sum())
+            split_cloth_pixels = int((split_cloth_u8 > 0).sum())
+            split_residual_pixels = int((split_residual_u8 > 0).sum())
             split_ready = int((split_union_u8 > 0).sum()) >= max(96, int(force_pixels * 0.35))
             if split_ready:
                 split_applied = False
@@ -4225,6 +4206,10 @@ class MirrAISDPipeline:
                 "pipeline_lama_post_cleanup_skin_mask": split_skin_mask,
                 "pipeline_lama_post_cleanup_background_mask": split_background_mask,
                 "pipeline_lama_post_cleanup_split_residual_mask": split_residual_mask,
+                "split_background_pixels": split_background_pixels,
+                "split_skin_pixels": split_skin_pixels,
+                "split_cloth_pixels": split_cloth_pixels,
+                "split_residual_pixels": split_residual_pixels,
                 "short_cleanup_pattern": short_cleanup_pattern,
                 "short_side_outer_enabled": side_outer_enabled,
                 "short_front_panel_area": front_panel_area_total,
