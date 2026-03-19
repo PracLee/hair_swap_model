@@ -3944,15 +3944,18 @@ class MirrAISDPipeline:
                 )
 
             background_zone_top = min(H, int(cutoff_y + face_h * 0.12))
-            background_zone_u8 = corridor.copy()
-            center_background_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
-            center_background_keepout_u8[
-                background_zone_top:,
-                max(0, int(cx - face_w * 0.34)):min(W, int(cx + face_w * 0.34)),
-            ] = 255
+            background_zone_u8 = np.zeros((H, W), dtype=np.uint8)
+            left_bg_x1 = max(0, int(x1 - face_w * 0.92))
+            left_bg_x2 = max(0, int(x1 - face_w * 0.04))
+            right_bg_x1 = min(W, int(x2 + face_w * 0.04))
+            right_bg_x2 = min(W, int(x2 + face_w * 0.92))
+            if left_bg_x1 < left_bg_x2:
+                background_zone_u8[:, left_bg_x1:left_bg_x2] = 255
+            if right_bg_x1 < right_bg_x2:
+                background_zone_u8[:, right_bg_x1:right_bg_x2] = 255
+            background_zone_u8 = cv2.bitwise_and(background_zone_u8, corridor)
             background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(cloth_u8))
             background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(skin_zone_u8))
-            background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(center_background_keepout_u8))
             background_zone_u8[:background_zone_top, :] = 0
             split_background_u8 = cv2.bitwise_and(force_u8, background_zone_u8)
             split_background_u8 = cv2.bitwise_and(split_background_u8, cv2.bitwise_not(split_cloth_u8))
@@ -3968,6 +3971,25 @@ class MirrAISDPipeline:
                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 7)),
                     iterations=1,
                 )
+                filtered_background_u8 = np.zeros_like(split_background_u8)
+                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                    split_background_u8,
+                    connectivity=8,
+                )
+                min_bg_area = max(24, int(face_w * 0.06))
+                min_bg_dist = face_w * 0.42
+                max_bg_width = max(18, int(face_w * 0.52))
+                for label_idx in range(1, num_labels):
+                    x, _, w, _, area = stats[label_idx]
+                    comp_cx = float(centroids[label_idx][0])
+                    if area < min_bg_area:
+                        continue
+                    if w > max_bg_width:
+                        continue
+                    if abs(comp_cx - cx) < min_bg_dist:
+                        continue
+                    filtered_background_u8[labels == label_idx] = 255
+                split_background_u8 = filtered_background_u8
 
             split_union_u8 = cv2.bitwise_or(split_cloth_u8, split_skin_u8)
             split_union_u8 = cv2.bitwise_or(split_union_u8, split_background_u8)
