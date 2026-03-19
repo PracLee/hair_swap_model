@@ -1308,6 +1308,92 @@ class MirrAISDPipeline:
         out_bgr = blend_bgr * alpha + img_bgr.astype(np.float32) * (1.0 - alpha)
         return cv2.cvtColor(np.clip(out_bgr, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
 
+    def _lama_inpaint_component_rois(
+        self,
+        img_rgb: np.ndarray,
+        mask_u8: np.ndarray,
+        *,
+        pad_x: int,
+        pad_y: int,
+        protect_mask: Optional[np.ndarray] = None,
+        min_component_area: int = 80,
+    ) -> Tuple[np.ndarray, int]:
+        """
+        큰 lower-panel mask를 component별 ROI로 나눠 LaMa를 적용한다.
+        전역 한 번 인페인트보다 목/의상 영역 뭉개짐을 줄이는 용도다.
+        """
+        H, W = img_rgb.shape[:2]
+        if mask_u8.shape != (H, W):
+            return img_rgb, 0
+
+        work_mask = (mask_u8 > 0).astype(np.uint8) * 255
+        if protect_mask is not None and protect_mask.shape == (H, W):
+            protect_u8 = (np.clip(protect_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
+            if int((protect_u8 > 0).sum()) > 0:
+                protect_u8 = cv2.dilate(
+                    protect_u8,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+                    iterations=1,
+                )
+                work_mask = cv2.bitwise_and(work_mask, cv2.bitwise_not(protect_u8))
+
+        if int((work_mask > 0).sum()) < min_component_area:
+            return img_rgb, 0
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(work_mask, connectivity=8)
+        components: list[tuple[int, int, int, int, int, int]] = []
+        for label_idx in range(1, num_labels):
+            x, y, w, h, area = stats[label_idx]
+            if area < min_component_area:
+                continue
+            components.append((label_idx, x, y, w, h, area))
+        if not components:
+            return img_rgb, 0
+
+        components.sort(key=lambda item: item[5], reverse=True)
+        result_rgb = img_rgb.copy()
+        applied_count = 0
+
+        for label_idx, x, y, w, h, _ in components:
+            comp_mask_u8 = np.zeros_like(work_mask)
+            comp_mask_u8[labels == label_idx] = 255
+            if int((comp_mask_u8 > 0).sum()) < min_component_area:
+                continue
+
+            x1 = max(0, x - pad_x)
+            y1 = max(0, y - pad_y)
+            x2 = min(W, x + w + pad_x)
+            y2 = min(H, y + h + pad_y)
+            if x2 - x1 < 12 or y2 - y1 < 12:
+                continue
+
+            roi_img = result_rgb[y1:y2, x1:x2]
+            roi_mask_u8 = comp_mask_u8[y1:y2, x1:x2]
+            if int((roi_mask_u8 > 0).sum()) < min_component_area:
+                continue
+
+            roi_result = self._lama_inpaint(roi_img, roi_mask_u8, force_single_pass=True)
+            alpha_u8 = cv2.dilate(
+                roi_mask_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+                iterations=1,
+            )
+            alpha = cv2.GaussianBlur(
+                alpha_u8.astype(np.float32) / 255.0,
+                (0, 0),
+                sigmaX=4.5,
+                sigmaY=4.5,
+            )
+            alpha = np.clip(alpha, 0.0, 1.0)[..., np.newaxis]
+            blended = (
+                roi_result.astype(np.float32) * alpha
+                + roi_img.astype(np.float32) * (1.0 - alpha)
+            )
+            result_rgb[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
+            applied_count += 1
+
+        return result_rgb, applied_count
+
     def _neutralize_short_generation_input(
         self,
         img_rgb: np.ndarray,
@@ -3835,7 +3921,28 @@ class MirrAISDPipeline:
         # short post-cleanup은 비용과 artifact를 줄이기 위해
         # 추가 SD refine 없이 LaMa를 기본으로 쓰고,
         # lower panel의 어두운 얼룩만 cv2 inpaint 결과를 약하게 섞어 정리한다.
-        result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
+        lama_post_mode = "global"
+        lama_component_count = 0
+        if (
+            hair_length == "short"
+            and short_cleanup_pattern in {"front", "mixed"}
+        ):
+            component_pad_x = max(20, int(face_w * 0.24))
+            component_pad_y = max(28, int(face_h * 0.32))
+            result_rgb, lama_component_count = self._lama_inpaint_component_rois(
+                img_rgb,
+                force_u8,
+                pad_x=component_pad_x,
+                pad_y=component_pad_y,
+                protect_mask=protect_mask,
+                min_component_area=max(60, int(face_w * 0.10)),
+            )
+            if lama_component_count > 0:
+                lama_post_mode = "component_roi"
+            else:
+                result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
+        else:
+            result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
         cv2_post_rgb: Optional[np.ndarray] = None
         cv2_front_rgb: Optional[np.ndarray] = None
         cv2_side_rgb: Optional[np.ndarray] = None
@@ -4008,6 +4115,8 @@ class MirrAISDPipeline:
                 "pipeline_short_residual_cleanup_mask": residual_cleanup_mask,
                 "short_cleanup_pattern": short_cleanup_pattern,
                 "short_side_outer_enabled": side_outer_enabled,
+                "lama_post_cleanup_mode": lama_post_mode,
+                "lama_post_cleanup_component_count": lama_component_count,
                 "short_front_panel_area": front_panel_area_total,
                 "short_side_panel_area": side_panel_area_total,
                 "short_front_panel_count": front_panel_count,
