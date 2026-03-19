@@ -1398,6 +1398,201 @@ class MirrAISDPipeline:
         )
         return np.clip(blended, 0, 255).astype(np.uint8), work_u8
 
+    def _sd_inpaint_roi_cleanup(
+        self,
+        img_rgb: np.ndarray,
+        residual_mask_u8: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        protect_mask: Optional[np.ndarray] = None,
+        cloth_mask: Optional[np.ndarray] = None,
+        seed: int = 42,
+        roi_pad_ratio: float = 0.25,
+        min_residual_pixels: int = 300,
+    ) -> np.ndarray:
+        """
+        Iterative LaMa cleanup 후 남은 잔여물을 SD inpainting으로 채운다.
+
+        LaMa는 큰 영역의 texture를 제대로 복원하지 못하는 한계가 있다.
+        남은 dark mass ROI만 크롭하여 SD 1.5 inpainting pipe로 채운 뒤
+        원본에 soft-blend로 합성한다.
+
+        Args:
+            img_rgb: 현재 결과 이미지 (RGB)
+            residual_mask_u8: 잔여물 영역 마스크 (0/255)
+            face_bbox: (x1, y1, x2, y2) 얼굴 bbox
+            protect_mask: 얼굴 보호 마스크 (float32, 0~1)
+            cloth_mask: 옷 영역 마스크 (float32, 0~1)
+            seed: 생성 시드
+            roi_pad_ratio: ROI 패딩 비율
+            min_residual_pixels: 최소 잔여 픽셀 수 (이하면 스킵)
+        """
+        H, W = img_rgb.shape[:2]
+        if residual_mask_u8.shape != (H, W):
+            return img_rgb
+
+        residual_pixels = int((residual_mask_u8 > 0).sum())
+        if residual_pixels < min_residual_pixels:
+            logger.info(
+                f"[SDPipeline] SD ROI cleanup skipped: {residual_pixels}px < {min_residual_pixels}"
+            )
+            return img_rgb
+
+        # ── 1) ROI 영역 계산 ──────────────────────────────────────────
+        ys, xs = np.where(residual_mask_u8 > 0)
+        r_y1, r_y2 = int(ys.min()), int(ys.max())
+        r_x1, r_x2 = int(xs.min()), int(xs.max())
+        roi_h = r_y2 - r_y1
+        roi_w = r_x2 - r_x1
+
+        # 패딩 추가 (context를 SD에 제공)
+        pad_y = max(32, int(roi_h * roi_pad_ratio))
+        pad_x = max(32, int(roi_w * roi_pad_ratio))
+        crop_y1 = max(0, r_y1 - pad_y)
+        crop_y2 = min(H, r_y2 + pad_y)
+        crop_x1 = max(0, r_x1 - pad_x)
+        crop_x2 = min(W, r_x2 + pad_x)
+        crop_h = crop_y2 - crop_y1
+        crop_w = crop_x2 - crop_x1
+
+        if crop_h < 64 or crop_w < 64:
+            return img_rgb
+
+        logger.info(
+            f"[SDPipeline] SD ROI cleanup: {residual_pixels}px residual, "
+            f"ROI=({crop_x1},{crop_y1})-({crop_x2},{crop_y2}) "
+            f"size={crop_w}x{crop_h}"
+        )
+
+        # ── 2) ROI 크롭 + SD 512x512 리사이즈 ────────────────────────
+        roi_rgb = img_rgb[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+        roi_mask = residual_mask_u8[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+
+        # mask를 약간 dilate해서 경계도 포함
+        roi_mask = cv2.dilate(
+            roi_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=1,
+        )
+
+        # protect mask가 있으면 ROI 내에서 제거
+        if protect_mask is not None and protect_mask.shape == (H, W):
+            roi_protect = (
+                (np.clip(protect_mask[crop_y1:crop_y2, crop_x1:crop_x2], 0, 1) > 0.4)
+                .astype(np.uint8) * 255
+            )
+            roi_protect = cv2.dilate(
+                roi_protect,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+                iterations=1,
+            )
+            roi_mask = cv2.bitwise_and(roi_mask, cv2.bitwise_not(roi_protect))
+
+        if int((roi_mask > 0).sum()) < 100:
+            return img_rgb
+
+        # SD는 512x512에서 동작
+        roi_pil = Image.fromarray(roi_rgb).resize((SD_SIZE, SD_SIZE), Image.LANCZOS)
+        mask_pil = Image.fromarray(roi_mask).resize((SD_SIZE, SD_SIZE), Image.NEAREST)
+
+        # ── 3) Canny edge for ControlNet (옷 텍스처 가이드) ───────────
+        roi_gray = cv2.cvtColor(
+            np.array(roi_pil), cv2.COLOR_RGB2GRAY
+        )
+        canny = cv2.Canny(roi_gray, 40, 120)
+        # mask 영역의 canny는 제거 (잔여물 edge를 가이드로 쓰면 안 됨)
+        mask_512_np = np.array(mask_pil)
+        canny[mask_512_np > 127] = 0
+        canny_pil = Image.fromarray(canny).convert("RGB")
+
+        # ── 4) 프롬프트 구성 ──────────────────────────────────────────
+        # cloth 영역이 mask에 포함되어 있으면 clothing을 강조
+        has_cloth_in_roi = False
+        if cloth_mask is not None and cloth_mask.shape == (H, W):
+            roi_cloth = (
+                np.clip(cloth_mask[crop_y1:crop_y2, crop_x1:crop_x2], 0, 1) > 0.3
+            ).astype(np.uint8) * 255
+            overlap = cv2.bitwise_and(roi_mask, roi_cloth)
+            has_cloth_in_roi = int((overlap > 0).sum()) > 100
+
+        if has_cloth_in_roi:
+            prompt = (
+                "clean clothing fabric, natural skin tone, smooth texture, "
+                "photorealistic, high quality, studio lighting, sharp focus, "
+                "no hair strands, clean neckline"
+            )
+        else:
+            prompt = (
+                "clean background, natural skin tone, smooth surface, "
+                "photorealistic, high quality, studio lighting, sharp focus, "
+                "no hair strands"
+            )
+        negative = (
+            "hair, hair strands, dark patches, black smudge, blur, "
+            "artifacts, distortion, ugly, deformed, low quality"
+        )
+
+        # ── 5) SD inpainting 실행 ────────────────────────────────────
+        try:
+            # IP-Adapter는 ROI cleanup에서 불필요 → scale 0
+            self._sd_pipe.set_ip_adapter_scale(0.0)
+
+            # IP-Adapter가 로드되어 있으므로 dummy face image 필요
+            dummy_face = Image.new("RGB", (224, 224), (128, 128, 128))
+
+            gen = torch.Generator(device=self.device).manual_seed(seed)
+            with torch.inference_mode():
+                out = self._sd_pipe(
+                    prompt=prompt,
+                    negative_prompt=negative,
+                    image=roi_pil,
+                    mask_image=mask_pil,
+                    control_image=canny_pil,
+                    ip_adapter_image=[dummy_face],
+                    height=SD_SIZE,
+                    width=SD_SIZE,
+                    num_inference_steps=15,  # 빠르게 (full gen은 25~30)
+                    guidance_scale=5.0,
+                    controlnet_conditioning_scale=0.35,
+                    num_images_per_prompt=1,
+                    generator=[gen],
+                    strength=0.85,
+                )
+            sd_result_pil = out.images[0]
+
+            # IP-Adapter scale은 다음 generate 호출에서 재설정됨
+
+        except Exception as e:
+            logger.warning(f"[SDPipeline] SD ROI cleanup failed: {e}")
+            return img_rgb
+
+        # ── 6) 결과를 원본 해상도로 되돌리고 soft-blend ──────────────
+        sd_result_np = np.array(sd_result_pil)  # 512x512 RGB
+        sd_roi_rgb = cv2.resize(
+            sd_result_np, (crop_w, crop_h), interpolation=cv2.INTER_LANCZOS4
+        )
+
+        # Soft blend mask: 잔여물 영역에서만 SD 결과 적용
+        blend_mask = roi_mask.astype(np.float32) / 255.0
+        blend_mask = cv2.GaussianBlur(blend_mask, (0, 0), sigmaX=5.0, sigmaY=5.0)
+        blend_mask = np.clip(blend_mask, 0.0, 1.0)[..., np.newaxis]
+
+        # SD 결과와 원본을 soft blend
+        roi_blended = (
+            sd_roi_rgb.astype(np.float32) * blend_mask
+            + roi_rgb.astype(np.float32) * (1.0 - blend_mask)
+        )
+        roi_blended = np.clip(roi_blended, 0, 255).astype(np.uint8)
+
+        # 원본에 paste back
+        result = img_rgb.copy()
+        result[crop_y1:crop_y2, crop_x1:crop_x2] = roi_blended
+
+        logger.info(
+            f"[SDPipeline] SD ROI cleanup done: "
+            f"{residual_pixels}px cleaned with SD inpainting"
+        )
+        return result
+
     def _neutralize_short_generation_input(
         self,
         img_rgb: np.ndarray,
@@ -4565,6 +4760,91 @@ class MirrAISDPipeline:
                     )
                     iterative_cleanup_count += 1
 
+            # ── SD inpainting ROI cleanup ─────────────────────────────────
+            # Iterative LaMa 후에도 남은 dark residual을 SD inpainting으로 채운다.
+            # LaMa는 큰 영역의 texture 복원에 한계가 있으므로, 남은 잔여물 ROI만
+            # SD pipe로 재생성하여 옷/피부/배경 텍스처를 자연스럽게 복원한다.
+            sd_roi_applied = False
+            if _has_cloth and self._sd_pipe is not None:
+                # 잔여물 재감지: iterative cleanup 후 기준으로 재스캔
+                sd_detect_lab = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+                sd_detect_L = sd_detect_lab[:, :, 0]
+
+                sd_residual_u8 = np.zeros((H, W), dtype=np.uint8)
+
+                # Cloth dark outliers (1.2σ — iterative보다 더 엄격하게 잡음)
+                sd_cloth_ref = sd_detect_L[cloth_ref_mask > 0]
+                if len(sd_cloth_ref) >= 64:
+                    sd_cloth_med = float(np.median(sd_cloth_ref))
+                    sd_cloth_std = max(float(np.std(sd_cloth_ref)), 6.0)
+                    sd_cloth_thresh = sd_cloth_med - sd_cloth_std * 1.2
+                    sd_cloth_dark = (
+                        (cloth_scan_base > 0) & (sd_detect_L < sd_cloth_thresh)
+                    ).astype(np.uint8) * 255
+                    sd_residual_u8 = cv2.bitwise_or(sd_residual_u8, sd_cloth_dark)
+
+                # Background dark outliers
+                sd_bg_ref = sd_detect_L[bg_ref_mask > 0]
+                if len(sd_bg_ref) >= 64:
+                    sd_bg_med = float(np.median(sd_bg_ref))
+                    sd_bg_std = max(float(np.std(sd_bg_ref)), 6.0)
+                    sd_bg_thresh = sd_bg_med - sd_bg_std * 1.0
+                    sd_bg_dark = (
+                        (bg_scan_base > 0) & (sd_detect_L < sd_bg_thresh)
+                    ).astype(np.uint8) * 255
+                    sd_residual_u8 = cv2.bitwise_or(sd_residual_u8, sd_bg_dark)
+
+                # Constraints
+                sd_residual_u8[:cleanup_roi_top, :] = 0
+                sd_residual_u8 = cv2.bitwise_and(sd_residual_u8, corridor)
+                sd_residual_u8 = cv2.bitwise_and(sd_residual_u8, cv2.bitwise_not(protect_u8))
+                if int((residual_keepout_u8 > 0).sum()) > 0:
+                    sd_residual_u8 = cv2.bitwise_and(
+                        sd_residual_u8, cv2.bitwise_not(residual_keepout_u8)
+                    )
+
+                # Component filtering
+                if int((sd_residual_u8 > 0).sum()) > 0:
+                    n_sd, lbl_sd, stats_sd, _ = cv2.connectedComponentsWithStats(
+                        sd_residual_u8, connectivity=8
+                    )
+                    sd_filtered = np.zeros_like(sd_residual_u8)
+                    for sd_lbl in range(1, n_sd):
+                        if stats_sd[sd_lbl, cv2.CC_STAT_AREA] >= 80:
+                            sd_filtered[lbl_sd == sd_lbl] = 255
+                    sd_residual_u8 = sd_filtered
+
+                # Morphological cleanup
+                if int((sd_residual_u8 > 0).sum()) >= 300:
+                    sd_residual_u8 = cv2.morphologyEx(
+                        sd_residual_u8,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+                    )
+
+                sd_residual_pixels = int((sd_residual_u8 > 0).sum())
+                logger.info(
+                    f"[SDPipeline] SD ROI residual detection: {sd_residual_pixels}px remaining"
+                )
+
+                if sd_residual_pixels >= 300:
+                    _use_seed = seed if seed is not None else 42
+                    result_rgb = self._sd_inpaint_roi_cleanup(
+                        result_rgb,
+                        sd_residual_u8,
+                        face_bbox,
+                        protect_mask=protect_mask,
+                        cloth_mask=cloth_mask,
+                        seed=_use_seed,
+                        roi_pad_ratio=0.30,
+                        min_residual_pixels=300,
+                    )
+                    sd_roi_applied = True
+                    # 누적 cleanup mask 업데이트
+                    iterative_total_mask_u8 = cv2.bitwise_or(
+                        iterative_total_mask_u8, sd_residual_u8
+                    )
+
             # ── Poisson blending (seamlessClone) ─────────────────────────
             # src = cleanup 완료된 이미지 (LaMa가 채운 텍스처)
             # dst = cleanup 전 원본에서 force_u8 영역만 주변색으로 neutralize한 이미지
@@ -4766,6 +5046,7 @@ class MirrAISDPipeline:
                 "pipeline_iterative_cleanup_mask": iterative_total_mask_u8.astype(np.float32) / 255.0,
                 "iterative_cleanup_count": iterative_cleanup_count,
                 "poisson_blend_applied": poisson_applied,
+                "sd_roi_cleanup_applied": sd_roi_applied,
                 "boundary_interpolation_used": boundary_y_map is not None,
             }
             if cv2_post_rgb is not None:
