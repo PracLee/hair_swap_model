@@ -260,6 +260,10 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         return_base64  = _coerce_bool(inp.get("return_base64"), default=True)
         return_intermediates = _coerce_bool(inp.get("return_intermediates"), default=False)
         bg_fill_mode   = normalize_bg_fill_mode(inp.get("bg_fill_mode", "lama"))
+
+        # ── cleanup tuning params (런타임 오버라이드) ──────────────────────
+        cleanup_params = inp.get("cleanup_params") or {}
+
         if not hairstyle_text and not color_text:
             return {"error": "hairstyle_text 또는 color_text 중 하나 이상 필요합니다."}
 
@@ -290,6 +294,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             color_text=color_text,
             top_k=top_k,
             return_intermediates=return_intermediates,
+            cleanup_params=cleanup_params,
         )
 
         # ── 결과 직렬화 ───────────────────────────────────────────────────────

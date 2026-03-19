@@ -271,6 +271,7 @@ class MirrAISDPipeline:
         color_text: str,
         top_k: int = 3,
         return_intermediates: bool = False,
+        cleanup_params: Optional[Dict[str, Any]] = None,
     ) -> List[SDInpaintResult]:
         """
         헤어 스타일 변환 실행.
@@ -1408,6 +1409,11 @@ class MirrAISDPipeline:
         seed: int = 42,
         roi_pad_ratio: float = 0.25,
         min_residual_pixels: int = 300,
+        sd_strength: float = 0.85,
+        sd_steps: int = 15,
+        sd_blend_sigma: float = 5.0,
+        sd_guidance: float = 5.0,
+        sd_controlnet: float = 0.35,
     ) -> np.ndarray:
         """
         Iterative LaMa cleanup 후 남은 잔여물을 SD inpainting으로 채운다.
@@ -1550,12 +1556,12 @@ class MirrAISDPipeline:
                     ip_adapter_image=[dummy_face],
                     height=SD_SIZE,
                     width=SD_SIZE,
-                    num_inference_steps=15,  # 빠르게 (full gen은 25~30)
-                    guidance_scale=5.0,
-                    controlnet_conditioning_scale=0.35,
+                    num_inference_steps=sd_steps,
+                    guidance_scale=sd_guidance,
+                    controlnet_conditioning_scale=sd_controlnet,
                     num_images_per_prompt=1,
                     generator=[gen],
-                    strength=0.85,
+                    strength=sd_strength,
                 )
             sd_result_pil = out.images[0]
 
@@ -1573,7 +1579,7 @@ class MirrAISDPipeline:
 
         # Soft blend mask: 잔여물 영역에서만 SD 결과 적용
         blend_mask = roi_mask.astype(np.float32) / 255.0
-        blend_mask = cv2.GaussianBlur(blend_mask, (0, 0), sigmaX=5.0, sigmaY=5.0)
+        blend_mask = cv2.GaussianBlur(blend_mask, (0, 0), sigmaX=sd_blend_sigma, sigmaY=sd_blend_sigma)
         blend_mask = np.clip(blend_mask, 0.0, 1.0)[..., np.newaxis]
 
         # SD 결과와 원본을 soft blend
@@ -4629,6 +4635,26 @@ class MirrAISDPipeline:
             iterative_total_mask_u8 = np.zeros((H, W), dtype=np.uint8)
             poisson_applied = False
             _has_cloth = cloth_mask is not None and cloth_mask.shape == (H, W)
+
+            # ── cleanup tuning params (API 런타임 오버라이드) ──────────
+            _cp = cleanup_params or {}
+            _cp_iter_cloth_sigmas = _cp.get("iter_cloth_sigmas", [1.4, 1.7, 2.0, 2.3, 2.6])
+            _cp_iter_bg_sigmas = _cp.get("iter_bg_sigmas", [1.2, 1.5, 1.8, 2.1, 2.4])
+            _cp_sd_cloth_sigma = float(_cp.get("sd_cloth_sigma", 1.2))
+            _cp_sd_bg_sigma = float(_cp.get("sd_bg_sigma", 1.0))
+            _cp_sd_strength = float(_cp.get("sd_strength", 0.85))
+            _cp_sd_steps = int(_cp.get("sd_steps", 15))
+            _cp_sd_blend_sigma = float(_cp.get("sd_blend_sigma", 5.0))
+            _cp_sd_comp_min = int(_cp.get("sd_comp_min", 80))
+            _cp_sd_guidance = float(_cp.get("sd_guidance", 5.0))
+            _cp_sd_controlnet = float(_cp.get("sd_controlnet", 0.35))
+            logger.info(
+                f"[SDPipeline] cleanup_params: iter_cloth_sigmas={_cp_iter_cloth_sigmas}, "
+                f"iter_bg_sigmas={_cp_iter_bg_sigmas}, sd_cloth_sigma={_cp_sd_cloth_sigma}, "
+                f"sd_bg_sigma={_cp_sd_bg_sigma}, sd_strength={_cp_sd_strength}, "
+                f"sd_steps={_cp_sd_steps}, sd_blend_sigma={_cp_sd_blend_sigma}, "
+                f"sd_comp_min={_cp_sd_comp_min}"
+            )
             if _has_cloth:
                 cleanup_roi_top = min(H, int(cutoff_y + face_h * 0.08))
                 cleanup_roi_bottom = min(H, int(cutoff_y + face_h * 1.60))
@@ -4676,8 +4702,13 @@ class MirrAISDPipeline:
 
                 max_iterations = 5
                 # Start aggressive on first pass, relax each iteration
-                cloth_sigma_schedule = [1.4, 1.7, 2.0, 2.3, 2.6]
-                bg_sigma_schedule = [1.2, 1.5, 1.8, 2.1, 2.4]
+                cloth_sigma_schedule = _cp_iter_cloth_sigmas[:max_iterations]
+                bg_sigma_schedule = _cp_iter_bg_sigmas[:max_iterations]
+                # Pad if shorter than max_iterations
+                while len(cloth_sigma_schedule) < max_iterations:
+                    cloth_sigma_schedule.append(cloth_sigma_schedule[-1] + 0.3)
+                while len(bg_sigma_schedule) < max_iterations:
+                    bg_sigma_schedule.append(bg_sigma_schedule[-1] + 0.3)
                 min_iter_pixels = 48
 
                 for iter_i in range(max_iterations):
@@ -4772,12 +4803,12 @@ class MirrAISDPipeline:
 
                 sd_residual_u8 = np.zeros((H, W), dtype=np.uint8)
 
-                # Cloth dark outliers (1.2σ — iterative보다 더 엄격하게 잡음)
+                # Cloth dark outliers (configurable σ — iterative보다 더 엄격하게 잡음)
                 sd_cloth_ref = sd_detect_L[cloth_ref_mask > 0]
                 if len(sd_cloth_ref) >= 64:
                     sd_cloth_med = float(np.median(sd_cloth_ref))
                     sd_cloth_std = max(float(np.std(sd_cloth_ref)), 6.0)
-                    sd_cloth_thresh = sd_cloth_med - sd_cloth_std * 1.2
+                    sd_cloth_thresh = sd_cloth_med - sd_cloth_std * _cp_sd_cloth_sigma
                     sd_cloth_dark = (
                         (cloth_scan_base > 0) & (sd_detect_L < sd_cloth_thresh)
                     ).astype(np.uint8) * 255
@@ -4788,7 +4819,7 @@ class MirrAISDPipeline:
                 if len(sd_bg_ref) >= 64:
                     sd_bg_med = float(np.median(sd_bg_ref))
                     sd_bg_std = max(float(np.std(sd_bg_ref)), 6.0)
-                    sd_bg_thresh = sd_bg_med - sd_bg_std * 1.0
+                    sd_bg_thresh = sd_bg_med - sd_bg_std * _cp_sd_bg_sigma
                     sd_bg_dark = (
                         (bg_scan_base > 0) & (sd_detect_L < sd_bg_thresh)
                     ).astype(np.uint8) * 255
@@ -4810,7 +4841,7 @@ class MirrAISDPipeline:
                     )
                     sd_filtered = np.zeros_like(sd_residual_u8)
                     for sd_lbl in range(1, n_sd):
-                        if stats_sd[sd_lbl, cv2.CC_STAT_AREA] >= 80:
+                        if stats_sd[sd_lbl, cv2.CC_STAT_AREA] >= _cp_sd_comp_min:
                             sd_filtered[lbl_sd == sd_lbl] = 255
                     sd_residual_u8 = sd_filtered
 
@@ -4838,6 +4869,11 @@ class MirrAISDPipeline:
                         seed=_use_seed,
                         roi_pad_ratio=0.30,
                         min_residual_pixels=300,
+                        sd_strength=_cp_sd_strength,
+                        sd_steps=_cp_sd_steps,
+                        sd_blend_sigma=_cp_sd_blend_sigma,
+                        sd_guidance=_cp_sd_guidance,
+                        sd_controlnet=_cp_sd_controlnet,
                     )
                     sd_roi_applied = True
                     # 누적 cleanup mask 업데이트
