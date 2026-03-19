@@ -4187,11 +4187,12 @@ class MirrAISDPipeline:
                 )
                 result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
 
-            # ── Color-guided residual detection ──────────────────────────
-            # After all geometric cleanup, detect remaining dark anomalies
-            # by comparing pixel luminance against surrounding context.
-            color_residual_u8 = np.zeros((H, W), dtype=np.uint8)
-            color_residual_applied = False
+            # ── Iterative color-guided residual cleanup ───────────────────
+            # Repeatedly detect dark anomalies by LAB lightness comparison
+            # against cloth/background references, then LaMa fill.
+            # Each iteration the mask shrinks as LaMa fills progressively.
+            iterative_cleanup_count = 0
+            iterative_total_mask_u8 = np.zeros((H, W), dtype=np.uint8)
             poisson_applied = False
             _has_cloth = cloth_mask is not None and cloth_mask.shape == (H, W)
             if _has_cloth:
@@ -4200,10 +4201,6 @@ class MirrAISDPipeline:
                 cleanup_roi_left = max(0, int(cx - face_w * 1.20))
                 cleanup_roi_right = min(W, int(cx + face_w * 1.20))
 
-                result_lab = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-                result_L = result_lab[:, :, 0]
-
-                # Cloth reference: median L from unoccluded cloth outside cleanup ROI
                 _cloth_u8 = (np.clip(cloth_mask, 0.0, 1.0) > 0.16).astype(np.uint8) * 255
                 if int((_cloth_u8 > 0).sum()) > 0:
                     _cloth_u8 = cv2.dilate(
@@ -4211,139 +4208,164 @@ class MirrAISDPipeline:
                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
                         iterations=1,
                     )
-                cloth_ref_mask = _cloth_u8.copy()
-                cloth_ref_mask[cleanup_roi_top:cleanup_roi_bottom,
-                               cleanup_roi_left:cleanup_roi_right] = 0
-                if protect_mask is not None:
-                    cloth_ref_mask = cv2.bitwise_and(
-                        cloth_ref_mask,
-                        cv2.bitwise_not(
-                            (np.clip(protect_mask, 0.0, 1.0) > 0.5).astype(np.uint8) * 255
-                        ),
-                    )
-                cloth_ref_pixels = result_L[cloth_ref_mask > 0]
-                if len(cloth_ref_pixels) >= 64:
-                    cloth_median_L = float(np.median(cloth_ref_pixels))
-                    cloth_std_L = max(float(np.std(cloth_ref_pixels)), 6.0)
-                    # Stricter threshold: only catch truly dark outliers
-                    cloth_dark_thresh = min(cloth_median_L - cloth_std_L * 2.8, 90.0)
-                    cloth_scan_u8 = cv2.bitwise_and(force_u8, _cloth_u8)
-                    cloth_scan_u8[:cleanup_roi_top, :] = 0
-                    cloth_dark_u8 = (
-                        (cloth_scan_u8 > 0) & (result_L < cloth_dark_thresh)
-                    ).astype(np.uint8) * 255
-                    color_residual_u8 = cv2.bitwise_or(color_residual_u8, cloth_dark_u8)
-
-                # Background reference
                 protect_u8 = (
                     (np.clip(protect_mask, 0.0, 1.0) > 0.5).astype(np.uint8) * 255
                     if protect_mask is not None
                     else np.zeros((H, W), dtype=np.uint8)
                 )
+
+                # Build static reference regions (outside cleanup ROI)
+                cloth_ref_mask = _cloth_u8.copy()
+                cloth_ref_mask[cleanup_roi_top:cleanup_roi_bottom,
+                               cleanup_roi_left:cleanup_roi_right] = 0
+                cloth_ref_mask = cv2.bitwise_and(cloth_ref_mask, cv2.bitwise_not(protect_u8))
+
                 bg_ref_mask = cv2.bitwise_not(cv2.bitwise_or(_cloth_u8, protect_u8))
                 bg_ref_mask[cleanup_roi_top:cleanup_roi_bottom,
                             cleanup_roi_left:cleanup_roi_right] = 0
                 bg_ref_mask = cv2.bitwise_and(bg_ref_mask, corridor)
-                bg_ref_pixels = result_L[bg_ref_mask > 0]
-                if len(bg_ref_pixels) >= 64:
-                    bg_median_L = float(np.median(bg_ref_pixels))
-                    bg_std_L = max(float(np.std(bg_ref_pixels)), 6.0)
-                    bg_dark_thresh = min(bg_median_L - bg_std_L * 2.5, 85.0)
-                    bg_check_u8 = cv2.bitwise_and(force_u8, cv2.bitwise_not(_cloth_u8))
-                    bg_dark_u8 = (
-                        (bg_check_u8 > 0) & (result_L < bg_dark_thresh)
-                    ).astype(np.uint8) * 255
-                    color_residual_u8 = cv2.bitwise_or(color_residual_u8, bg_dark_u8)
 
-                # Constraints
-                color_residual_u8[:cleanup_roi_top, :] = 0
-                color_residual_u8 = cv2.bitwise_and(color_residual_u8, corridor)
-                if protect_mask is not None:
-                    color_residual_u8 = cv2.bitwise_and(
-                        color_residual_u8, cv2.bitwise_not(protect_u8)
-                    )
-                if int((residual_keepout_u8 > 0).sum()) > 0:
-                    color_residual_u8 = cv2.bitwise_and(
-                        color_residual_u8, cv2.bitwise_not(residual_keepout_u8)
-                    )
-                # Remove small components
-                if int((color_residual_u8 > 0).sum()) > 0:
-                    num_labels_c, labels_c, stats_c, _ = cv2.connectedComponentsWithStats(
-                        color_residual_u8, connectivity=8
-                    )
-                    min_color_area = max(48, int(face_w * 0.18))
-                    max_color_area = int(face_w * face_h * 0.35)
-                    filtered_color_u8 = np.zeros_like(color_residual_u8)
-                    for lbl in range(1, num_labels_c):
-                        comp_area = stats_c[lbl, cv2.CC_STAT_AREA]
-                        if comp_area >= min_color_area and comp_area <= max_color_area:
-                            filtered_color_u8[labels_c == lbl] = 255
-                    color_residual_u8 = filtered_color_u8
+                # Scan region: within force_u8 (geometric cleanup area)
+                cloth_scan_base = cv2.bitwise_and(force_u8, _cloth_u8)
+                cloth_scan_base[:cleanup_roi_top, :] = 0
+                bg_scan_base = cv2.bitwise_and(force_u8, cv2.bitwise_not(_cloth_u8))
+                bg_scan_base[:cleanup_roi_top, :] = 0
 
-                if int((color_residual_u8 > 0).sum()) >= 48:
-                    color_residual_u8 = cv2.morphologyEx(
-                        color_residual_u8,
+                max_iterations = 3
+                # Start aggressive on first pass, relax each iteration
+                cloth_sigma_schedule = [2.2, 2.5, 2.8]
+                bg_sigma_schedule = [2.0, 2.3, 2.6]
+                min_iter_pixels = 48
+
+                for iter_i in range(max_iterations):
+                    # Re-detect on current result
+                    iter_lab = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+                    iter_L = iter_lab[:, :, 0]
+
+                    iter_mask_u8 = np.zeros((H, W), dtype=np.uint8)
+
+                    # Cloth dark outliers
+                    cloth_ref_pixels = iter_L[cloth_ref_mask > 0]
+                    if len(cloth_ref_pixels) >= 64:
+                        cloth_med = float(np.median(cloth_ref_pixels))
+                        cloth_std = max(float(np.std(cloth_ref_pixels)), 6.0)
+                        cloth_thresh = cloth_med - cloth_std * cloth_sigma_schedule[iter_i]
+                        cloth_dark = (
+                            (cloth_scan_base > 0) & (iter_L < cloth_thresh)
+                        ).astype(np.uint8) * 255
+                        iter_mask_u8 = cv2.bitwise_or(iter_mask_u8, cloth_dark)
+
+                    # Background dark outliers
+                    bg_ref_pixels = iter_L[bg_ref_mask > 0]
+                    if len(bg_ref_pixels) >= 64:
+                        bg_med = float(np.median(bg_ref_pixels))
+                        bg_std = max(float(np.std(bg_ref_pixels)), 6.0)
+                        bg_thresh = bg_med - bg_std * bg_sigma_schedule[iter_i]
+                        bg_dark = (
+                            (bg_scan_base > 0) & (iter_L < bg_thresh)
+                        ).astype(np.uint8) * 255
+                        iter_mask_u8 = cv2.bitwise_or(iter_mask_u8, bg_dark)
+
+                    # Apply constraints
+                    iter_mask_u8[:cleanup_roi_top, :] = 0
+                    iter_mask_u8 = cv2.bitwise_and(iter_mask_u8, corridor)
+                    iter_mask_u8 = cv2.bitwise_and(iter_mask_u8, cv2.bitwise_not(protect_u8))
+                    if int((residual_keepout_u8 > 0).sum()) > 0:
+                        iter_mask_u8 = cv2.bitwise_and(
+                            iter_mask_u8, cv2.bitwise_not(residual_keepout_u8)
+                        )
+
+                    # Filter small noise components
+                    if int((iter_mask_u8 > 0).sum()) > 0:
+                        n_lbl, lbl_map, lbl_stats, _ = cv2.connectedComponentsWithStats(
+                            iter_mask_u8, connectivity=8
+                        )
+                        min_area = max(36, int(face_w * 0.14))
+                        filtered = np.zeros_like(iter_mask_u8)
+                        for lbl in range(1, n_lbl):
+                            if lbl_stats[lbl, cv2.CC_STAT_AREA] >= min_area:
+                                filtered[lbl_map == lbl] = 255
+                        iter_mask_u8 = filtered
+
+                    iter_pixels = int((iter_mask_u8 > 0).sum())
+                    if iter_pixels < min_iter_pixels:
+                        break  # Converged — nothing left to clean
+
+                    # Morphological cleanup for mask coherence
+                    iter_mask_u8 = cv2.morphologyEx(
+                        iter_mask_u8,
                         cv2.MORPH_CLOSE,
                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
                     )
-                    color_residual_u8 = cv2.dilate(
-                        color_residual_u8,
-                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 9)),
+                    iter_mask_u8 = cv2.dilate(
+                        iter_mask_u8,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 7)),
                         iterations=1,
                     )
+
+                    # LaMa fill this iteration's residual
                     result_rgb, _ = self._lama_inpaint_region_blend(
                         result_rgb,
-                        color_residual_u8,
+                        iter_mask_u8,
                         sigma=5.0,
                         protect_mask=protect_mask,
                         dilate_kernel_size=5,
-                        min_pixels=48,
+                        min_pixels=min_iter_pixels,
                     )
-                    color_residual_applied = True
+                    iterative_total_mask_u8 = cv2.bitwise_or(
+                        iterative_total_mask_u8, iter_mask_u8
+                    )
+                    iterative_cleanup_count += 1
 
-            # ── Boundary smoothing via guided filter ─────────────────────
-            # Smooth the seam between inpainted and original regions using
-            # edge-aware bilateral filtering on the boundary band only.
+            # ── Poisson blending (seamlessClone) ─────────────────────────
+            # After iterative cleanup, both src and dst are clean.
+            # Use seamlessClone to smooth the boundary between the
+            # inpainted region and its surroundings.
             all_cleanup_u8 = force_u8.copy()
-            if color_residual_applied:
-                all_cleanup_u8 = cv2.bitwise_or(all_cleanup_u8, color_residual_u8)
+            if iterative_cleanup_count > 0:
+                all_cleanup_u8 = cv2.bitwise_or(all_cleanup_u8, iterative_total_mask_u8)
             poisson_pixels = int((all_cleanup_u8 > 0).sum())
             if poisson_pixels >= 200:
-                # Create boundary band: dilated minus eroded
-                boundary_outer = cv2.dilate(
+                poisson_mask_u8 = cv2.dilate(
                     all_cleanup_u8,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
                     iterations=1,
                 )
-                boundary_inner = cv2.erode(
-                    all_cleanup_u8,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
-                    iterations=1,
+                poisson_mask_u8 = cv2.bitwise_and(
+                    poisson_mask_u8, cv2.bitwise_not(
+                        (np.clip(protect_mask, 0.0, 1.0) > 0.5).astype(np.uint8) * 255
+                    ) if protect_mask is not None else np.full((H, W), 255, dtype=np.uint8)
                 )
-                boundary_band_u8 = cv2.bitwise_and(
-                    boundary_outer, cv2.bitwise_not(boundary_inner)
-                )
-                if protect_mask is not None:
-                    boundary_band_u8 = cv2.bitwise_and(
-                        boundary_band_u8,
-                        cv2.bitwise_not(
-                            (np.clip(protect_mask, 0.0, 1.0) > 0.5).astype(np.uint8) * 255
-                        ),
-                    )
-                if int((boundary_band_u8 > 0).sum()) >= 100:
-                    # Bilateral filter smooths color while preserving edges
-                    smoothed = cv2.bilateralFilter(result_rgb, d=9, sigmaColor=45, sigmaSpace=45)
-                    boundary_alpha = cv2.GaussianBlur(
-                        boundary_band_u8.astype(np.float32) / 255.0,
-                        (0, 0), sigmaX=5.0, sigmaY=5.0,
-                    )
-                    boundary_alpha = np.clip(boundary_alpha * 0.55, 0.0, 0.55)[..., np.newaxis]
-                    result_rgb = (
-                        smoothed.astype(np.float32) * boundary_alpha
-                        + result_rgb.astype(np.float32) * (1.0 - boundary_alpha)
-                    )
-                    result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
-                    poisson_applied = True
+                ys_p, xs_p = np.where(poisson_mask_u8 > 0)
+                if len(ys_p) >= 200:
+                    center_x = int((xs_p.min() + xs_p.max()) // 2)
+                    center_y = int((ys_p.min() + ys_p.max()) // 2)
+                    # Save pre-Poisson state as dst (already clean)
+                    pre_poisson_rgb = result_rgb.copy()
+                    try:
+                        # Smooth result into itself — boundary harmonization
+                        poisson_out = cv2.seamlessClone(
+                            result_rgb[:, :, ::-1],       # src: current clean result
+                            pre_poisson_rgb[:, :, ::-1],  # dst: same clean result
+                            poisson_mask_u8,
+                            (center_x, center_y),
+                            cv2.NORMAL_CLONE,
+                        )
+                        poisson_rgb = poisson_out[:, :, ::-1]
+                        # Soft blend: 45% Poisson smoothed + 55% original
+                        p_alpha = cv2.GaussianBlur(
+                            poisson_mask_u8.astype(np.float32) / 255.0,
+                            (0, 0), sigmaX=6.0, sigmaY=6.0,
+                        )
+                        p_alpha = np.clip(p_alpha * 0.45, 0.0, 0.45)[..., np.newaxis]
+                        result_rgb = (
+                            poisson_rgb.astype(np.float32) * p_alpha
+                            + result_rgb.astype(np.float32) * (1.0 - p_alpha)
+                        )
+                        result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
+                        poisson_applied = True
+                    except cv2.error:
+                        pass
 
         if return_debug:
             debug_bundle = {
@@ -4368,8 +4390,8 @@ class MirrAISDPipeline:
                 "short_side_panel_area": side_panel_area_total,
                 "short_front_panel_count": front_panel_count,
                 "short_side_panel_count": side_panel_count,
-                "pipeline_color_residual_mask": color_residual_u8.astype(np.float32) / 255.0,
-                "color_residual_applied": color_residual_applied,
+                "pipeline_iterative_cleanup_mask": iterative_total_mask_u8.astype(np.float32) / 255.0,
+                "iterative_cleanup_count": iterative_cleanup_count,
                 "poisson_blend_applied": poisson_applied,
             }
             if cv2_post_rgb is not None:
