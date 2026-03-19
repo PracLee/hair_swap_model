@@ -218,6 +218,16 @@ class SDInpaintConfig:
     roi_stronger_mask_expand_px: int = 4
     roi_stronger_mask_blur_px: int = 4
 
+    # short lower-panel cleanup: 기존 경량 경로 위에 얹는 ROI ControlNet polish
+    enable_short_roi_control_cleanup: bool = True
+    short_roi_control_target_size: int = 512
+    short_roi_control_steps: int = 12
+    short_roi_control_guidance_scale: float = 6.8
+    short_roi_control_conditioning_scale: float = 0.42
+    short_roi_control_strength: float = 0.38
+    short_roi_control_mask_expand_px: int = 4
+    short_roi_control_mask_blur_px: int = 4
+
     def __post_init__(self) -> None:
         self.bg_fill_mode = normalize_bg_fill_mode(self.bg_fill_mode)
         self.roi_stronger_backend = str(self.roi_stronger_backend or "sdxl").strip().lower()
@@ -232,6 +242,10 @@ class SDInpaintConfig:
             raise ValueError("roi_stronger_target_size must be >= 256")
         if self.roi_stronger_steps < 1:
             raise ValueError("roi_stronger_steps must be >= 1")
+        if self.short_roi_control_target_size < 256:
+            raise ValueError("short_roi_control_target_size must be >= 256")
+        if self.short_roi_control_steps < 1:
+            raise ValueError("short_roi_control_steps must be >= 1")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2893,20 +2907,23 @@ class MirrAISDPipeline:
         face_w = max(int(x2 - x1), 1)
         face_h = max(int(y2 - y1), 1)
 
-        crop_x1 = max(0, int(xs.min()) - max(24, int(face_w * 0.30)))
-        crop_x2 = min(W, int(xs.max()) + 1 + max(24, int(face_w * 0.30)))
+        # lower-panel ROI는 원래보다 더 넓게 잘라 옷/피부 문맥을 충분히 남긴다.
+        x_pad = max(40, int(face_w * 0.55))
+        bottom_pad = max(44, int(face_h * 0.68))
+        crop_x1 = max(0, int(xs.min()) - x_pad)
+        crop_x2 = min(W, int(xs.max()) + 1 + x_pad)
         crop_y1 = max(
             0,
             min(
-                int(np.clip(cutoff_y - face_h * 0.08, 0, H - 1)),
-                int(ys.min()) - max(12, int(face_h * 0.05)),
+                int(np.clip(cutoff_y - face_h * 0.20, 0, H - 1)),
+                int(ys.min()) - max(20, int(face_h * 0.12)),
             ),
         )
         crop_y2 = min(
             H,
             max(
-                int(ys.max()) + 1 + max(28, int(face_h * 0.42)),
-                int(np.clip(cutoff_y + face_h * 1.30, 0, H)),
+                int(ys.max()) + 1 + bottom_pad,
+                int(np.clip(cutoff_y + face_h * 1.75, 0, H)),
             ),
         )
 
@@ -2914,9 +2931,9 @@ class MirrAISDPipeline:
             shoulder_u8 = (np.clip(shoulder_protect, 0.0, 1.0) > 0.24).astype(np.uint8) * 255
             shoulder_ys, shoulder_xs = np.where(shoulder_u8 > 0)
             if shoulder_ys.size > 0 and shoulder_xs.size > 0:
-                crop_x1 = max(0, min(crop_x1, int(shoulder_xs.min()) - 12))
-                crop_x2 = min(W, max(crop_x2, int(shoulder_xs.max()) + 13))
-                crop_y2 = min(H, max(crop_y2, int(shoulder_ys.max()) + 13))
+                crop_x1 = max(0, min(crop_x1, int(shoulder_xs.min()) - 20))
+                crop_x2 = min(W, max(crop_x2, int(shoulder_xs.max()) + 21))
+                crop_y2 = min(H, max(crop_y2, int(shoulder_ys.max()) + 21))
 
         if crop_x2 - crop_x1 < 64 or crop_y2 - crop_y1 < 64:
             return None
@@ -2941,6 +2958,207 @@ class MirrAISDPipeline:
             local_face_bbox,
             debug,
         )
+
+    @staticmethod
+    def _build_soft_mask_from_u8(
+        mask_u8: np.ndarray,
+        expand_px: int,
+        blur_px: int,
+    ) -> np.ndarray:
+        soft_mask_u8 = mask_u8.copy()
+        expand_px = max(0, int(expand_px))
+        if expand_px > 0:
+            k = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (expand_px * 2 + 1, expand_px * 2 + 1),
+            )
+            soft_mask_u8 = cv2.dilate(soft_mask_u8, k, iterations=1)
+
+        soft_mask = soft_mask_u8.astype(np.float32) / 255.0
+        blur_px = max(0, int(blur_px))
+        if blur_px > 0:
+            sigma = max(0.8, float(blur_px) * 0.5)
+            soft_mask = cv2.GaussianBlur(
+                soft_mask,
+                (0, 0),
+                sigmaX=sigma,
+                sigmaY=sigma,
+            )
+        return np.clip(soft_mask, 0.0, 1.0).astype(np.float32)
+
+    def _build_masked_real_edge_control(
+        self,
+        img_rgb: np.ndarray,
+        suppress_mask: np.ndarray,
+        kernel_size: int = 15,
+    ) -> np.ndarray:
+        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, self.config.canny_low, self.config.canny_high)
+        sup_u8 = (np.clip(suppress_mask.astype(np.float32), 0.0, 1.0) > 0.30).astype(np.uint8) * 255
+        k_size = max(3, int(kernel_size))
+        if k_size % 2 == 0:
+            k_size += 1
+        sup_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+        sup_u8 = cv2.dilate(sup_u8, sup_k, iterations=1)
+        masked_edges = cv2.bitwise_and(edges, cv2.bitwise_not(sup_u8))
+        return cv2.cvtColor(masked_edges, cv2.COLOR_GRAY2RGB)
+
+    @staticmethod
+    def _prepare_custom_control_inputs(
+        img_rgb: np.ndarray,
+        inpaint_mask: np.ndarray,
+        control_rgb: np.ndarray,
+        target_size: int,
+    ) -> Tuple[Image.Image, Image.Image, Image.Image, float, Tuple[int, int]]:
+        target_size = max(64, int(target_size))
+        if target_size % 8 != 0:
+            target_size -= target_size % 8
+            target_size = max(64, target_size)
+
+        H, W = img_rgb.shape[:2]
+        scale = target_size / max(H, W)
+        new_w = max(1, int(round(W * scale)))
+        new_h = max(1, int(round(H * scale)))
+        pad_l = (target_size - new_w) // 2
+        pad_t = (target_size - new_h) // 2
+
+        img_rs = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        img_canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+        img_canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = img_rs
+
+        mask_rs = cv2.resize(
+            np.clip(inpaint_mask.astype(np.float32), 0.0, 1.0),
+            (new_w, new_h),
+            interpolation=cv2.INTER_AREA,
+        )
+        mask_canvas = np.zeros((target_size, target_size), dtype=np.float32)
+        mask_canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = mask_rs
+
+        control_rs = cv2.resize(control_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        control_canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+        control_canvas[pad_t:pad_t + new_h, pad_l:pad_l + new_w] = control_rs
+
+        return (
+            Image.fromarray(img_canvas),
+            Image.fromarray((np.clip(mask_canvas, 0.0, 1.0) * 255.0).astype(np.uint8), mode="L"),
+            Image.fromarray(control_canvas),
+            scale,
+            (pad_l, pad_t),
+        )
+
+    def _run_short_roi_control_cleanup(
+        self,
+        base_rgb: np.ndarray,
+        removal_mask_u8: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        cutoff_y: int,
+        shoulder_protect: Optional[np.ndarray],
+        face_crop_pil: Optional[Image.Image],
+        seed: Optional[int],
+    ) -> Optional[Tuple[np.ndarray, Dict[str, Any]]]:
+        if not self.config.enable_short_roi_control_cleanup:
+            return None
+        if face_crop_pil is None or seed is None:
+            return None
+
+        roi_info = self._build_lower_panel_cleanup_roi(
+            removal_mask_u8.astype(np.float32) / 255.0,
+            face_bbox,
+            cutoff_y,
+            shoulder_protect=shoulder_protect,
+        )
+        if roi_info is None:
+            return None
+
+        y_slice, x_slice, _, roi_debug = roi_info
+        roi_rgb = base_rgb[y_slice, x_slice].copy()
+        roi_mask_u8 = removal_mask_u8[y_slice, x_slice].copy()
+        roi_mask = (roi_mask_u8 > 0).astype(np.float32)
+        if int((roi_mask > 0.5).sum()) < 64:
+            return None
+
+        control_rgb = self._build_masked_real_edge_control(
+            roi_rgb,
+            roi_mask,
+            kernel_size=11,
+        )
+        if int((control_rgb[..., 0] > 0).sum()) < 24:
+            return None
+
+        target_size = int(self.config.short_roi_control_target_size)
+        img_pil, mask_pil, control_pil, scale, pad = self._prepare_custom_control_inputs(
+            roi_rgb,
+            roi_mask,
+            control_rgb,
+            target_size=target_size,
+        )
+
+        prompt = (
+            "professional portrait photo, continuation of existing clothes and skin, "
+            "coherent neckline and shoulder contour, preserve original clothing texture and edge structure, "
+            "remove dark hair residue in masked region, seamless texture transition, photorealistic details"
+        )
+        negative_prompt = (
+            "long hair strands, dangling dark strand on clothing, ghosting, geometry artifact, "
+            "mismatched clothing texture, distorted shape, unnatural skin, blurry smeared texture, "
+            "melted details, duplicated collar edge, painting, cartoon"
+        )
+
+        self._sd_pipe.set_ip_adapter_scale(0.0)
+        generator = torch.Generator(device=self.device).manual_seed(int(seed))
+        with torch.inference_mode():
+            out = self._sd_pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                image=img_pil,
+                mask_image=mask_pil,
+                control_image=control_pil,
+                ip_adapter_image=[face_crop_pil],
+                height=target_size,
+                width=target_size,
+                num_inference_steps=int(self.config.short_roi_control_steps),
+                guidance_scale=float(self.config.short_roi_control_guidance_scale),
+                controlnet_conditioning_scale=float(
+                    self.config.short_roi_control_conditioning_scale
+                ),
+                num_images_per_prompt=1,
+                generator=generator,
+                strength=float(self.config.short_roi_control_strength),
+            )
+
+        gen_np = np.array(out.images[0].convert("RGB"))
+        pad_l, pad_t = pad
+        new_w = max(1, int(round(roi_rgb.shape[1] * scale)))
+        new_h = max(1, int(round(roi_rgb.shape[0] * scale)))
+        gen_cropped = gen_np[pad_t:pad_t + new_h, pad_l:pad_l + new_w]
+        gen_orig = cv2.resize(
+            gen_cropped,
+            (roi_rgb.shape[1], roi_rgb.shape[0]),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+
+        soft_mask = self._build_soft_mask_from_u8(
+            roi_mask_u8,
+            expand_px=self.config.short_roi_control_mask_expand_px,
+            blur_px=self.config.short_roi_control_mask_blur_px,
+        )
+        alpha = soft_mask[..., np.newaxis]
+        roi_composite = (
+            gen_orig.astype(np.float32) * alpha
+            + roi_rgb.astype(np.float32) * (1.0 - alpha)
+        )
+        roi_composite = np.clip(roi_composite, 0, 255).astype(np.uint8)
+
+        result_rgb = base_rgb.copy()
+        result_rgb[y_slice, x_slice] = roi_composite
+        debug_bundle: Dict[str, Any] = {
+            "pipeline_short_roi_cleanup_mask": soft_mask,
+            "pipeline_short_roi_real_edge_control": control_rgb,
+            "pipeline_short_roi_cleanup_result": roi_composite,
+            "pipeline_post_cleanup_backend": "lama_roi_control",
+        }
+        debug_bundle.update(roi_debug)
+        return result_rgb, debug_bundle
 
     def _build_roi_stronger_soft_mask(
         self,
@@ -4100,6 +4318,7 @@ class MirrAISDPipeline:
 
         post_cleanup_backend = "lama"
         roi_stronger_debug: Dict[str, Any] = {}
+        roi_control_debug: Dict[str, Any] = {}
         if hair_length == "short" and self.config.enable_roi_stronger_inpainter:
             try:
                 roi_stronger_result = self._run_roi_stronger_post_cleanup(
@@ -4282,6 +4501,19 @@ class MirrAISDPipeline:
                     + result_rgb.astype(np.float32) * (1.0 - residual_alpha)
                 )
                 result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
+
+            roi_control_result = self._run_short_roi_control_cleanup(
+                result_rgb,
+                force_u8,
+                face_bbox,
+                cutoff_y,
+                shoulder_protect,
+                face_crop_pil,
+                seed,
+            )
+            if roi_control_result is not None:
+                result_rgb, roi_control_debug = roi_control_result
+                post_cleanup_backend = "lama_roi_control"
         if return_debug:
             debug_bundle = {
                 "pipeline_lama_post_cleanup_mask": force_mask,
@@ -4303,6 +4535,8 @@ class MirrAISDPipeline:
             }
             if roi_stronger_debug:
                 debug_bundle.update(roi_stronger_debug)
+            if roi_control_debug:
+                debug_bundle.update(roi_control_debug)
             if cv2_post_rgb is not None:
                 debug_bundle["pipeline_cv2_post_cleanup_result"] = cv2_post_rgb
             if cv2_front_rgb is not None:
