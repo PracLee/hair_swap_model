@@ -3082,7 +3082,8 @@ class MirrAISDPipeline:
             roi_mask,
             kernel_size=11,
         )
-        if int((control_rgb[..., 0] > 0).sum()) < 24:
+        control_edge_pixels = int((control_rgb[..., 0] > 0).sum())
+        if control_edge_pixels < 4:
             return None
 
         target_size = int(self.config.short_roi_control_target_size)
@@ -3156,6 +3157,7 @@ class MirrAISDPipeline:
             "pipeline_short_roi_real_edge_control": control_rgb,
             "pipeline_short_roi_cleanup_result": roi_composite,
             "pipeline_post_cleanup_backend": "lama_roi_control",
+            "short_roi_control_edge_pixels": control_edge_pixels,
         }
         debug_bundle.update(roi_debug)
         return result_rgb, debug_bundle
