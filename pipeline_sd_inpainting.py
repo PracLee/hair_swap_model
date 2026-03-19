@@ -828,6 +828,7 @@ class MirrAISDPipeline:
                         face_crop_pil=face_crop_pil,
                         protect_mask=feature_protect_mask,
                         cloth_mask=cloth_mask_dilated,
+                        face_mask=face_region_mask,
                         seed=seed,
                         return_debug=post_debug_enabled,
                     )
@@ -3489,6 +3490,130 @@ class MirrAISDPipeline:
             }
         return result_rgb
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Skin-Cloth Boundary Interpolation (SegFace-guided)
+    # ──────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _interpolate_skin_cloth_boundary(
+        face_mask: np.ndarray,
+        cloth_mask: np.ndarray,
+        cleanup_mask_u8: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        cutoff_y: int,
+    ) -> Optional[np.ndarray]:
+        """
+        마스크 양쪽의 visible 영역에서 SegFace skin→cloth 전환 y좌표를 추출하고,
+        마스크 내부를 spline 보간으로 연결한 경계선 맵을 반환한다.
+
+        Returns:
+            boundary_y_map (W,) int array: 각 x좌표에서의 skin-cloth 경계 y좌표.
+            None if boundary detection fails.
+        """
+        H, W = face_mask.shape[:2]
+        x1, y1, x2, y2 = face_bbox
+        face_h = max(int(y2 - y1), 1)
+        face_w = max(int(x2 - x1), 1)
+        cx = int(0.5 * (x1 + x2))
+
+        skin_u8 = (np.clip(face_mask, 0.0, 1.0) > 0.3).astype(np.uint8)
+        cloth_u8 = (np.clip(cloth_mask, 0.0, 1.0) > 0.16).astype(np.uint8)
+        cleanup_bin = cleanup_mask_u8 > 0
+
+        # cleanup 영역의 좌우 경계 찾기
+        cleanup_cols = np.where(cleanup_bin.any(axis=0))[0]
+        if len(cleanup_cols) < 4:
+            return None
+        mask_left = int(cleanup_cols[0])
+        mask_right = int(cleanup_cols[-1])
+
+        # 양쪽 visible strip 폭 (mask 바깥)
+        strip_w = max(20, int(face_w * 0.25))
+
+        def _find_transition_y(strip_x1: int, strip_x2: int) -> Optional[int]:
+            """strip 내에서 skin→cloth 전환점 y좌표를 찾는다."""
+            s_x1 = max(0, strip_x1)
+            s_x2 = min(W, strip_x2)
+            if s_x2 <= s_x1:
+                return None
+            # cutoff_y 아래에서만 탐색
+            search_top = max(cutoff_y, y1)
+            search_bottom = min(H, int(y2 + face_h * 1.2))
+            if search_bottom <= search_top:
+                return None
+
+            skin_strip = skin_u8[search_top:search_bottom, s_x1:s_x2]
+            cloth_strip = cloth_u8[search_top:search_bottom, s_x1:s_x2]
+            strip_h = search_bottom - search_top
+            if strip_h < 4:
+                return None
+
+            # 각 행의 skin/cloth 비율
+            skin_ratio = skin_strip.mean(axis=1).astype(np.float32)
+            cloth_ratio = cloth_strip.mean(axis=1).astype(np.float32)
+
+            # skin이 우세하다가 cloth가 우세해지는 전환점 찾기
+            diff = cloth_ratio - skin_ratio
+            # smoothing
+            kernel_size = max(3, min(15, strip_h // 4))
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+            from scipy.ndimage import uniform_filter1d
+            diff_smooth = uniform_filter1d(diff.astype(np.float64), size=kernel_size).astype(np.float32)
+
+            # 음→양 전환점 (skin 우세 → cloth 우세)
+            transitions = []
+            for row_i in range(1, len(diff_smooth)):
+                if diff_smooth[row_i - 1] < 0 and diff_smooth[row_i] >= 0:
+                    transitions.append(row_i)
+
+            if not transitions:
+                # fallback: cloth가 처음으로 지배적인 행
+                cloth_dominant = np.where(cloth_ratio > 0.3)[0]
+                if len(cloth_dominant) > 0:
+                    return int(search_top + cloth_dominant[0])
+                return None
+
+            # 가장 첫 번째 전환점 (위에서 아래로)
+            return int(search_top + transitions[0])
+
+        # 좌측 visible strip의 전환점
+        left_y = _find_transition_y(mask_left - strip_w, mask_left)
+        # 우측 visible strip의 전환점
+        right_y = _find_transition_y(mask_right, mask_right + strip_w)
+
+        if left_y is None and right_y is None:
+            return None
+
+        # 하나만 있으면 다른 쪽도 같은 값 사용
+        if left_y is None:
+            left_y = right_y
+        if right_y is None:
+            right_y = left_y
+
+        # 탐색 범위 바깥의 x 좌표에도 경계선 확장
+        # spline으로 보간 (선형이면 충분 — 목선은 보통 거의 수평)
+        boundary_y_map = np.full(W, -1, dtype=np.int32)
+
+        # 마스크 바깥 좌측
+        left_strip_cx = max(0, mask_left - strip_w // 2)
+        right_strip_cx = min(W - 1, mask_right + strip_w // 2)
+
+        # 3점 보간: 좌측 경계점, 중앙(좌우 평균), 우측 경계점
+        mid_x = (mask_left + mask_right) // 2
+        mid_y = (left_y + right_y) // 2
+        # 중앙을 약간 아래로 (목선은 보통 가운데가 살짝 내려감)
+        mid_y = min(H - 1, mid_y + max(2, int(face_h * 0.02)))
+
+        xs = np.array([left_strip_cx, mid_x, right_strip_cx], dtype=np.float64)
+        ys = np.array([left_y, mid_y, right_y], dtype=np.float64)
+
+        # 전체 x 범위에 대해 보간
+        x_range = np.arange(W, dtype=np.float64)
+        interp_y = np.interp(x_range, xs, ys)
+        boundary_y_map = np.clip(interp_y, 0, H - 1).astype(np.int32)
+
+        return boundary_y_map
+
     def _final_cutoff_cleanup(
         self,
         img_rgb: np.ndarray,
@@ -3501,6 +3626,7 @@ class MirrAISDPipeline:
         face_crop_pil: Optional[Image.Image] = None,
         protect_mask: Optional[np.ndarray] = None,
         cloth_mask: Optional[np.ndarray] = None,
+        face_mask: Optional[np.ndarray] = None,
         seed: Optional[int] = None,
         return_debug: bool = False,
     ) -> Any:
@@ -3892,6 +4018,7 @@ class MirrAISDPipeline:
         # short post-cleanup은 먼저 skin / cloth 성격이 다른 영역을 나눠 LaMa로 순차 처리한다.
         # 목 피부와 의상 질감을 한 번에 지울 때 생기는 뭉개짐을 줄이기 위한 분리 fill이다.
         result_rgb = img_rgb
+        pre_cleanup_rgb = img_rgb.copy()  # Poisson dst용: cleanup 전 상태 보존
         split_cloth_mask = np.zeros((H, W), dtype=np.float32)
         split_skin_mask = np.zeros((H, W), dtype=np.float32)
         split_background_mask = np.zeros((H, W), dtype=np.float32)
@@ -3900,6 +4027,7 @@ class MirrAISDPipeline:
         split_skin_result: Optional[np.ndarray] = None
         split_background_result: Optional[np.ndarray] = None
         split_residual_result: Optional[np.ndarray] = None
+        boundary_y_map: Optional[np.ndarray] = None
         if hair_length == "short" and cloth_mask is not None and cloth_mask.shape == (H, W):
             cloth_u8 = (np.clip(cloth_mask, 0.0, 1.0) > 0.16).astype(np.uint8) * 255
             if int((cloth_u8 > 0).sum()) > 0:
@@ -3908,41 +4036,113 @@ class MirrAISDPipeline:
                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
                     iterations=1,
                 )
-            cloth_zone_u8 = np.zeros((H, W), dtype=np.uint8)
-            cloth_zone_top = min(H, int(cutoff_y + face_h * 0.22))
-            cloth_zone_u8[cloth_zone_top:, :] = 255
-            upper_center_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
-            upper_center_keepout_u8[
-                min(H, int(cutoff_y + face_h * 0.04)):min(H, int(cutoff_y + face_h * 0.52)),
-                max(0, int(cx - face_w * 0.28)):min(W, int(cx + face_w * 0.28)),
-            ] = 255
-            split_cloth_u8 = cv2.bitwise_and(force_u8, cloth_u8)
-            split_cloth_u8 = cv2.bitwise_and(split_cloth_u8, cloth_zone_u8)
-            split_cloth_u8 = cv2.bitwise_and(split_cloth_u8, cv2.bitwise_not(upper_center_keepout_u8))
-            if int((split_cloth_u8 > 0).sum()) > 0:
-                split_cloth_u8 = cv2.morphologyEx(
-                    split_cloth_u8,
-                    cv2.MORPH_CLOSE,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 13)),
+
+            # ── SegFace 경계 보간 기반 zone splitting ──────────────────────
+            # face_mask가 있으면 실제 skin-cloth 경계를 보간하여 zone을 나눈다.
+            _face_mask_for_boundary = face_mask
+            if _face_mask_for_boundary is None:
+                # fallback: SegFace를 다시 돌려 face_mask 획득
+                try:
+                    _, _face_mask_for_boundary, _ = self._segface_hair_mask(img_rgb, face_bbox)
+                except Exception:
+                    _face_mask_for_boundary = None
+
+            if _face_mask_for_boundary is not None:
+                boundary_y_map = self._interpolate_skin_cloth_boundary(
+                    _face_mask_for_boundary,
+                    cloth_mask,
+                    force_u8,
+                    face_bbox,
+                    cutoff_y,
                 )
 
-            skin_zone_u8 = np.zeros((H, W), dtype=np.uint8)
-            skin_poly = np.asarray([
-                [max(0, int(cx - face_w * 0.18)), min(H - 1, int(cutoff_y + face_h * 0.04))],
-                [min(W - 1, int(cx + face_w * 0.18)), min(H - 1, int(cutoff_y + face_h * 0.04))],
-                [min(W - 1, int(cx + face_w * 0.48)), min(H - 1, int(cutoff_y + face_h * 1.02))],
-                [max(0, int(cx - face_w * 0.48)), min(H - 1, int(cutoff_y + face_h * 1.02))],
-            ], dtype=np.int32)
-            cv2.fillConvexPoly(skin_zone_u8, skin_poly, 255)
-            split_skin_u8 = cv2.bitwise_and(force_u8, skin_zone_u8)
-            split_skin_u8 = cv2.bitwise_and(split_skin_u8, cv2.bitwise_not(split_cloth_u8))
-            if int((split_skin_u8 > 0).sum()) > 0:
-                split_skin_u8 = cv2.morphologyEx(
-                    split_skin_u8,
-                    cv2.MORPH_CLOSE,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 9)),
-                )
+            if boundary_y_map is not None:
+                # ── 경계 보간 성공: boundary_y_map 기준으로 zone 분할 ──
+                logger.info("[SDPipeline] skin-cloth boundary interpolation succeeded")
 
+                # skin zone: boundary 위쪽 (피부)
+                skin_zone_u8 = np.zeros((H, W), dtype=np.uint8)
+                for col_x in range(W):
+                    by = boundary_y_map[col_x]
+                    if by > cutoff_y:
+                        skin_zone_u8[cutoff_y:by, col_x] = 255
+
+                # cloth zone: boundary 아래쪽 (옷)
+                cloth_zone_u8 = np.zeros((H, W), dtype=np.uint8)
+                for col_x in range(W):
+                    by = boundary_y_map[col_x]
+                    if by < H:
+                        cloth_zone_u8[by:, col_x] = 255
+
+                split_skin_u8 = cv2.bitwise_and(force_u8, skin_zone_u8)
+                # skin zone은 face 근처 corridor 안에서만 유효
+                skin_corridor_half = max(20, int(face_w * 0.52))
+                skin_corridor_u8 = np.zeros((H, W), dtype=np.uint8)
+                skin_corridor_u8[:, max(0, cx - skin_corridor_half):min(W, cx + skin_corridor_half)] = 255
+                split_skin_u8 = cv2.bitwise_and(split_skin_u8, skin_corridor_u8)
+                if int((split_skin_u8 > 0).sum()) > 0:
+                    split_skin_u8 = cv2.morphologyEx(
+                        split_skin_u8,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 9)),
+                    )
+
+                split_cloth_u8 = cv2.bitwise_and(force_u8, cloth_zone_u8)
+                split_cloth_u8 = cv2.bitwise_and(split_cloth_u8, cloth_u8)
+                # neck seam 방지: boundary 바로 위 영역은 cloth에서 제외
+                neck_margin = max(4, int(face_h * 0.04))
+                neck_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
+                for col_x in range(W):
+                    by = boundary_y_map[col_x]
+                    top = max(0, by - neck_margin)
+                    bot = min(H, by + neck_margin)
+                    neck_keepout_u8[top:bot, col_x] = 255
+                split_cloth_u8 = cv2.bitwise_and(split_cloth_u8, cv2.bitwise_not(neck_keepout_u8))
+                if int((split_cloth_u8 > 0).sum()) > 0:
+                    split_cloth_u8 = cv2.morphologyEx(
+                        split_cloth_u8,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 13)),
+                    )
+            else:
+                # ── fallback: 기존 하드코딩 비율 기반 zone splitting ──
+                logger.info("[SDPipeline] boundary interpolation failed, using heuristic zones")
+                cloth_zone_u8 = np.zeros((H, W), dtype=np.uint8)
+                cloth_zone_top = min(H, int(cutoff_y + face_h * 0.22))
+                cloth_zone_u8[cloth_zone_top:, :] = 255
+                upper_center_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
+                upper_center_keepout_u8[
+                    min(H, int(cutoff_y + face_h * 0.04)):min(H, int(cutoff_y + face_h * 0.52)),
+                    max(0, int(cx - face_w * 0.28)):min(W, int(cx + face_w * 0.28)),
+                ] = 255
+                split_cloth_u8 = cv2.bitwise_and(force_u8, cloth_u8)
+                split_cloth_u8 = cv2.bitwise_and(split_cloth_u8, cloth_zone_u8)
+                split_cloth_u8 = cv2.bitwise_and(split_cloth_u8, cv2.bitwise_not(upper_center_keepout_u8))
+                if int((split_cloth_u8 > 0).sum()) > 0:
+                    split_cloth_u8 = cv2.morphologyEx(
+                        split_cloth_u8,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 13)),
+                    )
+
+                skin_zone_u8 = np.zeros((H, W), dtype=np.uint8)
+                skin_poly = np.asarray([
+                    [max(0, int(cx - face_w * 0.18)), min(H - 1, int(cutoff_y + face_h * 0.04))],
+                    [min(W - 1, int(cx + face_w * 0.18)), min(H - 1, int(cutoff_y + face_h * 0.04))],
+                    [min(W - 1, int(cx + face_w * 0.48)), min(H - 1, int(cutoff_y + face_h * 1.02))],
+                    [max(0, int(cx - face_w * 0.48)), min(H - 1, int(cutoff_y + face_h * 1.02))],
+                ], dtype=np.int32)
+                cv2.fillConvexPoly(skin_zone_u8, skin_poly, 255)
+                split_skin_u8 = cv2.bitwise_and(force_u8, skin_zone_u8)
+                split_skin_u8 = cv2.bitwise_and(split_skin_u8, cv2.bitwise_not(split_cloth_u8))
+                if int((split_skin_u8 > 0).sum()) > 0:
+                    split_skin_u8 = cv2.morphologyEx(
+                        split_skin_u8,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 9)),
+                    )
+
+            # ── background zone (공통) ────────────────────────────────
             background_zone_top = min(H, int(cutoff_y + face_h * 0.12))
             background_zone_u8 = corridor.copy()
             center_background_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
@@ -3951,7 +4151,8 @@ class MirrAISDPipeline:
                 max(0, int(cx - face_w * 0.34)):min(W, int(cx + face_w * 0.34)),
             ] = 255
             background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(cloth_u8))
-            background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(skin_zone_u8))
+            skin_for_bg_exclude = skin_zone_u8 if boundary_y_map is None else split_skin_u8
+            background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(skin_for_bg_exclude))
             background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(center_background_keepout_u8))
             background_zone_u8[:background_zone_top, :] = 0
             split_background_u8 = cv2.bitwise_and(force_u8, background_zone_u8)
@@ -4318,9 +4519,9 @@ class MirrAISDPipeline:
                     iterative_cleanup_count += 1
 
             # ── Poisson blending (seamlessClone) ─────────────────────────
-            # After iterative cleanup, both src and dst are clean.
-            # Use seamlessClone to smooth the boundary between the
-            # inpainted region and its surroundings.
+            # src = cleanup 완료된 이미지 (LaMa가 채운 텍스처)
+            # dst = cleanup 전 원본에서 force_u8 영역만 주변색으로 neutralize한 이미지
+            # → src의 텍스처를 유지하되 dst 경계의 색과 자연스럽게 연결
             all_cleanup_u8 = force_u8.copy()
             if iterative_cleanup_count > 0:
                 all_cleanup_u8 = cv2.bitwise_or(all_cleanup_u8, iterative_total_mask_u8)
@@ -4340,32 +4541,46 @@ class MirrAISDPipeline:
                 if len(ys_p) >= 200:
                     center_x = int((xs_p.min() + xs_p.max()) // 2)
                     center_y = int((ys_p.min() + ys_p.max()) // 2)
-                    # Save pre-Poisson state as dst (already clean)
-                    pre_poisson_rgb = result_rgb.copy()
+                    # Build neutralized dst: pre_cleanup에서 mask 영역을
+                    # 주변 색으로 채워 dark mass 없는 reference 생성
+                    poisson_dst_rgb = pre_cleanup_rgb.copy()
+                    poisson_dst_mask = cv2.dilate(
+                        all_cleanup_u8,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
+                        iterations=1,
+                    )
+                    # cv2 inpaint로 dst의 mask 영역을 주변색으로 빠르게 채움
+                    poisson_dst_bgr = cv2.inpaint(
+                        poisson_dst_rgb[:, :, ::-1],
+                        poisson_dst_mask,
+                        inpaintRadius=7,
+                        flags=cv2.INPAINT_TELEA,
+                    )
+                    poisson_dst_rgb = poisson_dst_bgr[:, :, ::-1]
                     try:
-                        # Smooth result into itself — boundary harmonization
+                        # src=cleanup result (texture), dst=neutralized (color reference)
                         poisson_out = cv2.seamlessClone(
-                            result_rgb[:, :, ::-1],       # src: current clean result
-                            pre_poisson_rgb[:, :, ::-1],  # dst: same clean result
+                            result_rgb[:, :, ::-1],        # src: cleanup 완료
+                            poisson_dst_rgb[:, :, ::-1],   # dst: neutralized reference
                             poisson_mask_u8,
                             (center_x, center_y),
                             cv2.NORMAL_CLONE,
                         )
                         poisson_rgb = poisson_out[:, :, ::-1]
-                        # Soft blend: 45% Poisson smoothed + 55% original
+                        # Soft blend: 50% Poisson + 50% cleanup result
                         p_alpha = cv2.GaussianBlur(
                             poisson_mask_u8.astype(np.float32) / 255.0,
                             (0, 0), sigmaX=6.0, sigmaY=6.0,
                         )
-                        p_alpha = np.clip(p_alpha * 0.45, 0.0, 0.45)[..., np.newaxis]
+                        p_alpha = np.clip(p_alpha * 0.50, 0.0, 0.50)[..., np.newaxis]
                         result_rgb = (
                             poisson_rgb.astype(np.float32) * p_alpha
                             + result_rgb.astype(np.float32) * (1.0 - p_alpha)
                         )
                         result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
                         poisson_applied = True
-                    except cv2.error:
-                        pass
+                    except cv2.error as e:
+                        logger.warning(f"[SDPipeline] Poisson seamlessClone failed: {e}")
 
         if return_debug:
             debug_bundle = {
@@ -4393,6 +4608,7 @@ class MirrAISDPipeline:
                 "pipeline_iterative_cleanup_mask": iterative_total_mask_u8.astype(np.float32) / 255.0,
                 "iterative_cleanup_count": iterative_cleanup_count,
                 "poisson_blend_applied": poisson_applied,
+                "boundary_interpolation_used": boundary_y_map is not None,
             }
             if cv2_post_rgb is not None:
                 debug_bundle["pipeline_cv2_post_cleanup_result"] = cv2_post_rgb
