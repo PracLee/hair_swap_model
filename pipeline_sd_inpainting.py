@@ -1352,7 +1352,39 @@ class MirrAISDPipeline:
         if int((work_u8 > 0).sum()) < min_pixels:
             return img_rgb, np.zeros((H, W), dtype=np.uint8)
 
-        lama_rgb = self._lama_inpaint(img_rgb, work_u8, force_single_pass=True)
+        # ── Multi-scale LaMa: 큰 mask는 축소 pass 선행 ──────────────
+        # LaMa는 작은 mask에서 더 좋은 결과를 내므로,
+        # 50% 축소 → LaMa → upscale → full-res LaMa 순서로 처리
+        mask_pixels = int((work_u8 > 0).sum())
+        use_multiscale = mask_pixels >= max(2000, int(H * W * 0.008))
+        if use_multiscale:
+            scale = 0.5
+            H_s, W_s = int(H * scale), int(W * scale)
+            img_small = cv2.resize(img_rgb, (W_s, H_s), interpolation=cv2.INTER_AREA)
+            mask_small = cv2.resize(work_u8, (W_s, H_s), interpolation=cv2.INTER_NEAREST)
+            # Ensure mask stays binary after resize
+            mask_small = ((mask_small > 127).astype(np.uint8)) * 255
+            if int((mask_small > 0).sum()) >= 100:
+                lama_small = self._lama_inpaint(img_small, mask_small, force_single_pass=True)
+                # Upscale back and use as base for full-res pass
+                lama_upscaled = cv2.resize(lama_small, (W, H), interpolation=cv2.INTER_LANCZOS4)
+                # Blend upscaled result into original at mask location
+                ms_alpha = (work_u8.astype(np.float32) / 255.0)[..., np.newaxis]
+                img_for_lama = (
+                    lama_upscaled.astype(np.float32) * ms_alpha
+                    + img_rgb.astype(np.float32) * (1.0 - ms_alpha)
+                )
+                img_for_lama = np.clip(img_for_lama, 0, 255).astype(np.uint8)
+                logger.info(
+                    f"[SDPipeline] Multi-scale LaMa: {mask_pixels}px, "
+                    f"downscaled {H}x{W} -> {H_s}x{W_s}"
+                )
+            else:
+                img_for_lama = img_rgb
+        else:
+            img_for_lama = img_rgb
+
+        lama_rgb = self._lama_inpaint(img_for_lama, work_u8, force_single_pass=True)
         alpha = cv2.GaussianBlur(
             work_u8.astype(np.float32) / 255.0,
             (0, 0),
@@ -4426,16 +4458,25 @@ class MirrAISDPipeline:
                             cleanup_roi_left:cleanup_roi_right] = 0
                 bg_ref_mask = cv2.bitwise_and(bg_ref_mask, corridor)
 
-                # Scan region: within force_u8 (geometric cleanup area)
-                cloth_scan_base = cv2.bitwise_and(force_u8, _cloth_u8)
+                # Scan region: cleanup ROI 전체 (force_u8 밖으로 번진 dark pixel도 잡음)
+                scan_roi_u8 = np.zeros((H, W), dtype=np.uint8)
+                scan_roi_u8[
+                    cleanup_roi_top:cleanup_roi_bottom,
+                    cleanup_roi_left:cleanup_roi_right,
+                ] = 255
+                # corridor 제한은 유지
+                scan_roi_u8 = cv2.bitwise_and(scan_roi_u8, corridor)
+                # force_u8도 포함 (기존 영역 + ROI 확장)
+                scan_roi_u8 = cv2.bitwise_or(scan_roi_u8, force_u8)
+                cloth_scan_base = cv2.bitwise_and(scan_roi_u8, _cloth_u8)
                 cloth_scan_base[:cleanup_roi_top, :] = 0
-                bg_scan_base = cv2.bitwise_and(force_u8, cv2.bitwise_not(_cloth_u8))
+                bg_scan_base = cv2.bitwise_and(scan_roi_u8, cv2.bitwise_not(_cloth_u8))
                 bg_scan_base[:cleanup_roi_top, :] = 0
 
                 max_iterations = 3
                 # Start aggressive on first pass, relax each iteration
-                cloth_sigma_schedule = [2.2, 2.5, 2.8]
-                bg_sigma_schedule = [2.0, 2.3, 2.6]
+                cloth_sigma_schedule = [1.8, 2.2, 2.5]
+                bg_sigma_schedule = [1.6, 2.0, 2.3]
                 min_iter_pixels = 48
 
                 for iter_i in range(max_iterations):
@@ -4572,7 +4613,7 @@ class MirrAISDPipeline:
                             poisson_mask_u8.astype(np.float32) / 255.0,
                             (0, 0), sigmaX=6.0, sigmaY=6.0,
                         )
-                        p_alpha = np.clip(p_alpha * 0.50, 0.0, 0.50)[..., np.newaxis]
+                        p_alpha = np.clip(p_alpha * 0.65, 0.0, 0.65)[..., np.newaxis]
                         result_rgb = (
                             poisson_rgb.astype(np.float32) * p_alpha
                             + result_rgb.astype(np.float32) * (1.0 - p_alpha)
@@ -4581,6 +4622,75 @@ class MirrAISDPipeline:
                         poisson_applied = True
                     except cv2.error as e:
                         logger.warning(f"[SDPipeline] Poisson seamlessClone failed: {e}")
+
+            # ── Post-cleanup color correction (safety net) ────────────
+            # Poisson/iterative 후에도 남은 dark pixel을 주변 참조색으로 강제 보정
+            if _has_cloth:
+                cc_lab = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+                cc_L = cc_lab[:, :, 0]
+
+                # Reference: cleanup ROI 바깥의 cloth + background
+                cc_ref_mask = np.zeros((H, W), dtype=np.uint8)
+                if int((cloth_ref_mask > 0).sum()) >= 64:
+                    cc_ref_mask = cv2.bitwise_or(cc_ref_mask, cloth_ref_mask)
+                if int((bg_ref_mask > 0).sum()) >= 64:
+                    cc_ref_mask = cv2.bitwise_or(cc_ref_mask, bg_ref_mask)
+
+                cc_ref_pixels = cc_L[cc_ref_mask > 0]
+                if len(cc_ref_pixels) >= 100:
+                    ref_median_L = float(np.median(cc_ref_pixels))
+                    ref_std_L = max(float(np.std(cc_ref_pixels)), 5.0)
+
+                    # cleanup ROI 내에서 reference보다 1.8σ 이상 어두운 pixel
+                    cc_target_mask = scan_roi_u8.copy()
+                    cc_target_mask = cv2.bitwise_and(cc_target_mask, cv2.bitwise_not(protect_u8))
+                    cc_dark_thresh = ref_median_L - ref_std_L * 1.8
+                    cc_dark = (
+                        (cc_target_mask > 0) & (cc_L < cc_dark_thresh)
+                    ).astype(np.uint8) * 255
+
+                    # 너무 작은 component 제거
+                    if int((cc_dark > 0).sum()) >= 100:
+                        n_cc, cc_lbl, cc_stats, _ = cv2.connectedComponentsWithStats(
+                            cc_dark, connectivity=8
+                        )
+                        cc_filtered = np.zeros_like(cc_dark)
+                        for cc_i in range(1, n_cc):
+                            if cc_stats[cc_i, cv2.CC_STAT_AREA] >= 64:
+                                cc_filtered[cc_lbl == cc_i] = 255
+                        cc_dark = cc_filtered
+
+                    cc_dark_count = int((cc_dark > 0).sum())
+                    if cc_dark_count >= 100:
+                        # Soft mask for correction
+                        cc_soft = cv2.GaussianBlur(
+                            cc_dark.astype(np.float32) / 255.0,
+                            (0, 0), sigmaX=5.0, sigmaY=5.0,
+                        )
+                        cc_soft = np.clip(cc_soft, 0.0, 1.0)
+
+                        # L channel을 reference median으로 shift
+                        # 완전히 대체하지 않고, 차이의 65%만 보정 (자연스러움 유지)
+                        L_corrected = cc_L.copy()
+                        dark_pixels_mask = cc_soft > 0.05
+                        L_diff = ref_median_L - cc_L
+                        L_corrected[dark_pixels_mask] = (
+                            cc_L[dark_pixels_mask] + L_diff[dark_pixels_mask] * 0.65
+                        )
+                        L_corrected = np.clip(L_corrected, 0, 255)
+
+                        # Apply with soft mask
+                        cc_lab[:, :, 0] = (
+                            L_corrected * cc_soft + cc_L * (1.0 - cc_soft)
+                        )
+                        result_rgb = cv2.cvtColor(
+                            np.clip(cc_lab, 0, 255).astype(np.uint8),
+                            cv2.COLOR_LAB2RGB,
+                        )
+                        logger.info(
+                            f"[SDPipeline] Color correction: {cc_dark_count}px corrected, "
+                            f"ref_L={ref_median_L:.1f}, thresh={cc_dark_thresh:.1f}"
+                        )
 
         if return_debug:
             debug_bundle = {
