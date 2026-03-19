@@ -3894,9 +3894,11 @@ class MirrAISDPipeline:
         result_rgb = img_rgb
         split_cloth_mask = np.zeros((H, W), dtype=np.float32)
         split_skin_mask = np.zeros((H, W), dtype=np.float32)
+        split_background_mask = np.zeros((H, W), dtype=np.float32)
         split_residual_mask = np.zeros((H, W), dtype=np.float32)
         split_cloth_result: Optional[np.ndarray] = None
         split_skin_result: Optional[np.ndarray] = None
+        split_background_result: Optional[np.ndarray] = None
         split_residual_result: Optional[np.ndarray] = None
         if hair_length == "short" and cloth_mask is not None and cloth_mask.shape == (H, W):
             cloth_u8 = (np.clip(cloth_mask, 0.0, 1.0) > 0.16).astype(np.uint8) * 255
@@ -3931,7 +3933,28 @@ class MirrAISDPipeline:
                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 9)),
                 )
 
+            background_zone_top = min(H, int(cutoff_y + face_h * 0.12))
+            background_zone_u8 = corridor.copy()
+            background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(cloth_u8))
+            background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(skin_zone_u8))
+            background_zone_u8[:background_zone_top, :] = 0
+            split_background_u8 = cv2.bitwise_and(force_u8, background_zone_u8)
+            split_background_u8 = cv2.bitwise_and(split_background_u8, cv2.bitwise_not(split_cloth_u8))
+            split_background_u8 = cv2.bitwise_and(split_background_u8, cv2.bitwise_not(split_skin_u8))
+            if int((split_background_u8 > 0).sum()) > 0:
+                split_background_u8 = cv2.morphologyEx(
+                    split_background_u8,
+                    cv2.MORPH_CLOSE,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 11)),
+                )
+                split_background_u8 = cv2.dilate(
+                    split_background_u8,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 7)),
+                    iterations=1,
+                )
+
             split_union_u8 = cv2.bitwise_or(split_cloth_u8, split_skin_u8)
+            split_union_u8 = cv2.bitwise_or(split_union_u8, split_background_u8)
             split_residual_u8 = cv2.bitwise_and(force_u8, cv2.bitwise_not(split_union_u8))
             split_ready = int((split_union_u8 > 0).sum()) >= max(96, int(force_pixels * 0.35))
             if split_ready:
@@ -3959,6 +3982,18 @@ class MirrAISDPipeline:
                     )
                     split_skin_mask = actual_skin_u8.astype(np.float32) / 255.0
                     split_skin_result = result_rgb.copy()
+                    split_applied = True
+                if int((split_background_u8 > 0).sum()) >= 72:
+                    result_rgb, actual_background_u8 = self._lama_inpaint_region_blend(
+                        result_rgb,
+                        split_background_u8,
+                        sigma=6.0,
+                        protect_mask=protect_mask,
+                        dilate_kernel_size=5,
+                        min_pixels=72,
+                    )
+                    split_background_mask = actual_background_u8.astype(np.float32) / 255.0
+                    split_background_result = result_rgb.copy()
                     split_applied = True
                 if int((split_residual_u8 > 0).sum()) >= 96:
                     result_rgb, actual_residual_u8 = self._lama_inpaint_region_blend(
@@ -4150,6 +4185,7 @@ class MirrAISDPipeline:
                 "pipeline_short_residual_cleanup_mask": residual_cleanup_mask,
                 "pipeline_lama_post_cleanup_cloth_mask": split_cloth_mask,
                 "pipeline_lama_post_cleanup_skin_mask": split_skin_mask,
+                "pipeline_lama_post_cleanup_background_mask": split_background_mask,
                 "pipeline_lama_post_cleanup_split_residual_mask": split_residual_mask,
                 "short_cleanup_pattern": short_cleanup_pattern,
                 "short_side_outer_enabled": side_outer_enabled,
@@ -4168,6 +4204,8 @@ class MirrAISDPipeline:
                 debug_bundle["pipeline_lama_post_cleanup_cloth_result"] = split_cloth_result
             if split_skin_result is not None:
                 debug_bundle["pipeline_lama_post_cleanup_skin_result"] = split_skin_result
+            if split_background_result is not None:
+                debug_bundle["pipeline_lama_post_cleanup_background_result"] = split_background_result
             if split_residual_result is not None:
                 debug_bundle["pipeline_lama_post_cleanup_split_residual_result"] = split_residual_result
             if residual_cv2_rgb is not None:
