@@ -4650,7 +4650,7 @@ class MirrAISDPipeline:
                     # cleanup ROI 내에서 reference보다 1.8σ 이상 어두운 pixel
                     cc_target_mask = scan_roi_u8.copy()
                     cc_target_mask = cv2.bitwise_and(cc_target_mask, cv2.bitwise_not(protect_u8))
-                    cc_dark_thresh = ref_median_L - ref_std_L * 1.2
+                    cc_dark_thresh = ref_median_L - ref_std_L * 1.5
                     cc_dark = (
                         (cc_target_mask > 0) & (cc_L < cc_dark_thresh)
                     ).astype(np.uint8) * 255
@@ -4676,12 +4676,12 @@ class MirrAISDPipeline:
                         cc_soft = np.clip(cc_soft, 0.0, 1.0)
 
                         # L channel을 reference median으로 shift
-                        # 차이의 80%를 보정 (v114: 65% → 80%로 강화)
+                        # 차이의 70%를 보정 (v115: 텍스처 보존을 위해 80%→70%)
                         L_corrected = cc_L.copy()
                         dark_pixels_mask = cc_soft > 0.05
                         L_diff = ref_median_L - cc_L
                         L_corrected[dark_pixels_mask] = (
-                            cc_L[dark_pixels_mask] + L_diff[dark_pixels_mask] * 0.80
+                            cc_L[dark_pixels_mask] + L_diff[dark_pixels_mask] * 0.70
                         )
                         L_corrected = np.clip(L_corrected, 0, 255)
 
@@ -4697,6 +4697,48 @@ class MirrAISDPipeline:
                             f"[SDPipeline] Color correction: {cc_dark_count}px corrected, "
                             f"ref_L={ref_median_L:.1f}, thresh={cc_dark_thresh:.1f}"
                         )
+
+            # ── Texture restoration: 원본 cloth의 high-freq texture 복원 ──
+            # color correction이 L channel을 올리면서 니트 등 텍스처가 flat해질 수 있음.
+            # 원본(pre_cleanup)의 cloth 영역에서 high-frequency detail을 추출해 합성.
+            if _has_cloth and int((all_cleanup_u8 > 0).sum()) >= 200:
+                try:
+                    # 원본 cloth 영역의 texture (high-pass filter)
+                    orig_gray = cv2.cvtColor(pre_cleanup_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+                    result_gray = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+                    # Low-pass: large Gaussian blur
+                    orig_low = cv2.GaussianBlur(orig_gray, (0, 0), sigmaX=8.0, sigmaY=8.0)
+                    result_low = cv2.GaussianBlur(result_gray, (0, 0), sigmaX=8.0, sigmaY=8.0)
+
+                    # High-freq = original - low_pass (텍스처만 추출)
+                    orig_hf = orig_gray - orig_low  # 원본 텍스처
+                    result_hf = result_gray - result_low  # 현재 텍스처
+
+                    # 원본 텍스처가 더 강한 곳에서만 복원 (텍스처가 소실된 영역)
+                    texture_loss = np.abs(orig_hf) - np.abs(result_hf)
+                    texture_loss = np.clip(texture_loss, 0, None)
+
+                    # cloth 영역 + cleanup 영역에서만 적용
+                    tex_target = cv2.bitwise_and(all_cleanup_u8, _cloth_u8)
+                    tex_soft = cv2.GaussianBlur(
+                        tex_target.astype(np.float32) / 255.0,
+                        (0, 0), sigmaX=4.0, sigmaY=4.0,
+                    )
+                    tex_soft = np.clip(tex_soft, 0.0, 1.0)
+
+                    # 원본 high-freq를 40% 강도로 현재 이미지에 더함
+                    tex_add = orig_hf * tex_soft * 0.40
+                    result_f = result_rgb.astype(np.float32)
+                    for ch in range(3):
+                        result_f[:, :, ch] += tex_add
+                    result_rgb = np.clip(result_f, 0, 255).astype(np.uint8)
+                    logger.info(
+                        f"[SDPipeline] Texture restoration: "
+                        f"cloth+cleanup overlap={int((tex_target > 0).sum())}px"
+                    )
+                except Exception as e:
+                    logger.warning(f"[SDPipeline] Texture restoration failed: {e}")
 
         if return_debug:
             debug_bundle = {
