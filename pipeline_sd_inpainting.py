@@ -29,6 +29,7 @@ MirrAI SD Inpainting Pipeline
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib
 import json
 import logging
@@ -287,12 +288,33 @@ class MirrAISDPipeline:
         if not self._loaded:
             self.load()
 
-        # 시드 결정: config에 고정값 있으면 사용, 없으면 매 요청마다 랜덤 생성
+        # 시드 결정:
+        #   1. config.seeds가 있으면 그대로 사용
+        #   2. 아니면 입력 이미지+프롬프트 해시 기반 deterministic seed 사용
+        #      (동일 요청 재실행 시 동일 결과 비교를 쉽게 하기 위함)
+        #   3. MIRRAI_DETERMINISTIC_SEEDS=0 이면 완전 랜덤으로 복귀
         if self.config.seeds:
             seeds = self.config.seeds[:top_k]
+            seed_mode = "config"
         else:
-            seeds = [random.randint(0, 2**31 - 1) for _ in range(top_k)]
-        logger.info(f"[SDPipeline] seeds={seeds}")
+            deterministic = os.environ.get("MIRRAI_DETERMINISTIC_SEEDS", "1").strip().lower()
+            use_deterministic = deterministic not in {"0", "false", "no", "off"}
+            if use_deterministic:
+                seed_hasher = hashlib.sha256()
+                seed_hasher.update(str(image.shape).encode("utf-8"))
+                seed_hasher.update(image.tobytes())
+                seed_hasher.update(hairstyle_text.strip().encode("utf-8"))
+                seed_hasher.update(b"\x1f")
+                seed_hasher.update(color_text.strip().encode("utf-8"))
+                base_seed = int.from_bytes(seed_hasher.digest()[:8], "big") % (2**31 - 1)
+                if base_seed <= 0:
+                    base_seed = 1
+                seeds = [((base_seed + (104729 * idx)) % (2**31 - 1)) or 1 for idx in range(top_k)]
+                seed_mode = "deterministic"
+            else:
+                seeds = [random.randint(0, 2**31 - 1) for _ in range(top_k)]
+                seed_mode = "random"
+        logger.info(f"[SDPipeline] seed_mode={seed_mode} seeds={seeds}")
 
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         bg_fill_mode = normalize_bg_fill_mode(self.config.bg_fill_mode)
