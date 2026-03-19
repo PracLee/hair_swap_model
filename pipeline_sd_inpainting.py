@@ -3928,8 +3928,6 @@ class MirrAISDPipeline:
         cv2_front_rgb: Optional[np.ndarray] = None
         cv2_side_rgb: Optional[np.ndarray] = None
         residual_cv2_rgb: Optional[np.ndarray] = None
-        residual_lama_rgb: Optional[np.ndarray] = None
-        residual_component_count = 0
         residual_cleanup_mask = np.zeros((H, W), dtype=np.float32)
         if hair_length == "short":
             front_blend_mask = front_cleanup_u8.astype(np.float32) / 255.0
@@ -4020,11 +4018,11 @@ class MirrAISDPipeline:
             # 1차 cleanup 뒤에도 side-zone에 남는 작은 dark tuft만 추가로 정리한다.
             residual_gray = result_rgb.mean(axis=2).astype(np.float32)
             residual_seed = (
-                ((side_blend_mask > 0.28) | (side_outer_blend_mask > 0.18))
+                ((side_blend_mask > 0.24) | (side_outer_blend_mask > 0.16))
             )
             if short_cleanup_pattern in {"front", "mixed"}:
-                residual_seed = residual_seed | (front_blend_mask > 0.18)
-            residual_dark_threshold = 124.0 if short_cleanup_pattern in {"front", "mixed"} else 122.0
+                residual_seed = residual_seed | (front_blend_mask > 0.14)
+            residual_dark_threshold = 128.0 if short_cleanup_pattern in {"front", "mixed"} else 122.0
             residual_u8 = (
                 (
                     residual_seed
@@ -4044,7 +4042,7 @@ class MirrAISDPipeline:
                     residual_u8,
                     connectivity=8,
                 )
-                min_residual_area = max(24, int(face_w * 0.10))
+                min_residual_area = max(20, int(face_w * 0.08))
                 min_residual_height = max(18, int(face_h * 0.18))
                 for label_idx in range(1, num_labels):
                     _, _, _, h, area = stats[label_idx]
@@ -4058,54 +4056,31 @@ class MirrAISDPipeline:
                 residual_u8 = cv2.morphologyEx(
                     residual_u8,
                     cv2.MORPH_CLOSE,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 9)),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
                 )
                 residual_u8 = cv2.dilate(
                     residual_u8,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 7)),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 9)),
                     iterations=1,
                 )
                 residual_cleanup_mask = residual_u8.astype(np.float32) / 255.0
-                if short_cleanup_pattern in {"front", "mixed"}:
-                    residual_lama_rgb, residual_component_count = self._lama_inpaint_component_rois(
-                        result_rgb,
-                        residual_u8,
-                        pad_x=max(12, int(face_w * 0.14)),
-                        pad_y=max(16, int(face_h * 0.18)),
-                        protect_mask=protect_mask,
-                        min_component_area=max(36, int(face_w * 0.06)),
-                    )
-                    if residual_component_count > 0:
-                        residual_alpha = cv2.GaussianBlur(
-                            residual_cleanup_mask,
-                            (0, 0),
-                            sigmaX=2.6,
-                            sigmaY=2.6,
-                        )
-                        residual_alpha = np.clip(residual_alpha * 0.34, 0.0, 0.34)[..., np.newaxis]
-                        result_rgb = (
-                            residual_lama_rgb.astype(np.float32) * residual_alpha
-                            + result_rgb.astype(np.float32) * (1.0 - residual_alpha)
-                        )
-                        result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
-                if residual_component_count == 0:
-                    residual_cv2_rgb = self._cv2_inpaint_region(
-                        result_rgb,
-                        residual_cleanup_mask,
-                        protect_mask=protect_mask,
-                    )
-                    residual_alpha = cv2.GaussianBlur(
-                        residual_cleanup_mask,
-                        (0, 0),
-                        sigmaX=3.0,
-                        sigmaY=3.0,
-                    )
-                    residual_alpha = np.clip(residual_alpha * 0.20, 0.0, 0.20)[..., np.newaxis]
-                    result_rgb = (
-                        residual_cv2_rgb.astype(np.float32) * residual_alpha
-                        + result_rgb.astype(np.float32) * (1.0 - residual_alpha)
-                    )
-                    result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
+                residual_cv2_rgb = self._cv2_inpaint_region(
+                    result_rgb,
+                    residual_cleanup_mask,
+                    protect_mask=protect_mask,
+                )
+                residual_alpha = cv2.GaussianBlur(
+                    residual_cleanup_mask,
+                    (0, 0),
+                    sigmaX=3.6,
+                    sigmaY=3.6,
+                )
+                residual_alpha = np.clip(residual_alpha * 0.24, 0.0, 0.24)[..., np.newaxis]
+                result_rgb = (
+                    residual_cv2_rgb.astype(np.float32) * residual_alpha
+                    + result_rgb.astype(np.float32) * (1.0 - residual_alpha)
+                )
+                result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
         if return_debug:
             debug_bundle = {
                 "pipeline_lama_post_cleanup_mask": force_mask,
@@ -4123,7 +4098,6 @@ class MirrAISDPipeline:
                 "short_side_outer_enabled": side_outer_enabled,
                 "lama_post_cleanup_mode": lama_post_mode,
                 "lama_post_cleanup_component_count": lama_component_count,
-                "lama_residual_component_count": residual_component_count,
                 "short_front_panel_area": front_panel_area_total,
                 "short_side_panel_area": side_panel_area_total,
                 "short_front_panel_count": front_panel_count,
@@ -4137,8 +4111,6 @@ class MirrAISDPipeline:
                 debug_bundle["pipeline_cv2_side_cleanup_result"] = cv2_side_rgb
             if residual_cv2_rgb is not None:
                 debug_bundle["pipeline_cv2_residual_cleanup_result"] = residual_cv2_rgb
-            if residual_lama_rgb is not None:
-                debug_bundle["pipeline_lama_residual_component_result"] = residual_lama_rgb
             return result_rgb, debug_bundle
         return result_rgb
 
