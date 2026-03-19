@@ -3845,16 +3845,28 @@ class MirrAISDPipeline:
             front_blend_mask = front_cleanup_u8.astype(np.float32) / 255.0
             side_blend_mask = side_cleanup_u8.astype(np.float32) / 255.0
             side_outer_blend_mask = side_outer_cleanup_u8.astype(np.float32) / 255.0
+            blend_keepout_u8 = lower_center_keepout_u8.copy()
+            residual_keepout_u8 = lower_center_keepout_u8.copy()
+            if short_cleanup_pattern in {"front", "mixed"} and int((lower_center_keepout_u8 > 0).sum()) > 0:
+                relax_top = min(H, int(cutoff_y + face_h * 0.78))
+                residual_keepout_u8[:relax_top, :] = 0
+                residual_keepout_u8 = cv2.erode(
+                    residual_keepout_u8,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
+                    iterations=1,
+                )
+                if short_cleanup_pattern == "mixed":
+                    blend_keepout_u8 = residual_keepout_u8
             lower_blend_top = min(H, int(cutoff_y + face_h * 0.12))
             front_blend_mask[:lower_blend_top, :] = 0.0
             side_blend_mask[:lower_blend_top, :] = 0.0
             side_outer_blend_mask[:lower_blend_top, :] = 0.0
-            if int((lower_center_keepout_u8 > 0).sum()) > 0:
+            if int((blend_keepout_u8 > 0).sum()) > 0:
                 side_blend_mask = side_blend_mask * (
-                    cv2.bitwise_not(lower_center_keepout_u8).astype(np.float32) / 255.0
+                    cv2.bitwise_not(blend_keepout_u8).astype(np.float32) / 255.0
                 )
                 side_outer_blend_mask = side_outer_blend_mask * (
-                    cv2.bitwise_not(lower_center_keepout_u8).astype(np.float32) / 255.0
+                    cv2.bitwise_not(blend_keepout_u8).astype(np.float32) / 255.0
                 )
             if int((front_blend_mask > 0.35).sum()) >= 48:
                 cv2_front_rgb = self._cv2_inpaint_region(
@@ -3917,18 +3929,24 @@ class MirrAISDPipeline:
 
             # 1차 cleanup 뒤에도 side-zone에 남는 작은 dark tuft만 추가로 정리한다.
             residual_gray = result_rgb.mean(axis=2).astype(np.float32)
+            residual_seed = (
+                ((side_blend_mask > 0.28) | (side_outer_blend_mask > 0.18))
+            )
+            if short_cleanup_pattern in {"front", "mixed"}:
+                residual_seed = residual_seed | (front_blend_mask > 0.18)
+            residual_dark_threshold = 124.0 if short_cleanup_pattern in {"front", "mixed"} else 122.0
             residual_u8 = (
                 (
-                    ((side_blend_mask > 0.28) | (side_outer_blend_mask > 0.18))
-                    & (residual_gray < 122.0)
+                    residual_seed
+                    & (residual_gray < residual_dark_threshold)
                 ).astype(np.uint8) * 255
             )
             residual_u8[:lower_blend_top, :] = 0
             residual_u8 = cv2.bitwise_and(residual_u8, corridor)
-            if int((lower_center_keepout_u8 > 0).sum()) > 0:
+            if int((residual_keepout_u8 > 0).sum()) > 0:
                 residual_u8 = cv2.bitwise_and(
                     residual_u8,
-                    cv2.bitwise_not(lower_center_keepout_u8),
+                    cv2.bitwise_not(residual_keepout_u8),
                 )
             if int((residual_u8 > 0).sum()) > 0:
                 filtered_residual_u8 = np.zeros_like(residual_u8)
@@ -3985,6 +4003,8 @@ class MirrAISDPipeline:
                 "pipeline_short_side_cleanup_mask": side_cleanup_u8.astype(np.float32) / 255.0,
                 "pipeline_short_side_outer_cleanup_mask": side_outer_cleanup_u8.astype(np.float32) / 255.0,
                 "pipeline_short_center_keepout_mask": lower_center_keepout_u8.astype(np.float32) / 255.0,
+                "pipeline_short_blend_keepout_mask": blend_keepout_u8.astype(np.float32) / 255.0,
+                "pipeline_short_residual_keepout_mask": residual_keepout_u8.astype(np.float32) / 255.0,
                 "pipeline_short_residual_cleanup_mask": residual_cleanup_mask,
                 "short_cleanup_pattern": short_cleanup_pattern,
                 "short_side_outer_enabled": side_outer_enabled,
