@@ -895,10 +895,8 @@ class MirrAISDPipeline:
                     logger.warning(f"[SDPipeline] 색상 거리 계산 실패(무시): {e}")
 
             silhouette_score = 0.0
-            lower_panel_score = 1.0
             rank_score = color_score if (has_color_request and target_hair_lab is not None) else 0.0
             silhouette_metrics: Optional[Dict[str, float]] = None
-            lower_panel_metrics: Optional[Dict[str, float]] = None
             if hair_length == "short" and cutoff_y_for_post is not None and long_hair_mask_for_post is not None:
                 try:
                     silhouette_metrics = self._estimate_short_hair_silhouette_score(
@@ -916,25 +914,6 @@ class MirrAISDPipeline:
                         rank_score = silhouette_score
                 except Exception as e:
                     logger.warning(f"[SDPipeline] short silhouette 점수 계산 실패(무시): {e}")
-                try:
-                    lower_panel_metrics = self._estimate_short_lower_panel_artifact_score(
-                        img_rgb=post_rgb,
-                        reference_rgb=composite_base_rgb,
-                        face_bbox=face_bbox,
-                        cutoff_y=cutoff_y_for_post,
-                        protect_mask=feature_protect_mask,
-                    )
-                    lower_panel_score = float(lower_panel_metrics.get("score", 1.0))
-                    if has_color_request and target_hair_lab is not None:
-                        rank_score = float(np.clip(
-                            silhouette_score * 0.58 + color_score * 0.24 + lower_panel_score * 0.18,
-                            0.0,
-                            1.0,
-                        ))
-                    else:
-                        rank_score = float(np.clip(silhouette_score * 0.82 + lower_panel_score * 0.18, 0.0, 1.0))
-                except Exception as e:
-                    logger.warning(f"[SDPipeline] short lower-panel 점수 계산 실패(무시): {e}")
 
             candidates.append({
                 "seed": seed,
@@ -943,10 +922,8 @@ class MirrAISDPipeline:
                 "color_distance": color_distance,
                 "color_score": color_score,
                 "silhouette_score": silhouette_score,
-                "lower_panel_score": lower_panel_score,
                 "rank_score": rank_score,
                 "silhouette_metrics": silhouette_metrics,
-                "lower_panel_metrics": lower_panel_metrics,
                 "gen_idx": gen_idx,
             })
 
@@ -956,9 +933,7 @@ class MirrAISDPipeline:
                 candidates.sort(
                     key=lambda c: (
                         -float(c["rank_score"]),
-                        -float(c.get("lower_panel_score", 1.0)),
                         float((c.get("silhouette_metrics") or {}).get("remnant_ratio", 1e9)),
-                        float((c.get("lower_panel_metrics") or {}).get("largest_component_ratio", 1e9)),
                         c["color_distance"] is None,
                         c["color_distance"] if c["color_distance"] is not None else 1e9,
                         c["gen_idx"],
@@ -1000,12 +975,8 @@ class MirrAISDPipeline:
                     "rank_score": round(float(c.get("rank_score", 0.0)), 4),
                     "silhouette_score": round(float(c.get("silhouette_score", 0.0)), 4),
                     "color_score": round(float(c.get("color_score", 0.0)), 4),
-                    "lower_panel_score": round(float(c.get("lower_panel_score", 1.0)), 4),
                     "silhouette_metrics": {
                         k: round(float(v), 4) for k, v in (c.get("silhouette_metrics") or {}).items()
-                    },
-                    "lower_panel_metrics": {
-                        k: round(float(v), 4) for k, v in (c.get("lower_panel_metrics") or {}).items()
                     },
                 }
                 for c in candidates
@@ -2541,139 +2512,6 @@ class MirrAISDPipeline:
             "short_real_mask_pixels": float(short_real_px),
             "short_remnant_pixels": float(remnant_px),
             "original_long_pixels": float(long_px),
-        }
-
-    def _estimate_short_lower_panel_artifact_score(
-        self,
-        img_rgb: np.ndarray,
-        reference_rgb: np.ndarray,
-        face_bbox: Tuple[int, int, int, int],
-        cutoff_y: int,
-        protect_mask: Optional[np.ndarray] = None,
-    ) -> Dict[str, float]:
-        """
-        short 후보의 lower-panel artifact를 정량화한다.
-        가슴팍 중앙에 남는 dark/desaturated blob를 connected component로 측정해
-        후보 간 reranking에만 사용한다.
-        """
-        H, W = img_rgb.shape[:2]
-        if reference_rgb.shape != img_rgb.shape:
-            return {
-                "score": 1.0,
-                "total_component_ratio": 0.0,
-                "largest_component_ratio": 0.0,
-                "center_occupancy": 0.0,
-                "component_count": 0.0,
-                "darkening_ratio": 0.0,
-            }
-
-        x1, y1, x2, y2 = face_bbox
-        face_w = max(int(x2 - x1), 1)
-        face_h = max(int(y2 - y1), 1)
-        face_area = float(face_w * face_h)
-        cx = int(0.5 * (x1 + x2))
-
-        y_top = int(np.clip(cutoff_y + face_h * 0.12, 0, H))
-        y_bottom = int(np.clip(cutoff_y + face_h * 1.58, 0, H))
-        x_left = int(np.clip(cx - face_w * 0.74, 0, W))
-        x_right = int(np.clip(cx + face_w * 0.74, 0, W))
-        if y_top >= y_bottom or x_left >= x_right:
-            return {
-                "score": 1.0,
-                "total_component_ratio": 0.0,
-                "largest_component_ratio": 0.0,
-                "center_occupancy": 0.0,
-                "component_count": 0.0,
-            }
-
-        roi_rgb = img_rgb[y_top:y_bottom, x_left:x_right]
-        ref_rgb = reference_rgb[y_top:y_bottom, x_left:x_right]
-        gray = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY)
-        ref_gray = cv2.cvtColor(ref_rgb, cv2.COLOR_RGB2GRAY)
-        hsv = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2HSV)
-        sat = hsv[..., 1]
-        delta_dark = np.clip(ref_gray.astype(np.int16) - gray.astype(np.int16), 0, 255).astype(np.uint8)
-
-        dark_soft = (
-            ((delta_dark > 18) & (gray < 132))
-            | ((delta_dark > 12) & (gray < 118) & (sat < 122))
-        )
-        dark_u8 = dark_soft.astype(np.uint8) * 255
-
-        if protect_mask is not None and protect_mask.shape == (H, W):
-            protect_roi = (np.clip(protect_mask[y_top:y_bottom, x_left:x_right], 0.0, 1.0) > 0.30).astype(np.uint8) * 255
-            dark_u8 = cv2.bitwise_and(dark_u8, cv2.bitwise_not(protect_roi))
-
-        dark_u8 = cv2.morphologyEx(
-            dark_u8,
-            cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-            iterations=1,
-        )
-        dark_u8 = cv2.morphologyEx(
-            dark_u8,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
-            iterations=1,
-        )
-
-        filtered_u8 = np.zeros_like(dark_u8)
-        total_area = 0.0
-        largest_area = 0.0
-        component_count = 0
-        if int((dark_u8 > 0).sum()) > 0:
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_u8, connectivity=8)
-            min_area = max(72, int(face_area * 0.006))
-            max_component_width = max(18, int(face_w * 1.05))
-            max_component_top = int(face_h * 0.42)
-            min_component_height = max(18, int(face_h * 0.18))
-            for label_idx in range(1, num_labels):
-                x = int(stats[label_idx, cv2.CC_STAT_LEFT])
-                y = int(stats[label_idx, cv2.CC_STAT_TOP])
-                w = int(stats[label_idx, cv2.CC_STAT_WIDTH])
-                h = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
-                area = int(stats[label_idx, cv2.CC_STAT_AREA])
-                if area < min_area:
-                    continue
-                if h < min_component_height:
-                    continue
-                if y > max_component_top:
-                    continue
-                if w > max_component_width:
-                    continue
-                mask = labels == label_idx
-                filtered_u8[mask] = 255
-                component_count += 1
-                total_area += float(area)
-                largest_area = max(largest_area, float(area))
-
-        center_x1 = max(0, int((cx - face_w * 0.26) - x_left))
-        center_x2 = min(filtered_u8.shape[1], int((cx + face_w * 0.26) - x_left))
-        center_occ = 0.0
-        if center_x1 < center_x2:
-            center_band = filtered_u8[:, center_x1:center_x2] > 0
-            if center_band.size > 0:
-                center_occ = float(center_band.mean())
-
-        total_ratio = float(total_area / max(face_area, 1.0))
-        largest_ratio = float(largest_area / max(face_area, 1.0))
-        darkening_ratio = float((delta_dark > 16).mean()) if delta_dark.size > 0 else 0.0
-        score = float(np.clip(
-            1.0
-            - np.clip(total_ratio / 0.11, 0.0, 1.0) * 0.40
-            - np.clip(largest_ratio / 0.07, 0.0, 1.0) * 0.28
-            - np.clip(center_occ / 0.18, 0.0, 1.0) * 0.18
-            - np.clip(darkening_ratio / 0.24, 0.0, 1.0) * 0.14,
-            0.0,
-            1.0,
-        ))
-        return {
-            "score": score,
-            "total_component_ratio": total_ratio,
-            "largest_component_ratio": largest_ratio,
-            "center_occupancy": center_occ,
-            "component_count": float(component_count),
-            "darkening_ratio": darkening_ratio,
         }
 
     def _preserve_original_hair_tone(
