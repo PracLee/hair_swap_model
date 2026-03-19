@@ -1308,6 +1308,63 @@ class MirrAISDPipeline:
         out_bgr = blend_bgr * alpha + img_bgr.astype(np.float32) * (1.0 - alpha)
         return cv2.cvtColor(np.clip(out_bgr, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
 
+    def _lama_inpaint_region_blend(
+        self,
+        img_rgb: np.ndarray,
+        mask_u8: np.ndarray,
+        *,
+        sigma: float,
+        protect_mask: Optional[np.ndarray] = None,
+        dilate_kernel_size: int = 0,
+        min_pixels: int = 40,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        LaMa 결과를 전체 치환하지 않고, 마스크 내부만 soft blend로 합성한다.
+        lower-panel cleanup에서 skin/cloth를 나눠 순차 처리할 때 사용한다.
+        """
+        H, W = img_rgb.shape[:2]
+        if mask_u8.shape != (H, W):
+            return img_rgb, np.zeros((H, W), dtype=np.uint8)
+
+        work_u8 = (mask_u8 > 0).astype(np.uint8) * 255
+        if int((work_u8 > 0).sum()) < min_pixels:
+            return img_rgb, np.zeros((H, W), dtype=np.uint8)
+
+        if dilate_kernel_size > 0:
+            ksz = int(dilate_kernel_size) | 1
+            work_u8 = cv2.dilate(
+                work_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz)),
+                iterations=1,
+            )
+
+        if protect_mask is not None and protect_mask.shape == (H, W):
+            protect_u8 = (np.clip(protect_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
+            if int((protect_u8 > 0).sum()) > 0:
+                protect_u8 = cv2.dilate(
+                    protect_u8,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+                    iterations=1,
+                )
+                work_u8 = cv2.bitwise_and(work_u8, cv2.bitwise_not(protect_u8))
+
+        if int((work_u8 > 0).sum()) < min_pixels:
+            return img_rgb, np.zeros((H, W), dtype=np.uint8)
+
+        lama_rgb = self._lama_inpaint(img_rgb, work_u8, force_single_pass=True)
+        alpha = cv2.GaussianBlur(
+            work_u8.astype(np.float32) / 255.0,
+            (0, 0),
+            sigmaX=sigma,
+            sigmaY=sigma,
+        )
+        alpha = np.clip(alpha, 0.0, 1.0)[..., np.newaxis]
+        blended = (
+            lama_rgb.astype(np.float32) * alpha
+            + img_rgb.astype(np.float32) * (1.0 - alpha)
+        )
+        return np.clip(blended, 0, 255).astype(np.uint8), work_u8
+
     def _neutralize_short_generation_input(
         self,
         img_rgb: np.ndarray,
@@ -3832,10 +3889,95 @@ class MirrAISDPipeline:
         force_u8 = cv2.dilate(force_u8, k, iterations=1)
         force_mask = force_u8.astype(np.float32) / 255.0
 
-        # short post-cleanup은 비용과 artifact를 줄이기 위해
-        # 추가 SD refine 없이 LaMa를 기본으로 쓰고,
-        # lower panel의 어두운 얼룩만 cv2 inpaint 결과를 약하게 섞어 정리한다.
-        result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
+        # short post-cleanup은 먼저 skin / cloth 성격이 다른 영역을 나눠 LaMa로 순차 처리한다.
+        # 목 피부와 의상 질감을 한 번에 지울 때 생기는 뭉개짐을 줄이기 위한 분리 fill이다.
+        result_rgb = img_rgb
+        split_cloth_mask = np.zeros((H, W), dtype=np.float32)
+        split_skin_mask = np.zeros((H, W), dtype=np.float32)
+        split_residual_mask = np.zeros((H, W), dtype=np.float32)
+        split_cloth_result: Optional[np.ndarray] = None
+        split_skin_result: Optional[np.ndarray] = None
+        split_residual_result: Optional[np.ndarray] = None
+        if hair_length == "short" and cloth_mask is not None and cloth_mask.shape == (H, W):
+            cloth_u8 = (np.clip(cloth_mask, 0.0, 1.0) > 0.16).astype(np.uint8) * 255
+            if int((cloth_u8 > 0).sum()) > 0:
+                cloth_u8 = cv2.dilate(
+                    cloth_u8,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+                    iterations=1,
+                )
+            split_cloth_u8 = cv2.bitwise_and(force_u8, cloth_u8)
+            if int((split_cloth_u8 > 0).sum()) > 0:
+                split_cloth_u8 = cv2.morphologyEx(
+                    split_cloth_u8,
+                    cv2.MORPH_CLOSE,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 13)),
+                )
+
+            skin_zone_u8 = np.zeros((H, W), dtype=np.uint8)
+            skin_poly = np.asarray([
+                [max(0, int(cx - face_w * 0.18)), min(H - 1, int(cutoff_y + face_h * 0.04))],
+                [min(W - 1, int(cx + face_w * 0.18)), min(H - 1, int(cutoff_y + face_h * 0.04))],
+                [min(W - 1, int(cx + face_w * 0.48)), min(H - 1, int(cutoff_y + face_h * 1.02))],
+                [max(0, int(cx - face_w * 0.48)), min(H - 1, int(cutoff_y + face_h * 1.02))],
+            ], dtype=np.int32)
+            cv2.fillConvexPoly(skin_zone_u8, skin_poly, 255)
+            split_skin_u8 = cv2.bitwise_and(force_u8, skin_zone_u8)
+            split_skin_u8 = cv2.bitwise_and(split_skin_u8, cv2.bitwise_not(split_cloth_u8))
+            if int((split_skin_u8 > 0).sum()) > 0:
+                split_skin_u8 = cv2.morphologyEx(
+                    split_skin_u8,
+                    cv2.MORPH_CLOSE,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 9)),
+                )
+
+            split_union_u8 = cv2.bitwise_or(split_cloth_u8, split_skin_u8)
+            split_residual_u8 = cv2.bitwise_and(force_u8, cv2.bitwise_not(split_union_u8))
+            split_ready = int((split_union_u8 > 0).sum()) >= max(96, int(force_pixels * 0.35))
+            if split_ready:
+                split_applied = False
+                if int((split_cloth_u8 > 0).sum()) >= 96:
+                    result_rgb, actual_cloth_u8 = self._lama_inpaint_region_blend(
+                        result_rgb,
+                        split_cloth_u8,
+                        sigma=7.0,
+                        protect_mask=protect_mask,
+                        dilate_kernel_size=9,
+                        min_pixels=96,
+                    )
+                    split_cloth_mask = actual_cloth_u8.astype(np.float32) / 255.0
+                    split_cloth_result = result_rgb.copy()
+                    split_applied = True
+                if int((split_skin_u8 > 0).sum()) >= 72:
+                    result_rgb, actual_skin_u8 = self._lama_inpaint_region_blend(
+                        result_rgb,
+                        split_skin_u8,
+                        sigma=5.0,
+                        protect_mask=protect_mask,
+                        dilate_kernel_size=5,
+                        min_pixels=72,
+                    )
+                    split_skin_mask = actual_skin_u8.astype(np.float32) / 255.0
+                    split_skin_result = result_rgb.copy()
+                    split_applied = True
+                if int((split_residual_u8 > 0).sum()) >= 96:
+                    result_rgb, actual_residual_u8 = self._lama_inpaint_region_blend(
+                        result_rgb,
+                        split_residual_u8,
+                        sigma=5.5,
+                        protect_mask=protect_mask,
+                        dilate_kernel_size=7,
+                        min_pixels=96,
+                    )
+                    split_residual_mask = actual_residual_u8.astype(np.float32) / 255.0
+                    split_residual_result = result_rgb.copy()
+                    split_applied = True
+                if not split_applied:
+                    result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
+            else:
+                result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
+        else:
+            result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
         cv2_post_rgb: Optional[np.ndarray] = None
         cv2_front_rgb: Optional[np.ndarray] = None
         cv2_side_rgb: Optional[np.ndarray] = None
@@ -4006,6 +4148,9 @@ class MirrAISDPipeline:
                 "pipeline_short_blend_keepout_mask": blend_keepout_u8.astype(np.float32) / 255.0,
                 "pipeline_short_residual_keepout_mask": residual_keepout_u8.astype(np.float32) / 255.0,
                 "pipeline_short_residual_cleanup_mask": residual_cleanup_mask,
+                "pipeline_lama_post_cleanup_cloth_mask": split_cloth_mask,
+                "pipeline_lama_post_cleanup_skin_mask": split_skin_mask,
+                "pipeline_lama_post_cleanup_split_residual_mask": split_residual_mask,
                 "short_cleanup_pattern": short_cleanup_pattern,
                 "short_side_outer_enabled": side_outer_enabled,
                 "short_front_panel_area": front_panel_area_total,
@@ -4019,6 +4164,12 @@ class MirrAISDPipeline:
                 debug_bundle["pipeline_cv2_front_cleanup_result"] = cv2_front_rgb
             if cv2_side_rgb is not None:
                 debug_bundle["pipeline_cv2_side_cleanup_result"] = cv2_side_rgb
+            if split_cloth_result is not None:
+                debug_bundle["pipeline_lama_post_cleanup_cloth_result"] = split_cloth_result
+            if split_skin_result is not None:
+                debug_bundle["pipeline_lama_post_cleanup_skin_result"] = split_skin_result
+            if split_residual_result is not None:
+                debug_bundle["pipeline_lama_post_cleanup_split_residual_result"] = split_residual_result
             if residual_cv2_rgb is not None:
                 debug_bundle["pipeline_cv2_residual_cleanup_result"] = residual_cv2_rgb
             return result_rgb, debug_bundle
