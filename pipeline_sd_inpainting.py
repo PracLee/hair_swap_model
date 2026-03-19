@@ -4225,7 +4225,8 @@ class MirrAISDPipeline:
                 if len(cloth_ref_pixels) >= 64:
                     cloth_median_L = float(np.median(cloth_ref_pixels))
                     cloth_std_L = max(float(np.std(cloth_ref_pixels)), 6.0)
-                    cloth_dark_thresh = cloth_median_L - cloth_std_L * 2.2
+                    # Stricter threshold: only catch truly dark outliers
+                    cloth_dark_thresh = min(cloth_median_L - cloth_std_L * 2.8, 90.0)
                     cloth_scan_u8 = cv2.bitwise_and(force_u8, _cloth_u8)
                     cloth_scan_u8[:cleanup_roi_top, :] = 0
                     cloth_dark_u8 = (
@@ -4247,7 +4248,7 @@ class MirrAISDPipeline:
                 if len(bg_ref_pixels) >= 64:
                     bg_median_L = float(np.median(bg_ref_pixels))
                     bg_std_L = max(float(np.std(bg_ref_pixels)), 6.0)
-                    bg_dark_thresh = bg_median_L - bg_std_L * 2.0
+                    bg_dark_thresh = min(bg_median_L - bg_std_L * 2.5, 85.0)
                     bg_check_u8 = cv2.bitwise_and(force_u8, cv2.bitwise_not(_cloth_u8))
                     bg_dark_u8 = (
                         (bg_check_u8 > 0) & (result_L < bg_dark_thresh)
@@ -4270,10 +4271,12 @@ class MirrAISDPipeline:
                     num_labels_c, labels_c, stats_c, _ = cv2.connectedComponentsWithStats(
                         color_residual_u8, connectivity=8
                     )
-                    min_color_area = max(32, int(face_w * 0.12))
+                    min_color_area = max(48, int(face_w * 0.18))
+                    max_color_area = int(face_w * face_h * 0.35)
                     filtered_color_u8 = np.zeros_like(color_residual_u8)
                     for lbl in range(1, num_labels_c):
-                        if stats_c[lbl, cv2.CC_STAT_AREA] >= min_color_area:
+                        comp_area = stats_c[lbl, cv2.CC_STAT_AREA]
+                        if comp_area >= min_color_area and comp_area <= max_color_area:
                             filtered_color_u8[labels_c == lbl] = 255
                     color_residual_u8 = filtered_color_u8
 
@@ -4298,54 +4301,49 @@ class MirrAISDPipeline:
                     )
                     color_residual_applied = True
 
-            # ── Poisson blending (seamlessClone) ─────────────────────────
-            # Smooth the boundary between inpainted and original regions.
+            # ── Boundary smoothing via guided filter ─────────────────────
+            # Smooth the seam between inpainted and original regions using
+            # edge-aware bilateral filtering on the boundary band only.
             all_cleanup_u8 = force_u8.copy()
             if color_residual_applied:
                 all_cleanup_u8 = cv2.bitwise_or(all_cleanup_u8, color_residual_u8)
             poisson_pixels = int((all_cleanup_u8 > 0).sum())
             if poisson_pixels >= 200:
-                poisson_mask_u8 = cv2.dilate(
+                # Create boundary band: dilated minus eroded
+                boundary_outer = cv2.dilate(
                     all_cleanup_u8,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
                     iterations=1,
                 )
+                boundary_inner = cv2.erode(
+                    all_cleanup_u8,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+                    iterations=1,
+                )
+                boundary_band_u8 = cv2.bitwise_and(
+                    boundary_outer, cv2.bitwise_not(boundary_inner)
+                )
                 if protect_mask is not None:
-                    poisson_mask_u8 = cv2.bitwise_and(
-                        poisson_mask_u8,
+                    boundary_band_u8 = cv2.bitwise_and(
+                        boundary_band_u8,
                         cv2.bitwise_not(
                             (np.clip(protect_mask, 0.0, 1.0) > 0.5).astype(np.uint8) * 255
                         ),
                     )
-                ys_p, xs_p = np.where(poisson_mask_u8 > 0)
-                if len(ys_p) >= 200:
-                    center_x = int((xs_p.min() + xs_p.max()) // 2)
-                    center_y = int((ys_p.min() + ys_p.max()) // 2)
-                    try:
-                        poisson_result = cv2.seamlessClone(
-                            result_rgb[:, :, ::-1],
-                            img_rgb[:, :, ::-1],
-                            poisson_mask_u8,
-                            (center_x, center_y),
-                            cv2.NORMAL_CLONE,
-                        )
-                        poisson_result_rgb = poisson_result[:, :, ::-1]
-                        poisson_alpha_map = cv2.GaussianBlur(
-                            poisson_mask_u8.astype(np.float32) / 255.0,
-                            (0, 0), sigmaX=6.0, sigmaY=6.0,
-                        )
-                        poisson_blend_strength = 0.40
-                        poisson_alpha_map = np.clip(
-                            poisson_alpha_map * poisson_blend_strength, 0.0, poisson_blend_strength
-                        )[..., np.newaxis]
-                        result_rgb = (
-                            poisson_result_rgb.astype(np.float32) * poisson_alpha_map
-                            + result_rgb.astype(np.float32) * (1.0 - poisson_alpha_map)
-                        )
-                        result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
-                        poisson_applied = True
-                    except cv2.error:
-                        pass
+                if int((boundary_band_u8 > 0).sum()) >= 100:
+                    # Bilateral filter smooths color while preserving edges
+                    smoothed = cv2.bilateralFilter(result_rgb, d=9, sigmaColor=45, sigmaSpace=45)
+                    boundary_alpha = cv2.GaussianBlur(
+                        boundary_band_u8.astype(np.float32) / 255.0,
+                        (0, 0), sigmaX=5.0, sigmaY=5.0,
+                    )
+                    boundary_alpha = np.clip(boundary_alpha * 0.55, 0.0, 0.55)[..., np.newaxis]
+                    result_rgb = (
+                        smoothed.astype(np.float32) * boundary_alpha
+                        + result_rgb.astype(np.float32) * (1.0 - boundary_alpha)
+                    )
+                    result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
+                    poisson_applied = True
 
         if return_debug:
             debug_bundle = {
