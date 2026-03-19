@@ -3908,7 +3908,17 @@ class MirrAISDPipeline:
                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
                     iterations=1,
                 )
+            cloth_zone_u8 = np.zeros((H, W), dtype=np.uint8)
+            cloth_zone_top = min(H, int(cutoff_y + face_h * 0.22))
+            cloth_zone_u8[cloth_zone_top:, :] = 255
+            upper_center_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
+            upper_center_keepout_u8[
+                min(H, int(cutoff_y + face_h * 0.04)):min(H, int(cutoff_y + face_h * 0.52)),
+                max(0, int(cx - face_w * 0.28)):min(W, int(cx + face_w * 0.28)),
+            ] = 255
             split_cloth_u8 = cv2.bitwise_and(force_u8, cloth_u8)
+            split_cloth_u8 = cv2.bitwise_and(split_cloth_u8, cloth_zone_u8)
+            split_cloth_u8 = cv2.bitwise_and(split_cloth_u8, cv2.bitwise_not(upper_center_keepout_u8))
             if int((split_cloth_u8 > 0).sum()) > 0:
                 split_cloth_u8 = cv2.morphologyEx(
                     split_cloth_u8,
@@ -3935,8 +3945,14 @@ class MirrAISDPipeline:
 
             background_zone_top = min(H, int(cutoff_y + face_h * 0.12))
             background_zone_u8 = corridor.copy()
+            center_background_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
+            center_background_keepout_u8[
+                background_zone_top:,
+                max(0, int(cx - face_w * 0.34)):min(W, int(cx + face_w * 0.34)),
+            ] = 255
             background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(cloth_u8))
             background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(skin_zone_u8))
+            background_zone_u8 = cv2.bitwise_and(background_zone_u8, cv2.bitwise_not(center_background_keepout_u8))
             background_zone_u8[:background_zone_top, :] = 0
             split_background_u8 = cv2.bitwise_and(force_u8, background_zone_u8)
             split_background_u8 = cv2.bitwise_and(split_background_u8, cv2.bitwise_not(split_cloth_u8))
@@ -3959,13 +3975,25 @@ class MirrAISDPipeline:
             split_ready = int((split_union_u8 > 0).sum()) >= max(96, int(force_pixels * 0.35))
             if split_ready:
                 split_applied = False
+                if int((split_background_u8 > 0).sum()) >= 72:
+                    result_rgb, actual_background_u8 = self._lama_inpaint_region_blend(
+                        result_rgb,
+                        split_background_u8,
+                        sigma=5.2,
+                        protect_mask=protect_mask,
+                        dilate_kernel_size=3,
+                        min_pixels=72,
+                    )
+                    split_background_mask = actual_background_u8.astype(np.float32) / 255.0
+                    split_background_result = result_rgb.copy()
+                    split_applied = True
                 if int((split_cloth_u8 > 0).sum()) >= 96:
                     result_rgb, actual_cloth_u8 = self._lama_inpaint_region_blend(
                         result_rgb,
                         split_cloth_u8,
-                        sigma=7.0,
+                        sigma=6.0,
                         protect_mask=protect_mask,
-                        dilate_kernel_size=9,
+                        dilate_kernel_size=5,
                         min_pixels=96,
                     )
                     split_cloth_mask = actual_cloth_u8.astype(np.float32) / 255.0
@@ -3982,18 +4010,6 @@ class MirrAISDPipeline:
                     )
                     split_skin_mask = actual_skin_u8.astype(np.float32) / 255.0
                     split_skin_result = result_rgb.copy()
-                    split_applied = True
-                if int((split_background_u8 > 0).sum()) >= 72:
-                    result_rgb, actual_background_u8 = self._lama_inpaint_region_blend(
-                        result_rgb,
-                        split_background_u8,
-                        sigma=6.0,
-                        protect_mask=protect_mask,
-                        dilate_kernel_size=5,
-                        min_pixels=72,
-                    )
-                    split_background_mask = actual_background_u8.astype(np.float32) / 255.0
-                    split_background_result = result_rgb.copy()
                     split_applied = True
                 if int((split_residual_u8 > 0).sum()) >= 96:
                     result_rgb, actual_residual_u8 = self._lama_inpaint_region_blend(
