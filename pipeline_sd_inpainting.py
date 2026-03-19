@@ -919,6 +919,7 @@ class MirrAISDPipeline:
                 try:
                     lower_panel_metrics = self._estimate_short_lower_panel_artifact_score(
                         img_rgb=post_rgb,
+                        reference_rgb=composite_base_rgb,
                         face_bbox=face_bbox,
                         cutoff_y=cutoff_y_for_post,
                         protect_mask=feature_protect_mask,
@@ -2545,6 +2546,7 @@ class MirrAISDPipeline:
     def _estimate_short_lower_panel_artifact_score(
         self,
         img_rgb: np.ndarray,
+        reference_rgb: np.ndarray,
         face_bbox: Tuple[int, int, int, int],
         cutoff_y: int,
         protect_mask: Optional[np.ndarray] = None,
@@ -2555,6 +2557,16 @@ class MirrAISDPipeline:
         후보 간 reranking에만 사용한다.
         """
         H, W = img_rgb.shape[:2]
+        if reference_rgb.shape != img_rgb.shape:
+            return {
+                "score": 1.0,
+                "total_component_ratio": 0.0,
+                "largest_component_ratio": 0.0,
+                "center_occupancy": 0.0,
+                "component_count": 0.0,
+                "darkening_ratio": 0.0,
+            }
+
         x1, y1, x2, y2 = face_bbox
         face_w = max(int(x2 - x1), 1)
         face_h = max(int(y2 - y1), 1)
@@ -2575,12 +2587,17 @@ class MirrAISDPipeline:
             }
 
         roi_rgb = img_rgb[y_top:y_bottom, x_left:x_right]
+        ref_rgb = reference_rgb[y_top:y_bottom, x_left:x_right]
         gray = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY)
+        ref_gray = cv2.cvtColor(ref_rgb, cv2.COLOR_RGB2GRAY)
         hsv = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2HSV)
         sat = hsv[..., 1]
-        val = hsv[..., 2]
+        delta_dark = np.clip(ref_gray.astype(np.int16) - gray.astype(np.int16), 0, 255).astype(np.uint8)
 
-        dark_soft = ((gray < 116) & (sat < 98)) | ((gray < 96) & (val < 120))
+        dark_soft = (
+            ((delta_dark > 18) & (gray < 132))
+            | ((delta_dark > 12) & (gray < 118) & (sat < 122))
+        )
         dark_u8 = dark_soft.astype(np.uint8) * 255
 
         if protect_mask is not None and protect_mask.shape == (H, W):
@@ -2640,11 +2657,13 @@ class MirrAISDPipeline:
 
         total_ratio = float(total_area / max(face_area, 1.0))
         largest_ratio = float(largest_area / max(face_area, 1.0))
+        darkening_ratio = float((delta_dark > 16).mean()) if delta_dark.size > 0 else 0.0
         score = float(np.clip(
             1.0
-            - np.clip(total_ratio / 0.16, 0.0, 1.0) * 0.48
-            - np.clip(largest_ratio / 0.10, 0.0, 1.0) * 0.34
-            - np.clip(center_occ / 0.12, 0.0, 1.0) * 0.18,
+            - np.clip(total_ratio / 0.11, 0.0, 1.0) * 0.40
+            - np.clip(largest_ratio / 0.07, 0.0, 1.0) * 0.28
+            - np.clip(center_occ / 0.18, 0.0, 1.0) * 0.18
+            - np.clip(darkening_ratio / 0.24, 0.0, 1.0) * 0.14,
             0.0,
             1.0,
         ))
@@ -2654,6 +2673,7 @@ class MirrAISDPipeline:
             "largest_component_ratio": largest_ratio,
             "center_occupancy": center_occ,
             "component_count": float(component_count),
+            "darkening_ratio": darkening_ratio,
         }
 
     def _preserve_original_hair_tone(
