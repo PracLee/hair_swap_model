@@ -1356,7 +1356,7 @@ class MirrAISDPipeline:
         # LaMa는 작은 mask에서 더 좋은 결과를 내므로,
         # 50% 축소 → LaMa → upscale → full-res LaMa 순서로 처리
         mask_pixels = int((work_u8 > 0).sum())
-        use_multiscale = mask_pixels >= max(2000, int(H * W * 0.008))
+        use_multiscale = mask_pixels >= max(1000, int(H * W * 0.005))
         if use_multiscale:
             scale = 0.5
             H_s, W_s = int(H * scale), int(W * scale)
@@ -4121,8 +4121,8 @@ class MirrAISDPipeline:
 
                 split_cloth_u8 = cv2.bitwise_and(force_u8, cloth_zone_u8)
                 split_cloth_u8 = cv2.bitwise_and(split_cloth_u8, cloth_u8)
-                # neck seam 방지: boundary 바로 위 영역은 cloth에서 제외
-                neck_margin = max(4, int(face_h * 0.04))
+                # neck seam 방지: boundary 바로 위 영역은 cloth에서 제외 (v114: margin 축소)
+                neck_margin = max(2, int(face_h * 0.02))
                 neck_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
                 for col_x in range(W):
                     by = boundary_y_map[col_x]
@@ -4130,6 +4130,12 @@ class MirrAISDPipeline:
                     bot = min(H, by + neck_margin)
                     neck_keepout_u8[top:bot, col_x] = 255
                 split_cloth_u8 = cv2.bitwise_and(split_cloth_u8, cv2.bitwise_not(neck_keepout_u8))
+                # v114: neck gap에 있는 pixel도 skin zone에 포함시켜 LaMa fill 받게 함
+                neck_gap_u8 = cv2.bitwise_and(force_u8, neck_keepout_u8)
+                neck_gap_u8 = cv2.bitwise_and(neck_gap_u8, cv2.bitwise_not(split_skin_u8))
+                neck_gap_u8 = cv2.bitwise_and(neck_gap_u8, cv2.bitwise_not(split_cloth_u8))
+                if int((neck_gap_u8 > 0).sum()) > 0:
+                    split_skin_u8 = cv2.bitwise_or(split_skin_u8, neck_gap_u8)
                 if int((split_cloth_u8 > 0).sum()) > 0:
                     split_cloth_u8 = cv2.morphologyEx(
                         split_cloth_u8,
@@ -4473,10 +4479,10 @@ class MirrAISDPipeline:
                 bg_scan_base = cv2.bitwise_and(scan_roi_u8, cv2.bitwise_not(_cloth_u8))
                 bg_scan_base[:cleanup_roi_top, :] = 0
 
-                max_iterations = 3
+                max_iterations = 5
                 # Start aggressive on first pass, relax each iteration
-                cloth_sigma_schedule = [1.8, 2.2, 2.5]
-                bg_sigma_schedule = [1.6, 2.0, 2.3]
+                cloth_sigma_schedule = [1.4, 1.7, 2.0, 2.3, 2.6]
+                bg_sigma_schedule = [1.2, 1.5, 1.8, 2.1, 2.4]
                 min_iter_pixels = 48
 
                 for iter_i in range(max_iterations):
@@ -4613,7 +4619,7 @@ class MirrAISDPipeline:
                             poisson_mask_u8.astype(np.float32) / 255.0,
                             (0, 0), sigmaX=6.0, sigmaY=6.0,
                         )
-                        p_alpha = np.clip(p_alpha * 0.65, 0.0, 0.65)[..., np.newaxis]
+                        p_alpha = np.clip(p_alpha * 0.75, 0.0, 0.75)[..., np.newaxis]
                         result_rgb = (
                             poisson_rgb.astype(np.float32) * p_alpha
                             + result_rgb.astype(np.float32) * (1.0 - p_alpha)
@@ -4644,7 +4650,7 @@ class MirrAISDPipeline:
                     # cleanup ROI 내에서 reference보다 1.8σ 이상 어두운 pixel
                     cc_target_mask = scan_roi_u8.copy()
                     cc_target_mask = cv2.bitwise_and(cc_target_mask, cv2.bitwise_not(protect_u8))
-                    cc_dark_thresh = ref_median_L - ref_std_L * 1.8
+                    cc_dark_thresh = ref_median_L - ref_std_L * 1.2
                     cc_dark = (
                         (cc_target_mask > 0) & (cc_L < cc_dark_thresh)
                     ).astype(np.uint8) * 255
@@ -4670,12 +4676,12 @@ class MirrAISDPipeline:
                         cc_soft = np.clip(cc_soft, 0.0, 1.0)
 
                         # L channel을 reference median으로 shift
-                        # 완전히 대체하지 않고, 차이의 65%만 보정 (자연스러움 유지)
+                        # 차이의 80%를 보정 (v114: 65% → 80%로 강화)
                         L_corrected = cc_L.copy()
                         dark_pixels_mask = cc_soft > 0.05
                         L_diff = ref_median_L - cc_L
                         L_corrected[dark_pixels_mask] = (
-                            cc_L[dark_pixels_mask] + L_diff[dark_pixels_mask] * 0.65
+                            cc_L[dark_pixels_mask] + L_diff[dark_pixels_mask] * 0.80
                         )
                         L_corrected = np.clip(L_corrected, 0, 255)
 
