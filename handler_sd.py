@@ -107,20 +107,20 @@ def _get_pipeline() -> "MirrAISDPipeline":
             "roi_stronger_control_mode": os.environ.get(
                 "ROI_STRONGER_CONTROL_MODE", "canny"
             ),
-            "roi_stronger_target_size": int(os.environ.get("ROI_STRONGER_TARGET_SIZE", "768")),
-            "roi_stronger_steps": int(os.environ.get("ROI_STRONGER_STEPS", "20")),
+            "roi_stronger_target_size": int(os.environ.get("ROI_STRONGER_TARGET_SIZE", "512")),
+            "roi_stronger_steps": int(os.environ.get("ROI_STRONGER_STEPS", "12")),
             "roi_stronger_guidance_scale": float(
-                os.environ.get("ROI_STRONGER_GUIDANCE_SCALE", "6.5")
+                os.environ.get("ROI_STRONGER_GUIDANCE_SCALE", "5.5")
             ),
             "roi_stronger_conditioning_scale": float(
-                os.environ.get("ROI_STRONGER_CONDITIONING_SCALE", "0.30")
+                os.environ.get("ROI_STRONGER_CONDITIONING_SCALE", "0.22")
             ),
-            "roi_stronger_strength": float(os.environ.get("ROI_STRONGER_STRENGTH", "0.72")),
+            "roi_stronger_strength": float(os.environ.get("ROI_STRONGER_STRENGTH", "0.48")),
             "roi_stronger_mask_expand_px": int(
-                os.environ.get("ROI_STRONGER_MASK_EXPAND_PX", "5")
+                os.environ.get("ROI_STRONGER_MASK_EXPAND_PX", "4")
             ),
             "roi_stronger_mask_blur_px": int(
-                os.environ.get("ROI_STRONGER_MASK_BLUR_PX", "5")
+                os.environ.get("ROI_STRONGER_MASK_BLUR_PX", "4")
             ),
         }
         cfg = SDInpaintConfig(**{k: v for k, v in _cfg_kwargs.items() if k in _cfg_fields})

@@ -15,6 +15,22 @@ logger = logging.getLogger(__name__)
 HF_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
 PROJECT_ROOT = Path(__file__).resolve().parent
 SEG_LOCAL_PATH = PROJECT_ROOT / "pretrained_models" / "seg.pth"
+ROI_SDXL_INPAINT_MODEL_ID = os.environ.get(
+    "ROI_SDXL_INPAINT_MODEL_ID",
+    "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+).strip()
+ROI_SDXL_CANNY_CONTROLNET_MODEL_ID = os.environ.get(
+    "ROI_SDXL_CANNY_CONTROLNET_MODEL_ID",
+    "diffusers/controlnet-canny-sdxl-1.0",
+).strip()
+ROI_SDXL_DEPTH_CONTROLNET_MODEL_ID = os.environ.get(
+    "ROI_SDXL_DEPTH_CONTROLNET_MODEL_ID",
+    "diffusers/controlnet-depth-sdxl-1.0",
+).strip()
+ROI_DEPTH_ESTIMATOR_MODEL_ID = os.environ.get(
+    "ROI_DEPTH_ESTIMATOR_MODEL_ID",
+    "Intel/dpt-hybrid-midas",
+).strip()
 
 
 def ensure_models_cached() -> None:
@@ -34,6 +50,28 @@ def ensure_models_cached() -> None:
         ("ControlNet Canny","lllyasviel/control_v11p_sd15_canny",     None, None,
          ["*.msgpack","*.h5"]),
     ]
+
+    if os.environ.get("ENABLE_ROI_STRONGER_INPAINTER", "0").strip().lower() in {"1", "true", "yes"}:
+        models.extend(
+            [
+                (
+                    "ROI SDXL Inpainting",
+                    ROI_SDXL_INPAINT_MODEL_ID,
+                    None,
+                    None,
+                    ["*.msgpack", "*.h5", "flax_model*", "tf_model*", "rust_model*"],
+                ),
+                (
+                    "ROI SDXL ControlNet",
+                    ROI_SDXL_DEPTH_CONTROLNET_MODEL_ID
+                    if os.environ.get("ROI_STRONGER_CONTROL_MODE", "canny").strip().lower() == "depth"
+                    else ROI_SDXL_CANNY_CONTROLNET_MODEL_ID,
+                    None,
+                    None,
+                    ["*.msgpack", "*.h5", "flax_model*", "tf_model*", "rust_model*"],
+                ),
+            ]
+        )
 
     for name, repo_id, subfolder, filename, ignore in models:
         logger.info(f"[models] {name} 확인 중...")
@@ -98,6 +136,12 @@ def ensure_models_cached() -> None:
             )
             logger.info("[models] custom hair SegFace 완료 ✓")
 
+    if (
+        os.environ.get("ENABLE_ROI_STRONGER_INPAINTER", "0").strip().lower() in {"1", "true", "yes"}
+        and os.environ.get("ROI_STRONGER_CONTROL_MODE", "canny").strip().lower() == "depth"
+    ):
+        _ensure_depth_estimator_cached(token)
+
 
 def _ensure_file(name, repo_id, filename, subfolder, token):
     from huggingface_hub import hf_hub_download
@@ -110,6 +154,29 @@ def _ensure_file(name, repo_id, filename, subfolder, token):
         logger.info(f"[models] {name} 다운로드 중...")
         hf_hub_download(repo_id, filename=filename,
                         subfolder=subfolder, token=token)
+        logger.info(f"[models] {name} 완료 ✓")
+
+
+def _ensure_depth_estimator_cached(token) -> None:
+    from huggingface_hub import snapshot_download
+
+    name = "ROI depth estimator"
+    logger.info(f"[models] {name} 확인 중...")
+    try:
+        snapshot_download(
+            ROI_DEPTH_ESTIMATOR_MODEL_ID,
+            token=token,
+            ignore_patterns=["*.msgpack", "*.h5"],
+            local_files_only=True,
+        )
+        logger.info(f"[models] {name} 캐시 확인 ✓")
+    except Exception:
+        logger.info(f"[models] {name} 다운로드 중...")
+        snapshot_download(
+            ROI_DEPTH_ESTIMATOR_MODEL_ID,
+            token=token,
+            ignore_patterns=["*.msgpack", "*.h5"],
+        )
         logger.info(f"[models] {name} 완료 ✓")
 
 
