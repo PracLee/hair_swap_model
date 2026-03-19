@@ -256,6 +256,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         hairstyle_text = str(inp.get("hairstyle_text", "")).strip()
         color_text     = str(inp.get("color_text", "")).strip()
         top_k          = max(1, min(5, int(inp.get("top_k", 3))))
+        seed_input     = inp.get("seed")
         return_base64  = _coerce_bool(inp.get("return_base64"), default=True)
         return_intermediates = _coerce_bool(inp.get("return_intermediates"), default=False)
         bg_fill_mode   = normalize_bg_fill_mode(inp.get("bg_fill_mode", "lama"))
@@ -274,6 +275,14 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         pipeline = _get_pipeline()
         # bg_fill_mode를 런타임에 동적으로 설정 (빌드 없이 테스트 가능)
         pipeline.config.bg_fill_mode = bg_fill_mode
+        # seed가 들어오면 요청 단위로 덮어쓰고, 없으면 deterministic seed 경로를 사용한다.
+        if seed_input is not None:
+            base_seed = max(1, int(seed_input))
+            pipeline.config.seeds = [base_seed + idx for idx in range(top_k)]
+            logger.info(f"[handler_sd] explicit_seeds={pipeline.config.seeds}")
+        else:
+            pipeline.config.seeds = None
+            logger.info("[handler_sd] explicit_seeds=(none) -> deterministic seed mode")
         logger.info(f"[handler_sd] bg_fill_mode={bg_fill_mode}")
         results = pipeline.run(
             image=img_bgr,
