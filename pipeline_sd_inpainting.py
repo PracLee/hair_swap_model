@@ -895,8 +895,10 @@ class MirrAISDPipeline:
                     logger.warning(f"[SDPipeline] 색상 거리 계산 실패(무시): {e}")
 
             silhouette_score = 0.0
+            lower_panel_score = 1.0
             rank_score = color_score if (has_color_request and target_hair_lab is not None) else 0.0
             silhouette_metrics: Optional[Dict[str, float]] = None
+            lower_panel_metrics: Optional[Dict[str, float]] = None
             if hair_length == "short" and cutoff_y_for_post is not None and long_hair_mask_for_post is not None:
                 try:
                     silhouette_metrics = self._estimate_short_hair_silhouette_score(
@@ -914,6 +916,24 @@ class MirrAISDPipeline:
                         rank_score = silhouette_score
                 except Exception as e:
                     logger.warning(f"[SDPipeline] short silhouette 점수 계산 실패(무시): {e}")
+                try:
+                    lower_panel_metrics = self._estimate_short_lower_panel_artifact_score(
+                        img_rgb=post_rgb,
+                        face_bbox=face_bbox,
+                        cutoff_y=cutoff_y_for_post,
+                        protect_mask=feature_protect_mask,
+                    )
+                    lower_panel_score = float(lower_panel_metrics.get("score", 1.0))
+                    if has_color_request and target_hair_lab is not None:
+                        rank_score = float(np.clip(
+                            silhouette_score * 0.58 + color_score * 0.24 + lower_panel_score * 0.18,
+                            0.0,
+                            1.0,
+                        ))
+                    else:
+                        rank_score = float(np.clip(silhouette_score * 0.82 + lower_panel_score * 0.18, 0.0, 1.0))
+                except Exception as e:
+                    logger.warning(f"[SDPipeline] short lower-panel 점수 계산 실패(무시): {e}")
 
             candidates.append({
                 "seed": seed,
@@ -922,8 +942,10 @@ class MirrAISDPipeline:
                 "color_distance": color_distance,
                 "color_score": color_score,
                 "silhouette_score": silhouette_score,
+                "lower_panel_score": lower_panel_score,
                 "rank_score": rank_score,
                 "silhouette_metrics": silhouette_metrics,
+                "lower_panel_metrics": lower_panel_metrics,
                 "gen_idx": gen_idx,
             })
 
@@ -933,7 +955,9 @@ class MirrAISDPipeline:
                 candidates.sort(
                     key=lambda c: (
                         -float(c["rank_score"]),
+                        -float(c.get("lower_panel_score", 1.0)),
                         float((c.get("silhouette_metrics") or {}).get("remnant_ratio", 1e9)),
+                        float((c.get("lower_panel_metrics") or {}).get("largest_component_ratio", 1e9)),
                         c["color_distance"] is None,
                         c["color_distance"] if c["color_distance"] is not None else 1e9,
                         c["gen_idx"],
@@ -975,8 +999,12 @@ class MirrAISDPipeline:
                     "rank_score": round(float(c.get("rank_score", 0.0)), 4),
                     "silhouette_score": round(float(c.get("silhouette_score", 0.0)), 4),
                     "color_score": round(float(c.get("color_score", 0.0)), 4),
+                    "lower_panel_score": round(float(c.get("lower_panel_score", 1.0)), 4),
                     "silhouette_metrics": {
                         k: round(float(v), 4) for k, v in (c.get("silhouette_metrics") or {}).items()
+                    },
+                    "lower_panel_metrics": {
+                        k: round(float(v), 4) for k, v in (c.get("lower_panel_metrics") or {}).items()
                     },
                 }
                 for c in candidates
@@ -1307,193 +1335,6 @@ class MirrAISDPipeline:
         blend_bgr = telea.astype(np.float32) * 0.68 + ns.astype(np.float32) * 0.32
         out_bgr = blend_bgr * alpha + img_bgr.astype(np.float32) * (1.0 - alpha)
         return cv2.cvtColor(np.clip(out_bgr, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
-
-    def _lama_inpaint_component_rois(
-        self,
-        img_rgb: np.ndarray,
-        mask_u8: np.ndarray,
-        *,
-        pad_x: int,
-        pad_y: int,
-        protect_mask: Optional[np.ndarray] = None,
-        min_component_area: int = 80,
-    ) -> Tuple[np.ndarray, int]:
-        """
-        큰 lower-panel mask를 component별 ROI로 나눠 LaMa를 적용한다.
-        전역 한 번 인페인트보다 목/의상 영역 뭉개짐을 줄이는 용도다.
-        """
-        H, W = img_rgb.shape[:2]
-        if mask_u8.shape != (H, W):
-            return img_rgb, 0
-
-        work_mask = (mask_u8 > 0).astype(np.uint8) * 255
-        if protect_mask is not None and protect_mask.shape == (H, W):
-            protect_u8 = (np.clip(protect_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
-            if int((protect_u8 > 0).sum()) > 0:
-                protect_u8 = cv2.dilate(
-                    protect_u8,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
-                    iterations=1,
-                )
-                work_mask = cv2.bitwise_and(work_mask, cv2.bitwise_not(protect_u8))
-
-        if int((work_mask > 0).sum()) < min_component_area:
-            return img_rgb, 0
-
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(work_mask, connectivity=8)
-        components: list[tuple[int, int, int, int, int, int]] = []
-        for label_idx in range(1, num_labels):
-            x, y, w, h, area = stats[label_idx]
-            if area < min_component_area:
-                continue
-            components.append((label_idx, x, y, w, h, area))
-        if not components:
-            return img_rgb, 0
-
-        components.sort(key=lambda item: item[5], reverse=True)
-        result_rgb = img_rgb.copy()
-        applied_count = 0
-
-        for label_idx, x, y, w, h, _ in components:
-            comp_mask_u8 = np.zeros_like(work_mask)
-            comp_mask_u8[labels == label_idx] = 255
-            if int((comp_mask_u8 > 0).sum()) < min_component_area:
-                continue
-
-            x1 = max(0, x - pad_x)
-            y1 = max(0, y - pad_y)
-            x2 = min(W, x + w + pad_x)
-            y2 = min(H, y + h + pad_y)
-            if x2 - x1 < 12 or y2 - y1 < 12:
-                continue
-
-            roi_img = result_rgb[y1:y2, x1:x2]
-            roi_mask_u8 = comp_mask_u8[y1:y2, x1:x2]
-            if int((roi_mask_u8 > 0).sum()) < min_component_area:
-                continue
-
-            roi_result = self._lama_inpaint(roi_img, roi_mask_u8, force_single_pass=True)
-            alpha_u8 = cv2.dilate(
-                roi_mask_u8,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
-                iterations=1,
-            )
-            alpha = cv2.GaussianBlur(
-                alpha_u8.astype(np.float32) / 255.0,
-                (0, 0),
-                sigmaX=4.5,
-                sigmaY=4.5,
-            )
-            alpha = np.clip(alpha, 0.0, 1.0)[..., np.newaxis]
-            blended = (
-                roi_result.astype(np.float32) * alpha
-                + roi_img.astype(np.float32) * (1.0 - alpha)
-            )
-            result_rgb[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
-            applied_count += 1
-
-        return result_rgb, applied_count
-
-    def _build_short_marker_cleanup_mask(
-        self,
-        img_rgb: np.ndarray,
-        seed_mask_u8: np.ndarray,
-        *,
-        corridor_u8: np.ndarray,
-        keepout_u8: np.ndarray,
-        face_bbox: Tuple[int, int, int, int],
-        cutoff_y: int,
-        protect_mask: Optional[np.ndarray] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        short lower-panel의 큰 dark mass만 별도로 잡기 위한 marker-style cleanup mask.
-        실제 최종 결과에는 marker 색을 남기지 않고, 검출과 디버깅용으로만 사용한다.
-        """
-        H, W = img_rgb.shape[:2]
-        if seed_mask_u8.shape != (H, W):
-            return np.zeros((H, W), dtype=np.uint8), img_rgb
-
-        x1, y1, x2, y2 = face_bbox
-        face_h = max(int(y2 - y1), 1)
-        face_w = max(int(x2 - x1), 1)
-        gray = img_rgb.mean(axis=2).astype(np.float32)
-        hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-        sat = hsv[..., 1].astype(np.float32)
-
-        candidate_u8 = cv2.dilate(
-            (seed_mask_u8 > 0).astype(np.uint8) * 255,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 25)),
-            iterations=1,
-        )
-        candidate_u8 = cv2.bitwise_and(candidate_u8, corridor_u8)
-        if int((keepout_u8 > 0).sum()) > 0:
-            candidate_u8 = cv2.bitwise_and(candidate_u8, cv2.bitwise_not(keepout_u8))
-
-        lower_top = min(H, int(cutoff_y + face_h * 0.18))
-        lower_zone = np.zeros((H, W), dtype=np.uint8)
-        lower_zone[lower_top:, :] = 255
-        candidate_u8 = cv2.bitwise_and(candidate_u8, lower_zone)
-
-        dark_threshold = 136.0
-        low_sat_threshold = 108.0
-        marker_mask_u8 = (
-            ((candidate_u8 > 0) & (gray < dark_threshold) & (sat < low_sat_threshold)).astype(np.uint8) * 255
-        )
-
-        if protect_mask is not None and protect_mask.shape == (H, W):
-            protect_u8 = (np.clip(protect_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
-            protect_u8 = cv2.dilate(
-                protect_u8,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
-                iterations=1,
-            )
-            marker_mask_u8 = cv2.bitwise_and(marker_mask_u8, cv2.bitwise_not(protect_u8))
-
-        filtered_u8 = np.zeros_like(marker_mask_u8)
-        if int((marker_mask_u8 > 0).sum()) > 0:
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(marker_mask_u8, connectivity=8)
-            min_area = max(72, int(face_w * 0.14))
-            min_height = max(36, int(face_h * 0.36))
-            for label_idx in range(1, num_labels):
-                _, _, _, h, area = stats[label_idx]
-                if area < min_area:
-                    continue
-                if h < min_height:
-                    continue
-                filtered_u8[labels == label_idx] = 255
-
-        if int((filtered_u8 > 0).sum()) > 0:
-            filtered_u8 = cv2.morphologyEx(
-                filtered_u8,
-                cv2.MORPH_CLOSE,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 13)),
-            )
-            filtered_u8 = cv2.dilate(
-                filtered_u8,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
-                iterations=1,
-            )
-
-        overlay_rgb = img_rgb.copy()
-        if int((filtered_u8 > 0).sum()) > 0:
-            alpha = cv2.GaussianBlur(
-                filtered_u8.astype(np.float32) / 255.0,
-                (0, 0),
-                sigmaX=3.0,
-                sigmaY=3.0,
-            )[..., np.newaxis]
-            marker_color = np.zeros_like(overlay_rgb, dtype=np.float32)
-            marker_color[..., 0] = 32.0
-            marker_color[..., 1] = 235.0
-            marker_color[..., 2] = 235.0
-            overlay_rgb = np.clip(
-                overlay_rgb.astype(np.float32) * (1.0 - alpha)
-                + marker_color * alpha,
-                0,
-                255,
-            ).astype(np.uint8)
-
-        return filtered_u8, overlay_rgb
 
     def _neutralize_short_generation_input(
         self,
@@ -2699,6 +2540,120 @@ class MirrAISDPipeline:
             "short_real_mask_pixels": float(short_real_px),
             "short_remnant_pixels": float(remnant_px),
             "original_long_pixels": float(long_px),
+        }
+
+    def _estimate_short_lower_panel_artifact_score(
+        self,
+        img_rgb: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        cutoff_y: int,
+        protect_mask: Optional[np.ndarray] = None,
+    ) -> Dict[str, float]:
+        """
+        short 후보의 lower-panel artifact를 정량화한다.
+        가슴팍 중앙에 남는 dark/desaturated blob를 connected component로 측정해
+        후보 간 reranking에만 사용한다.
+        """
+        H, W = img_rgb.shape[:2]
+        x1, y1, x2, y2 = face_bbox
+        face_w = max(int(x2 - x1), 1)
+        face_h = max(int(y2 - y1), 1)
+        face_area = float(face_w * face_h)
+        cx = int(0.5 * (x1 + x2))
+
+        y_top = int(np.clip(cutoff_y + face_h * 0.12, 0, H))
+        y_bottom = int(np.clip(cutoff_y + face_h * 1.58, 0, H))
+        x_left = int(np.clip(cx - face_w * 0.74, 0, W))
+        x_right = int(np.clip(cx + face_w * 0.74, 0, W))
+        if y_top >= y_bottom or x_left >= x_right:
+            return {
+                "score": 1.0,
+                "total_component_ratio": 0.0,
+                "largest_component_ratio": 0.0,
+                "center_occupancy": 0.0,
+                "component_count": 0.0,
+            }
+
+        roi_rgb = img_rgb[y_top:y_bottom, x_left:x_right]
+        gray = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY)
+        hsv = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2HSV)
+        sat = hsv[..., 1]
+        val = hsv[..., 2]
+
+        dark_soft = ((gray < 116) & (sat < 98)) | ((gray < 96) & (val < 120))
+        dark_u8 = dark_soft.astype(np.uint8) * 255
+
+        if protect_mask is not None and protect_mask.shape == (H, W):
+            protect_roi = (np.clip(protect_mask[y_top:y_bottom, x_left:x_right], 0.0, 1.0) > 0.30).astype(np.uint8) * 255
+            dark_u8 = cv2.bitwise_and(dark_u8, cv2.bitwise_not(protect_roi))
+
+        dark_u8 = cv2.morphologyEx(
+            dark_u8,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
+        )
+        dark_u8 = cv2.morphologyEx(
+            dark_u8,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=1,
+        )
+
+        filtered_u8 = np.zeros_like(dark_u8)
+        total_area = 0.0
+        largest_area = 0.0
+        component_count = 0
+        if int((dark_u8 > 0).sum()) > 0:
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_u8, connectivity=8)
+            min_area = max(72, int(face_area * 0.006))
+            max_component_width = max(18, int(face_w * 1.05))
+            max_component_top = int(face_h * 0.42)
+            min_component_height = max(18, int(face_h * 0.18))
+            for label_idx in range(1, num_labels):
+                x = int(stats[label_idx, cv2.CC_STAT_LEFT])
+                y = int(stats[label_idx, cv2.CC_STAT_TOP])
+                w = int(stats[label_idx, cv2.CC_STAT_WIDTH])
+                h = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
+                area = int(stats[label_idx, cv2.CC_STAT_AREA])
+                if area < min_area:
+                    continue
+                if h < min_component_height:
+                    continue
+                if y > max_component_top:
+                    continue
+                if w > max_component_width:
+                    continue
+                mask = labels == label_idx
+                filtered_u8[mask] = 255
+                component_count += 1
+                total_area += float(area)
+                largest_area = max(largest_area, float(area))
+
+        center_x1 = max(0, int((cx - face_w * 0.26) - x_left))
+        center_x2 = min(filtered_u8.shape[1], int((cx + face_w * 0.26) - x_left))
+        center_occ = 0.0
+        if center_x1 < center_x2:
+            center_band = filtered_u8[:, center_x1:center_x2] > 0
+            if center_band.size > 0:
+                center_occ = float(center_band.mean())
+
+        total_ratio = float(total_area / max(face_area, 1.0))
+        largest_ratio = float(largest_area / max(face_area, 1.0))
+        score = float(np.clip(
+            1.0
+            - np.clip(total_ratio / 0.16, 0.0, 1.0) * 0.48
+            - np.clip(largest_ratio / 0.10, 0.0, 1.0) * 0.34
+            - np.clip(center_occ / 0.12, 0.0, 1.0) * 0.18,
+            0.0,
+            1.0,
+        ))
+        return {
+            "score": score,
+            "total_component_ratio": total_ratio,
+            "largest_component_ratio": largest_ratio,
+            "center_occupancy": center_occ,
+            "component_count": float(component_count),
         }
 
     def _preserve_original_hair_tone(
@@ -4022,17 +3977,11 @@ class MirrAISDPipeline:
         # short post-cleanup은 비용과 artifact를 줄이기 위해
         # 추가 SD refine 없이 LaMa를 기본으로 쓰고,
         # lower panel의 어두운 얼룩만 cv2 inpaint 결과를 약하게 섞어 정리한다.
-        lama_post_mode = "global"
-        lama_component_count = 0
         result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
         cv2_post_rgb: Optional[np.ndarray] = None
         cv2_front_rgb: Optional[np.ndarray] = None
         cv2_side_rgb: Optional[np.ndarray] = None
         residual_cv2_rgb: Optional[np.ndarray] = None
-        marker_cleanup_mask = np.zeros((H, W), dtype=np.float32)
-        marker_overlay_rgb: Optional[np.ndarray] = None
-        marker_component_rgb: Optional[np.ndarray] = None
-        marker_component_count = 0
         residual_cleanup_mask = np.zeros((H, W), dtype=np.float32)
         if hair_length == "short":
             front_blend_mask = front_cleanup_u8.astype(np.float32) / 255.0
@@ -4123,11 +4072,11 @@ class MirrAISDPipeline:
             # 1차 cleanup 뒤에도 side-zone에 남는 작은 dark tuft만 추가로 정리한다.
             residual_gray = result_rgb.mean(axis=2).astype(np.float32)
             residual_seed = (
-                ((side_blend_mask > 0.24) | (side_outer_blend_mask > 0.16))
+                ((side_blend_mask > 0.28) | (side_outer_blend_mask > 0.18))
             )
             if short_cleanup_pattern in {"front", "mixed"}:
-                residual_seed = residual_seed | (front_blend_mask > 0.14)
-            residual_dark_threshold = 128.0 if short_cleanup_pattern in {"front", "mixed"} else 122.0
+                residual_seed = residual_seed | (front_blend_mask > 0.18)
+            residual_dark_threshold = 124.0 if short_cleanup_pattern in {"front", "mixed"} else 122.0
             residual_u8 = (
                 (
                     residual_seed
@@ -4147,7 +4096,7 @@ class MirrAISDPipeline:
                     residual_u8,
                     connectivity=8,
                 )
-                min_residual_area = max(20, int(face_w * 0.08))
+                min_residual_area = max(24, int(face_w * 0.10))
                 min_residual_height = max(18, int(face_h * 0.18))
                 for label_idx in range(1, num_labels):
                     _, _, _, h, area = stats[label_idx]
@@ -4161,11 +4110,11 @@ class MirrAISDPipeline:
                 residual_u8 = cv2.morphologyEx(
                     residual_u8,
                     cv2.MORPH_CLOSE,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 9)),
                 )
                 residual_u8 = cv2.dilate(
                     residual_u8,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 9)),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 7)),
                     iterations=1,
                 )
                 residual_cleanup_mask = residual_u8.astype(np.float32) / 255.0
@@ -4177,52 +4126,15 @@ class MirrAISDPipeline:
                 residual_alpha = cv2.GaussianBlur(
                     residual_cleanup_mask,
                     (0, 0),
-                    sigmaX=3.6,
-                    sigmaY=3.6,
+                    sigmaX=3.0,
+                    sigmaY=3.0,
                 )
-                residual_alpha = np.clip(residual_alpha * 0.24, 0.0, 0.24)[..., np.newaxis]
+                residual_alpha = np.clip(residual_alpha * 0.20, 0.0, 0.20)[..., np.newaxis]
                 result_rgb = (
                     residual_cv2_rgb.astype(np.float32) * residual_alpha
                     + result_rgb.astype(np.float32) * (1.0 - residual_alpha)
                 )
                 result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
-
-            marker_keepout_u8 = residual_keepout_u8 if short_cleanup_pattern in {"front", "mixed"} else lower_center_keepout_u8
-            marker_seed_u8 = cv2.bitwise_or(front_cleanup_u8, side_cleanup_u8)
-            marker_seed_u8 = cv2.bitwise_or(marker_seed_u8, side_outer_cleanup_u8)
-            marker_seed_u8 = cv2.bitwise_and(marker_seed_u8, corridor)
-            marker_mask_u8, marker_overlay_rgb = self._build_short_marker_cleanup_mask(
-                result_rgb,
-                marker_seed_u8,
-                corridor_u8=corridor,
-                keepout_u8=marker_keepout_u8,
-                face_bbox=face_bbox,
-                cutoff_y=cutoff_y,
-                protect_mask=protect_mask,
-            )
-            if int((marker_mask_u8 > 0).sum()) >= 96:
-                marker_cleanup_mask = marker_mask_u8.astype(np.float32) / 255.0
-                marker_component_rgb, marker_component_count = self._lama_inpaint_component_rois(
-                    result_rgb,
-                    marker_mask_u8,
-                    pad_x=max(14, int(face_w * 0.16)),
-                    pad_y=max(18, int(face_h * 0.22)),
-                    protect_mask=protect_mask,
-                    min_component_area=max(56, int(face_w * 0.08)),
-                )
-                if marker_component_count > 0:
-                    marker_alpha = cv2.GaussianBlur(
-                        marker_cleanup_mask,
-                        (0, 0),
-                        sigmaX=3.2,
-                        sigmaY=3.2,
-                    )
-                    marker_alpha = np.clip(marker_alpha * 0.28, 0.0, 0.28)[..., np.newaxis]
-                    result_rgb = (
-                        marker_component_rgb.astype(np.float32) * marker_alpha
-                        + result_rgb.astype(np.float32) * (1.0 - marker_alpha)
-                    )
-                    result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
         if return_debug:
             debug_bundle = {
                 "pipeline_lama_post_cleanup_mask": force_mask,
@@ -4236,12 +4148,8 @@ class MirrAISDPipeline:
                 "pipeline_short_blend_keepout_mask": blend_keepout_u8.astype(np.float32) / 255.0,
                 "pipeline_short_residual_keepout_mask": residual_keepout_u8.astype(np.float32) / 255.0,
                 "pipeline_short_residual_cleanup_mask": residual_cleanup_mask,
-                "pipeline_short_marker_cleanup_mask": marker_cleanup_mask,
                 "short_cleanup_pattern": short_cleanup_pattern,
                 "short_side_outer_enabled": side_outer_enabled,
-                "lama_post_cleanup_mode": lama_post_mode,
-                "lama_post_cleanup_component_count": lama_component_count,
-                "short_marker_component_count": marker_component_count,
                 "short_front_panel_area": front_panel_area_total,
                 "short_side_panel_area": side_panel_area_total,
                 "short_front_panel_count": front_panel_count,
@@ -4255,10 +4163,6 @@ class MirrAISDPipeline:
                 debug_bundle["pipeline_cv2_side_cleanup_result"] = cv2_side_rgb
             if residual_cv2_rgb is not None:
                 debug_bundle["pipeline_cv2_residual_cleanup_result"] = residual_cv2_rgb
-            if marker_overlay_rgb is not None:
-                debug_bundle["pipeline_short_marker_overlay_rgb"] = marker_overlay_rgb
-            if marker_component_rgb is not None:
-                debug_bundle["pipeline_lama_marker_component_result"] = marker_component_rgb
             return result_rgb, debug_bundle
         return result_rgb
 
