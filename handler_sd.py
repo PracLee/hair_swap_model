@@ -237,6 +237,17 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         return_base64  = _coerce_bool(inp.get("return_base64"), default=True)
         return_intermediates = _coerce_bool(inp.get("return_intermediates"), default=False)
         bg_fill_mode   = normalize_bg_fill_mode(inp.get("bg_fill_mode", "lama"))
+        fixed_seeds: Optional[list[int]] = None
+        raw_seeds = inp.get("seeds")
+        if isinstance(raw_seeds, (list, tuple)) and raw_seeds:
+            parsed = [int(s) for s in raw_seeds]
+            if parsed:
+                while len(parsed) < top_k:
+                    parsed.append(parsed[-1] + 1)
+                fixed_seeds = parsed[:top_k]
+        elif inp.get("seed") not in (None, ""):
+            seed0 = int(inp.get("seed"))
+            fixed_seeds = [seed0 + i for i in range(top_k)]
 
         if not hairstyle_text and not color_text:
             return {"error": "hairstyle_text 또는 color_text 중 하나 이상 필요합니다."}
@@ -253,7 +264,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         pipeline = _get_pipeline()
         # bg_fill_mode를 런타임에 동적으로 설정 (빌드 없이 테스트 가능)
         pipeline.config.bg_fill_mode = bg_fill_mode
+        pipeline.config.seeds = fixed_seeds
         logger.info(f"[handler_sd] bg_fill_mode={bg_fill_mode}")
+        logger.info(f"[handler_sd] fixed_seeds={fixed_seeds if fixed_seeds else 'random'}")
         results = pipeline.run(
             image=img_bgr,
             hairstyle_text=hairstyle_text,

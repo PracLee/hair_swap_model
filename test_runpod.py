@@ -344,6 +344,8 @@ def main():
                         help="헤어 컬러 텍스트 (기본: 미지정=원본 톤 유지)")
     parser.add_argument("--top-k",     default=3, type=int,
                         help="결과 수 (기본: 3, 최대: 5)")
+    parser.add_argument("--seed",      type=int, default=None,
+                        help="고정 seed 시작값 (top-k>1이면 seed, seed+1, ... 사용)")
     parser.add_argument("--bg-fill",   default="lama", type=normalize_bg_fill_mode_arg, metavar="{lama,sd}",
                         help="하이브리드 pre-clean 모드: lama=LaMa partial pre-clean only, sd=LaMa partial pre-clean + SD refine (legacy alias: cv2->lama)")
 
@@ -381,6 +383,8 @@ def main():
             "return_intermediates": args.return_intermediates,
             "bg_fill_mode":   args.bg_fill,
         }
+        if args.seed is not None:
+            payload["seed"] = args.seed
 
         if args.image_url:
             payload["image_url"] = args.image_url
@@ -398,6 +402,7 @@ def main():
         print(f"Hairstyle: {args.hairstyle}")
         print(f"Color    : {args.color if args.color.strip() else '(원본 톤 유지)'}")
         print(f"Top-K    : {args.top_k}")
+        print(f"Seed     : {args.seed if args.seed is not None else '(random)'}")
         print(f"BG Fill  : {args.bg_fill}")
         print(f"Intermed : {'on' if args.return_intermediates else 'off'}")
     print(f"{'='*60}\n")
