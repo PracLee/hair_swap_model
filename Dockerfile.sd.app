@@ -37,4 +37,4 @@ ENV PYTHONPATH=/app \
     ENABLE_STARTUP_GIT_PULL=0 \
     GIT_PULL_REF=master
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["python", "/app/handler_sd.py"]
