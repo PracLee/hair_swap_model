@@ -237,7 +237,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         return_base64  = _coerce_bool(inp.get("return_base64"), default=True)
         return_intermediates = _coerce_bool(inp.get("return_intermediates"), default=False)
         bg_fill_mode   = normalize_bg_fill_mode(inp.get("bg_fill_mode", "lama"))
-        fixed_seeds: Optional[list[int]] = None
+        fixed_seeds = None
         raw_seeds = inp.get("seeds")
         if isinstance(raw_seeds, (list, tuple)) and raw_seeds:
             parsed = [int(s) for s in raw_seeds]
