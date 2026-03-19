@@ -100,6 +100,28 @@ def _get_pipeline() -> "MirrAISDPipeline":
             "use_color_match":     True,
             "use_poisson_blend":   True,
             "enable_xformers":     False,
+            "enable_roi_stronger_inpainter": os.environ.get(
+                "ENABLE_ROI_STRONGER_INPAINTER", "0"
+            ) in {"1", "true", "yes"},
+            "roi_stronger_backend": os.environ.get("ROI_STRONGER_BACKEND", "sdxl"),
+            "roi_stronger_control_mode": os.environ.get(
+                "ROI_STRONGER_CONTROL_MODE", "canny"
+            ),
+            "roi_stronger_target_size": int(os.environ.get("ROI_STRONGER_TARGET_SIZE", "768")),
+            "roi_stronger_steps": int(os.environ.get("ROI_STRONGER_STEPS", "20")),
+            "roi_stronger_guidance_scale": float(
+                os.environ.get("ROI_STRONGER_GUIDANCE_SCALE", "6.5")
+            ),
+            "roi_stronger_conditioning_scale": float(
+                os.environ.get("ROI_STRONGER_CONDITIONING_SCALE", "0.30")
+            ),
+            "roi_stronger_strength": float(os.environ.get("ROI_STRONGER_STRENGTH", "0.72")),
+            "roi_stronger_mask_expand_px": int(
+                os.environ.get("ROI_STRONGER_MASK_EXPAND_PX", "5")
+            ),
+            "roi_stronger_mask_blur_px": int(
+                os.environ.get("ROI_STRONGER_MASK_BLUR_PX", "5")
+            ),
         }
         cfg = SDInpaintConfig(**{k: v for k, v in _cfg_kwargs.items() if k in _cfg_fields})
 
@@ -333,4 +355,24 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     import runpod
-    runpod.serverless.start({"handler": handler})
+
+    print(
+        f"[startup] RUNPOD_POD_ID={os.environ.get('RUNPOD_POD_ID', 'NOT_SET')}",
+        flush=True,
+    )
+    print(
+        f"[startup] RUNPOD_ENDPOINT_ID={os.environ.get('RUNPOD_ENDPOINT_ID', 'NOT_SET')}",
+        flush=True,
+    )
+    print(
+        f"[startup] RUNPOD_WEBHOOK_POST_OUTPUT={os.environ.get('RUNPOD_WEBHOOK_POST_OUTPUT', 'NOT_SET')[:200]}",
+        flush=True,
+    )
+    try:
+        print("[startup] starting runpod.serverless.start", flush=True)
+        runpod.serverless.start({"handler": handler})
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[startup] fatal: {type(e).__name__}: {e}", flush=True)
+        print(tb, flush=True)
+        raise

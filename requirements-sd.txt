@@ -31,7 +31,7 @@ safetensors==0.4.4
 controlnet-aux==0.0.9
 
 # RunPod
-runpod==1.7.7
+runpod==1.8.1
 huggingface_hub==0.24.7
 python-dotenv==1.0.1
 requests==2.32.3
