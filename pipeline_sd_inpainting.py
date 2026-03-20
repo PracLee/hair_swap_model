@@ -546,7 +546,7 @@ class MirrAISDPipeline:
             feature_protect_for_generation = feature_protect_mask
             if hair_length == "short":
                 feature_protect_for_generation = feature_protect_mask.copy()
-                relax_top = min(H, max(0, int(y2f + face_h * 0.05)))
+                relax_top = min(H, max(0, int(y2f + face_h * 0.12)))
                 feature_protect_for_generation[relax_top:, :] = 0.0
 
             gen_mask_base = np.clip(gen_mask_base - feature_protect_for_generation, 0.0, 1.0)
@@ -575,6 +575,13 @@ class MirrAISDPipeline:
                 short_cleanup_mask = (cleanup_u8 > 0).astype(np.float32)
             else:
                 gen_mask = np.clip(np.maximum(gen_mask_base, short_cleanup_mask), 0.0, 1.0)
+            conservative_short_cleanup_mask = np.zeros((H, W), dtype=np.float32)
+            if hair_length == "short":
+                conservative_short_cleanup_mask = self._build_conservative_short_cleanup_mask(
+                    short_cleanup_mask,
+                    face_bbox=face_bbox,
+                    cutoff_y=cutoff_y,
+                )
 
             if debug_data_common is not None:
                 debug_data_common["short_generation_mask_stats"] = {
@@ -586,13 +593,14 @@ class MirrAISDPipeline:
             _store_mask("pipeline_short_generation_mask", gen_mask)
             if hair_length == "short":
                 _store_mask("pipeline_short_cleanup_mask", short_cleanup_mask)
+                _store_mask("pipeline_short_cleanup_seed_mask", conservative_short_cleanup_mask)
 
             preclean_seed_mask = long_hair_mask.copy()
             preclean_top = max(0, int(cutoff_y - face_h * 0.03))
             preclean_seed_mask[:preclean_top, :] = 0.0
             if hair_length == "short":
                 preclean_seed_mask = np.clip(
-                    np.maximum(preclean_seed_mask, short_cleanup_mask),
+                    np.maximum(preclean_seed_mask, conservative_short_cleanup_mask),
                     0.0,
                     1.0,
                 )
@@ -696,11 +704,6 @@ class MirrAISDPipeline:
             hair_mask_for_sd = gen_mask.astype(np.float32)
             short_conditioning_mask = hair_mask_for_sd
             if hair_length == "short":
-                short_conditioning_mask = np.clip(
-                    np.maximum(hair_mask_for_sd, short_cleanup_mask.astype(np.float32)),
-                    0.0,
-                    1.0,
-                )
                 _store_mask("pipeline_short_conditioning_mask", short_conditioning_mask)
             img_rgb_for_sd = img_rgb_cleaned
             if hair_length == "short":
@@ -2601,7 +2604,9 @@ class MirrAISDPipeline:
         확장 없이 그냥 두면 원본 긴 머리 픽셀이 composite에서 살아남음.
         """
         x1, y1, x2, y2 = face_bbox
+        face_w = max(x2 - x1, 1)
         face_h = max(y2 - y1, 1)
+        cx = int(0.5 * (x1 + x2))
 
         # 길이별 기준점: 어디부터 "머리카락이 없어야 하는가"
         if hair_length == "short":
@@ -2613,11 +2618,11 @@ class MirrAISDPipeline:
         cutoff_y = max(0, min(cutoff_y, H - 1))
 
         # 마스크 확장 한계: 어깨 아래(얼굴 높이 2배)를 넘지 않도록 제한 (옷 보호)
-        max_expand_y = int(y2 + face_h * 2.0)
+        max_expand_ratio = 1.45 if hair_length == "short" else 2.0
+        max_expand_y = int(y2 + face_h * max_expand_ratio)
         max_expand_y = min(max_expand_y, H - 1)
 
         # SAM2가 한쪽만 끊기는 문제 보정: 좌/우 각각 최하단을 구해서 더 긴 쪽에 맞춤
-        cx = (x1 + x2) // 2
         left_rows  = np.any(hair_mask[:, :cx] > 0.5, axis=1)
         right_rows = np.any(hair_mask[:, cx:] > 0.5, axis=1)
 
@@ -2630,25 +2635,98 @@ class MirrAISDPipeline:
         if lowest_hair_y <= cutoff_y:
             return hair_mask
 
-        # cutoff_y ~ lowest_hair_y 구간을 마스크에 추가
-        # 헤어가 실제로 있는 열(column) 범위를 위쪽 행들에서 추정
-        hair_cols_all = np.where(np.any(hair_mask[:cutoff_y] > 0.5, axis=0))[0]
-        if len(hair_cols_all) > 0:
-            default_c_min = int(hair_cols_all.min())
-            default_c_max = int(hair_cols_all.max())
-        else:
-            default_c_min, default_c_max = x1, x2
+        # short는 중앙 neckline corridor를 보존하고, 좌/우 side strand만 보수적으로 확장한다.
+        center_keepout_half = max(18, int(face_w * (0.24 if hair_length == "short" else 0.18)))
+        left_bound = max(0, cx - center_keepout_half)
+        right_bound = min(W, cx + center_keepout_half)
+
+        upper_mask = hair_mask[:cutoff_y] > 0.5
+        left_default_cols = np.where(np.any(upper_mask[:, :left_bound], axis=0))[0]
+        right_default_cols = np.where(np.any(upper_mask[:, right_bound:], axis=0))[0] + right_bound
+
+        default_left_range: Optional[Tuple[int, int]] = None
+        default_right_range: Optional[Tuple[int, int]] = None
+        if left_default_cols.size > 0:
+            default_left_range = (int(left_default_cols.min()), int(left_default_cols.max()))
+        elif x1 < left_bound:
+            default_left_range = (x1, max(x1, left_bound - 1))
+        if right_default_cols.size > 0:
+            default_right_range = (int(right_default_cols.min()), int(right_default_cols.max()))
+        elif right_bound < x2:
+            default_right_range = (min(W - 1, right_bound), x2)
 
         expanded = hair_mask.copy()
         for row in range(cutoff_y, min(lowest_hair_y + 1, H)):
             row_hair_cols = np.where(hair_mask[row] > 0.3)[0]
-            if len(row_hair_cols) > 0:
-                c_min, c_max = int(row_hair_cols.min()), int(row_hair_cols.max())
+            if row_hair_cols.size > 0:
+                row_left = row_hair_cols[row_hair_cols < left_bound]
+                row_right = row_hair_cols[row_hair_cols >= right_bound]
             else:
-                c_min, c_max = default_c_min, default_c_max
-            expanded[row, max(0, c_min):min(W, c_max + 1)] = 1.0
+                row_left = np.empty((0,), dtype=np.int32)
+                row_right = np.empty((0,), dtype=np.int32)
+
+            if row_left.size > 0:
+                left_range = (int(row_left.min()), int(row_left.max()))
+            else:
+                left_range = default_left_range
+            if row_right.size > 0:
+                right_range = (int(row_right.min()), int(row_right.max()))
+            else:
+                right_range = default_right_range
+
+            if left_range is not None and left_range[0] <= left_range[1]:
+                expanded[row, max(0, left_range[0]):min(W, left_range[1] + 1)] = 1.0
+            if right_range is not None and right_range[0] <= right_range[1]:
+                expanded[row, max(0, right_range[0]):min(W, right_range[1] + 1)] = 1.0
 
         return expanded
+
+    def _build_conservative_short_cleanup_mask(
+        self,
+        cleanup_mask: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        cutoff_y: int,
+    ) -> np.ndarray:
+        """
+        short preclean/conditioning용 보수적 cleanup mask.
+        목 중앙은 비워 두고, cutoff 아래 좌우 side 영역만 제한적으로 사용한다.
+        """
+        H, W = cleanup_mask.shape[:2]
+        if cleanup_mask.shape != (H, W):
+            return np.zeros((H, W), dtype=np.float32)
+
+        x1, y1, x2, y2 = face_bbox
+        face_w = max(int(x2 - x1), 1)
+        face_h = max(int(y2 - y1), 1)
+        cx = int(0.5 * (x1 + x2))
+
+        cleanup_u8 = (np.clip(cleanup_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
+        if int((cleanup_u8 > 0).sum()) < 80:
+            return np.zeros((H, W), dtype=np.float32)
+
+        lower_top = min(H, int(cutoff_y + face_h * 0.08))
+        cleanup_u8[:lower_top, :] = 0
+
+        center_keepout_u8 = np.zeros((H, W), dtype=np.uint8)
+        keepout_half = max(20, int(face_w * 0.28))
+        keepout_bottom = min(H, int(cutoff_y + face_h * 1.50))
+        center_keepout_u8[
+            lower_top:keepout_bottom,
+            max(0, cx - keepout_half):min(W, cx + keepout_half),
+        ] = 255
+        cleanup_u8 = cv2.bitwise_and(cleanup_u8, cv2.bitwise_not(center_keepout_u8))
+
+        cleanup_u8 = cv2.erode(
+            cleanup_u8,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 11)),
+            iterations=1,
+        )
+        cleanup_u8 = cv2.morphologyEx(
+            cleanup_u8,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 9)),
+        )
+        return (cleanup_u8 > 0).astype(np.float32)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Color Helpers
@@ -3998,7 +4076,20 @@ class MirrAISDPipeline:
         side_panel_area_total = 0
         front_panel_count = 0
         side_panel_count = 0
+        conservative_cleanup_guard = False
         if hair_length == "short":
+            hair_inter_pixels = int((hair_inter_u8 > 0).sum())
+            raw_force_pixels = int((force_u8 > 0).sum())
+            force_guard_limit = max(24000, int(face_w * face_h * 0.95))
+            hair_support_limit = max(120, int(raw_force_pixels * 0.18))
+            if raw_force_pixels >= force_guard_limit and hair_inter_pixels < hair_support_limit:
+                # 실제 hair evidence가 약한데 heuristic removal mask가 너무 큰 경우엔
+                # cleanup을 최소화해 목/의상 패널 왜곡을 막는다.
+                conservative_cleanup_guard = True
+                short_cleanup_pattern = "guarded"
+                force_u8 = hair_inter_u8.copy()
+
+        if hair_length == "short" and not conservative_cleanup_guard:
             # SegFace miss를 보완하기 위해 side-zone에 한해 high-confidence force를 추가 반영
             center_half = max(18, int(face_w * 0.42))
             side_zone = corridor.copy()
@@ -4273,7 +4364,7 @@ class MirrAISDPipeline:
             panel_tail_u8 = cv2.bitwise_or(front_tail_u8, side_tail_u8)
 
             force_u8 = cv2.bitwise_or(front_cleanup_u8, side_cleanup_u8)
-        else:
+        elif hair_length != "short":
             # medium도 SegFace miss 보완용 fallback force 일부 허용
             fallback_u8 = ((force > 0.74).astype(np.uint8) * 255)
             fallback_u8 = cv2.bitwise_and(fallback_u8, corridor)
@@ -5097,6 +5188,7 @@ class MirrAISDPipeline:
                 "pipeline_lama_post_cleanup_background_mask": split_background_mask,
                 "pipeline_lama_post_cleanup_split_residual_mask": split_residual_mask,
                 "short_cleanup_pattern": short_cleanup_pattern,
+                "short_cleanup_guarded": conservative_cleanup_guard,
                 "short_side_outer_enabled": side_outer_enabled,
                 "short_front_panel_area": front_panel_area_total,
                 "short_side_panel_area": side_panel_area_total,
