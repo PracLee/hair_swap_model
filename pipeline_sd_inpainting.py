@@ -479,6 +479,10 @@ class MirrAISDPipeline:
             # post cleanup에서는 실제 생성 결과의 short mask와 차집합을 다시 계산한다.
             long_hair_mask = np.clip(hair_mask_for_removal - feature_protect_mask, 0.0, 1.0)
             long_hair_mask_for_post = long_hair_mask.copy()
+            short_side_gap_mode = (
+                hair_length == "short"
+                and self._is_side_dominant_lower_hair(long_hair_mask, face_bbox, cutoff_y)
+            )
 
             # gen_mask = 기존 헤어 상단 + 얼굴 주변 corridor를 합쳐 새 단발이 생성될 영역만 열어 준다.
             # 직사각형 전체 head box를 쓰면 배경 패치가 같이 생겨 사각형 artifact가 남기 쉽다.
@@ -577,11 +581,14 @@ class MirrAISDPipeline:
                 gen_mask = np.clip(np.maximum(gen_mask_base, short_cleanup_mask), 0.0, 1.0)
             conservative_short_cleanup_mask = np.zeros((H, W), dtype=np.float32)
             if hair_length == "short":
-                conservative_short_cleanup_mask = self._build_conservative_short_cleanup_mask(
-                    short_cleanup_mask,
-                    face_bbox=face_bbox,
-                    cutoff_y=cutoff_y,
-                )
+                if short_side_gap_mode:
+                    conservative_short_cleanup_mask = self._build_conservative_short_cleanup_mask(
+                        short_cleanup_mask,
+                        face_bbox=face_bbox,
+                        cutoff_y=cutoff_y,
+                    )
+                else:
+                    conservative_short_cleanup_mask = short_cleanup_mask.copy()
 
             if debug_data_common is not None:
                 debug_data_common["short_generation_mask_stats"] = {
@@ -589,6 +596,8 @@ class MirrAISDPipeline:
                     "lower_rewrite_pixels": int((short_cleanup_mask > 0.35).sum()),
                     "final_pixels": int((gen_mask > 0.35).sum()),
                 }
+                if hair_length == "short":
+                    debug_data_common["short_side_gap_mode"] = bool(short_side_gap_mode)
 
             _store_mask("pipeline_short_generation_mask", gen_mask)
             if hair_length == "short":
@@ -2635,7 +2644,31 @@ class MirrAISDPipeline:
         if lowest_hair_y <= cutoff_y:
             return hair_mask
 
-        # short는 중앙 neckline corridor를 보존하고, 좌/우 side strand만 보수적으로 확장한다.
+        side_dominant_lower_hair = (
+            hair_length == "short"
+            and self._is_side_dominant_lower_hair(hair_mask, face_bbox, cutoff_y)
+        )
+
+        if not side_dominant_lower_hair:
+            # 기본 모드: cutoff 아래 hair span 전체를 이어 붙여 재작성한다.
+            hair_cols_all = np.where(np.any(hair_mask[:cutoff_y] > 0.5, axis=0))[0]
+            if len(hair_cols_all) > 0:
+                default_c_min = int(hair_cols_all.min())
+                default_c_max = int(hair_cols_all.max())
+            else:
+                default_c_min, default_c_max = x1, x2
+
+            expanded = hair_mask.copy()
+            for row in range(cutoff_y, min(lowest_hair_y + 1, H)):
+                row_hair_cols = np.where(hair_mask[row] > 0.3)[0]
+                if len(row_hair_cols) > 0:
+                    c_min, c_max = int(row_hair_cols.min()), int(row_hair_cols.max())
+                else:
+                    c_min, c_max = default_c_min, default_c_max
+                expanded[row, max(0, c_min):min(W, c_max + 1)] = 1.0
+            return expanded
+
+        # side-gap 모드: 중앙 neckline corridor를 보존하고 좌/우 side strand만 확장한다.
         center_keepout_half = max(18, int(face_w * (0.24 if hair_length == "short" else 0.18)))
         left_bound = max(0, cx - center_keepout_half)
         right_bound = min(W, cx + center_keepout_half)
@@ -2727,6 +2760,57 @@ class MirrAISDPipeline:
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 9)),
         )
         return (cleanup_u8 > 0).astype(np.float32)
+
+    def _is_side_dominant_lower_hair(
+        self,
+        hair_mask: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        cutoff_y: int,
+    ) -> bool:
+        """
+        cutoff 아래 long-hair가 중앙을 덮는 front-panel인지,
+        아니면 양옆 side strand 위주인지 구분한다.
+        """
+        H, W = hair_mask.shape[:2]
+        if hair_mask.shape != (H, W):
+            return False
+
+        x1, y1, x2, y2 = face_bbox
+        face_w = max(int(x2 - x1), 1)
+        face_h = max(int(y2 - y1), 1)
+        cx = int(0.5 * (x1 + x2))
+
+        lower_top = min(H, int(cutoff_y + face_h * 0.08))
+        lower_bottom = min(H, int(cutoff_y + face_h * 1.55))
+        if lower_top >= lower_bottom:
+            return False
+
+        hair_u8 = (np.clip(hair_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
+        center_half = max(18, int(face_w * 0.18))
+        side_outer_half = max(32, int(face_w * 0.92))
+
+        left = hair_u8[
+            lower_top:lower_bottom,
+            max(0, cx - side_outer_half):max(0, cx - center_half),
+        ]
+        right = hair_u8[
+            lower_top:lower_bottom,
+            min(W, cx + center_half):min(W, cx + side_outer_half),
+        ]
+        center = hair_u8[
+            lower_top:lower_bottom,
+            max(0, cx - center_half):min(W, cx + center_half),
+        ]
+
+        def _coverage(region: np.ndarray) -> float:
+            if region.size == 0:
+                return 0.0
+            return float((region > 0).mean())
+
+        left_cov = _coverage(left)
+        right_cov = _coverage(right)
+        center_cov = _coverage(center)
+        return min(left_cov, right_cov) >= 0.08 and center_cov <= 0.06
 
     # ──────────────────────────────────────────────────────────────────────────
     # Color Helpers
@@ -4082,7 +4166,16 @@ class MirrAISDPipeline:
             raw_force_pixels = int((force_u8 > 0).sum())
             force_guard_limit = max(24000, int(face_w * face_h * 0.95))
             hair_support_limit = max(120, int(raw_force_pixels * 0.18))
-            if raw_force_pixels >= force_guard_limit and hair_inter_pixels < hair_support_limit:
+            side_gap_cleanup_mode = self._is_side_dominant_lower_hair(
+                force_u8.astype(np.float32) / 255.0,
+                face_bbox,
+                cutoff_y,
+            )
+            if (
+                side_gap_cleanup_mode
+                and raw_force_pixels >= force_guard_limit
+                and hair_inter_pixels < hair_support_limit
+            ):
                 # 실제 hair evidence가 약한데 heuristic removal mask가 너무 큰 경우엔
                 # cleanup을 최소화해 목/의상 패널 왜곡을 막는다.
                 conservative_cleanup_guard = True
