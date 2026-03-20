@@ -832,6 +832,8 @@ class MirrAISDPipeline:
                         face_mask=face_region_mask,
                         seed=seed,
                         return_debug=post_debug_enabled,
+                        original_rgb=img_rgb,
+                        cleanup_params=cleanup_params,
                     )
                     if post_debug_enabled:
                         post_rgb, post_cleanup_debug = post_cleanup
@@ -1409,21 +1411,28 @@ class MirrAISDPipeline:
         seed: int = 42,
         roi_pad_ratio: float = 0.25,
         min_residual_pixels: int = 300,
-        sd_strength: float = 0.85,
+        sd_strength: float = 0.50,
         sd_steps: int = 15,
         sd_blend_sigma: float = 5.0,
         sd_guidance: float = 5.0,
         sd_controlnet: float = 0.35,
+        original_rgb: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
-        Iterative LaMa cleanup 후 남은 잔여물을 SD inpainting으로 채운다.
+        Original texture reference approach for SD ROI cleanup.
 
-        LaMa는 큰 영역의 texture를 제대로 복원하지 못하는 한계가 있다.
-        남은 dark mass ROI만 크롭하여 SD 1.5 inpainting pipe로 채운 뒤
-        원본에 soft-blend로 합성한다.
+        Key insight: instead of generating new content (which loses texture detail),
+        use the ORIGINAL image (before hair swap) as init_image for SD inpainting.
+        The original has clothing texture in the same area (just with hair on top).
+        With moderate denoising strength (0.4-0.6), SD:
+          1. Keeps the clothing texture pattern from the original
+          2. Removes/blends away the dark hair strands
+          3. Results look natural because texture matches surrounding area
+
+        Falls back to current-image-as-init if original_rgb is not provided.
 
         Args:
-            img_rgb: 현재 결과 이미지 (RGB)
+            img_rgb: 현재 결과 이미지 (RGB, post-LaMa cleanup)
             residual_mask_u8: 잔여물 영역 마스크 (0/255)
             face_bbox: (x1, y1, x2, y2) 얼굴 bbox
             protect_mask: 얼굴 보호 마스크 (float32, 0~1)
@@ -1431,6 +1440,8 @@ class MirrAISDPipeline:
             seed: 생성 시드
             roi_pad_ratio: ROI 패딩 비율
             min_residual_pixels: 최소 잔여 픽셀 수 (이하면 스킵)
+            sd_strength: denoising strength (0.5 = moderate, keep texture)
+            original_rgb: 원본 입력 이미지 (RGB, before hair swap) — texture reference
         """
         H, W = img_rgb.shape[:2]
         if residual_mask_u8.shape != (H, W):
@@ -1463,15 +1474,33 @@ class MirrAISDPipeline:
         if crop_h < 64 or crop_w < 64:
             return img_rgb
 
-        logger.info(
-            f"[SDPipeline] SD ROI cleanup: {residual_pixels}px residual, "
-            f"ROI=({crop_x1},{crop_y1})-({crop_x2},{crop_y2}) "
-            f"size={crop_w}x{crop_h}"
-        )
-
-        # ── 2) ROI 크롭 + SD 512x512 리사이즈 ────────────────────────
+        # ── 2) ROI 크롭 ──────────────────────────────────────────────
         roi_rgb = img_rgb[crop_y1:crop_y2, crop_x1:crop_x2].copy()
         roi_mask = residual_mask_u8[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+
+        # Use original image as init_image for SD (texture reference)
+        # The original has clothing texture in the residual area (just with hair on top).
+        # SD with moderate denoising will keep the texture and remove hair strands.
+        use_original_ref = (
+            original_rgb is not None
+            and original_rgb.shape[:2] == (H, W)
+        )
+        if use_original_ref:
+            roi_init_rgb = original_rgb[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+            logger.info(
+                f"[SDPipeline] SD ROI cleanup: using ORIGINAL texture reference, "
+                f"{residual_pixels}px residual, "
+                f"ROI=({crop_x1},{crop_y1})-({crop_x2},{crop_y2}) "
+                f"size={crop_w}x{crop_h}, strength={sd_strength}"
+            )
+        else:
+            roi_init_rgb = roi_rgb.copy()
+            logger.info(
+                f"[SDPipeline] SD ROI cleanup: original not available, using current image, "
+                f"{residual_pixels}px residual, "
+                f"ROI=({crop_x1},{crop_y1})-({crop_x2},{crop_y2}) "
+                f"size={crop_w}x{crop_h}, strength={sd_strength}"
+            )
 
         # mask를 약간 dilate해서 경계도 포함
         roi_mask = cv2.dilate(
@@ -1496,48 +1525,31 @@ class MirrAISDPipeline:
         if int((roi_mask > 0).sum()) < 100:
             return img_rgb
 
-        # SD는 512x512에서 동작
-        roi_pil = Image.fromarray(roi_rgb).resize((SD_SIZE, SD_SIZE), Image.LANCZOS)
+        # SD는 512x512에서 동작 — init_image는 원본 텍스처 reference
+        roi_init_pil = Image.fromarray(roi_init_rgb).resize((SD_SIZE, SD_SIZE), Image.LANCZOS)
         mask_pil = Image.fromarray(roi_mask).resize((SD_SIZE, SD_SIZE), Image.NEAREST)
 
-        # ── 3) Canny edge for ControlNet (옷 텍스처 가이드) ───────────
-        roi_gray = cv2.cvtColor(
-            np.array(roi_pil), cv2.COLOR_RGB2GRAY
+        # ── 3) Canny edge for ControlNet ─────────────────────────────
+        # Use the ORIGINAL ROI for canny to guide clothing texture structure
+        roi_init_gray = cv2.cvtColor(
+            np.array(roi_init_pil), cv2.COLOR_RGB2GRAY
         )
-        canny = cv2.Canny(roi_gray, 40, 120)
+        canny = cv2.Canny(roi_init_gray, 40, 120)
         # mask 영역의 canny는 제거 (잔여물 edge를 가이드로 쓰면 안 됨)
         mask_512_np = np.array(mask_pil)
         canny[mask_512_np > 127] = 0
         canny_pil = Image.fromarray(canny).convert("RGB")
 
         # ── 4) 프롬프트 구성 ──────────────────────────────────────────
-        # cloth 영역이 mask에 포함되어 있으면 clothing을 강조
-        has_cloth_in_roi = False
-        if cloth_mask is not None and cloth_mask.shape == (H, W):
-            roi_cloth = (
-                np.clip(cloth_mask[crop_y1:crop_y2, crop_x1:crop_x2], 0, 1) > 0.3
-            ).astype(np.uint8) * 255
-            overlap = cv2.bitwise_and(roi_mask, roi_cloth)
-            has_cloth_in_roi = int((overlap > 0).sum()) > 100
-
-        if has_cloth_in_roi:
-            prompt = (
-                "clean clothing fabric, natural skin tone, smooth texture, "
-                "photorealistic, high quality, studio lighting, sharp focus, "
-                "no hair strands, clean neckline"
-            )
-        else:
-            prompt = (
-                "clean background, natural skin tone, smooth surface, "
-                "photorealistic, high quality, studio lighting, sharp focus, "
-                "no hair strands"
-            )
+        # Original texture reference approach: focus on clean skin/clothing
+        prompt = (
+            "clean skin, clothing fabric, natural lighting, no hair strands"
+        )
         negative = (
-            "hair, hair strands, dark patches, black smudge, blur, "
-            "artifacts, distortion, ugly, deformed, low quality"
+            "hair, dark spots, black strands, blur"
         )
 
-        # ── 5) SD inpainting 실행 ────────────────────────────────────
+        # ── 5) SD inpainting with original texture reference ─────────
         try:
             # IP-Adapter는 ROI cleanup에서 불필요 → scale 0
             self._sd_pipe.set_ip_adapter_scale(0.0)
@@ -1550,7 +1562,7 @@ class MirrAISDPipeline:
                 out = self._sd_pipe(
                     prompt=prompt,
                     negative_prompt=negative,
-                    image=roi_pil,
+                    image=roi_init_pil,       # ORIGINAL texture as init
                     mask_image=mask_pil,
                     control_image=canny_pil,
                     ip_adapter_image=[dummy_face],
@@ -1561,7 +1573,7 @@ class MirrAISDPipeline:
                     controlnet_conditioning_scale=sd_controlnet,
                     num_images_per_prompt=1,
                     generator=[gen],
-                    strength=sd_strength,
+                    strength=sd_strength,      # moderate: keep texture, remove hair
                 )
             sd_result_pil = out.images[0]
 
@@ -1571,23 +1583,53 @@ class MirrAISDPipeline:
             logger.warning(f"[SDPipeline] SD ROI cleanup failed: {e}")
             return img_rgb
 
-        # ── 6) 결과를 원본 해상도로 되돌리고 soft-blend ──────────────
+        # ── 6) Poisson blend back to original resolution ─────────────
         sd_result_np = np.array(sd_result_pil)  # 512x512 RGB
         sd_roi_rgb = cv2.resize(
             sd_result_np, (crop_w, crop_h), interpolation=cv2.INTER_LANCZOS4
         )
 
-        # Soft blend mask: 잔여물 영역에서만 SD 결과 적용
-        blend_mask = roi_mask.astype(np.float32) / 255.0
-        blend_mask = cv2.GaussianBlur(blend_mask, (0, 0), sigmaX=sd_blend_sigma, sigmaY=sd_blend_sigma)
-        blend_mask = np.clip(blend_mask, 0.0, 1.0)[..., np.newaxis]
+        # Try Poisson seamlessClone for natural blending
+        poisson_success = False
+        try:
+            poisson_mask_u8 = cv2.dilate(
+                roi_mask,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+                iterations=1,
+            )
+            # seamlessClone needs the mask center
+            ys_m, xs_m = np.where(poisson_mask_u8 > 0)
+            if len(ys_m) > 0 and len(xs_m) > 0:
+                center_x = int((xs_m.min() + xs_m.max()) // 2)
+                center_y = int((ys_m.min() + ys_m.max()) // 2)
+                # Poisson blend operates on BGR
+                sd_roi_bgr = sd_roi_rgb[:, :, ::-1].copy()
+                roi_current_bgr = roi_rgb[:, :, ::-1].copy()
+                poisson_out = cv2.seamlessClone(
+                    sd_roi_bgr,
+                    roi_current_bgr,
+                    poisson_mask_u8,
+                    (center_x, center_y),
+                    cv2.NORMAL_CLONE,
+                )
+                roi_blended = cv2.cvtColor(poisson_out, cv2.COLOR_BGR2RGB)
+                poisson_success = True
+                logger.info("[SDPipeline] SD ROI cleanup: Poisson blend applied")
+        except Exception as e:
+            logger.warning(f"[SDPipeline] SD ROI Poisson blend failed, falling back to soft blend: {e}")
 
-        # SD 결과와 원본을 soft blend
-        roi_blended = (
-            sd_roi_rgb.astype(np.float32) * blend_mask
-            + roi_rgb.astype(np.float32) * (1.0 - blend_mask)
-        )
-        roi_blended = np.clip(roi_blended, 0, 255).astype(np.uint8)
+        if not poisson_success:
+            # Fallback: soft blend
+            blend_mask = roi_mask.astype(np.float32) / 255.0
+            blend_mask = cv2.GaussianBlur(
+                blend_mask, (0, 0), sigmaX=sd_blend_sigma, sigmaY=sd_blend_sigma
+            )
+            blend_mask = np.clip(blend_mask, 0.0, 1.0)[..., np.newaxis]
+            roi_blended = (
+                sd_roi_rgb.astype(np.float32) * blend_mask
+                + roi_rgb.astype(np.float32) * (1.0 - blend_mask)
+            )
+            roi_blended = np.clip(roi_blended, 0, 255).astype(np.uint8)
 
         # 원본에 paste back
         result = img_rgb.copy()
@@ -1595,7 +1637,8 @@ class MirrAISDPipeline:
 
         logger.info(
             f"[SDPipeline] SD ROI cleanup done: "
-            f"{residual_pixels}px cleaned with SD inpainting"
+            f"{residual_pixels}px cleaned with original texture reference "
+            f"(poisson={'yes' if poisson_success else 'no'})"
         )
         return result
 
@@ -3862,6 +3905,8 @@ class MirrAISDPipeline:
         face_mask: Optional[np.ndarray] = None,
         seed: Optional[int] = None,
         return_debug: bool = False,
+        original_rgb: Optional[np.ndarray] = None,
+        cleanup_params: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         최종 결과에서 cutoff 아래 long-hair 제거 마스크 영역을 한 번 더 정리.
@@ -4638,11 +4683,11 @@ class MirrAISDPipeline:
 
             # ── cleanup tuning params (API 런타임 오버라이드) ──────────
             _cp = cleanup_params or {}
-            _cp_iter_cloth_sigmas = _cp.get("iter_cloth_sigmas", [1.4, 1.7, 2.0, 2.3, 2.6])
-            _cp_iter_bg_sigmas = _cp.get("iter_bg_sigmas", [1.2, 1.5, 1.8, 2.1, 2.4])
+            _cp_iter_cloth_sigmas = _cp.get("iter_cloth_sigmas", [1.4, 1.7, 2.0])
+            _cp_iter_bg_sigmas = _cp.get("iter_bg_sigmas", [1.2, 1.5, 1.8])
             _cp_sd_cloth_sigma = float(_cp.get("sd_cloth_sigma", 1.2))
             _cp_sd_bg_sigma = float(_cp.get("sd_bg_sigma", 1.0))
-            _cp_sd_strength = float(_cp.get("sd_strength", 0.85))
+            _cp_sd_strength = float(_cp.get("sd_strength", 0.50))
             _cp_sd_steps = int(_cp.get("sd_steps", 15))
             _cp_sd_blend_sigma = float(_cp.get("sd_blend_sigma", 5.0))
             _cp_sd_comp_min = int(_cp.get("sd_comp_min", 80))
@@ -4700,7 +4745,7 @@ class MirrAISDPipeline:
                 bg_scan_base = cv2.bitwise_and(scan_roi_u8, cv2.bitwise_not(_cloth_u8))
                 bg_scan_base[:cleanup_roi_top, :] = 0
 
-                max_iterations = 5
+                max_iterations = 3
                 # Start aggressive on first pass, relax each iteration
                 cloth_sigma_schedule = _cp_iter_cloth_sigmas[:max_iterations]
                 bg_sigma_schedule = _cp_iter_bg_sigmas[:max_iterations]
@@ -4874,6 +4919,7 @@ class MirrAISDPipeline:
                         sd_blend_sigma=_cp_sd_blend_sigma,
                         sd_guidance=_cp_sd_guidance,
                         sd_controlnet=_cp_sd_controlnet,
+                        original_rgb=original_rgb,
                     )
                     sd_roi_applied = True
                     # 누적 cleanup mask 업데이트
