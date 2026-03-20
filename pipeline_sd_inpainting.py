@@ -271,6 +271,7 @@ class MirrAISDPipeline:
         color_text: str,
         top_k: int = 3,
         return_intermediates: bool = False,
+        cleanup_params: Optional[Dict[str, Any]] = None,
     ) -> List[SDInpaintResult]:
         """
         헤어 스타일 변환 실행.
@@ -281,12 +282,16 @@ class MirrAISDPipeline:
             color_text:     헤어 컬러 텍스트 (트렌드 데이터 color_text)
             top_k:          반환 결과 수 (기본 3)
             return_intermediates: 중간 산출물 디버그 이미지 포함 여부
+            cleanup_params: 런타임 cleanup 튜닝 오버라이드용 예약 인자.
+                            현재 파이프라인에서는 무시하고, handler와의 ABI 호환만 유지한다.
 
         Returns:
             SDInpaintResult 리스트 (rank 0이 first)
         """
         if not self._loaded:
             self.load()
+
+        _ = cleanup_params
 
         # 시드 결정:
         #   1. config.seeds가 있으면 그대로 사용
