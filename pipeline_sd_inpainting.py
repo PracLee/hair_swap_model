@@ -2322,135 +2322,72 @@ class MirrAISDPipeline:
         if cleanup_count < 50:
             return result_rgb
 
-        # ── 4) Pixel copy per semantic zone ───────────────────────────
+        # ── 4) Pixel copy per semantic zone (vectorized) ──────────────
         output = result_rgb.copy()
 
-        # -- 4a) SKIN zone: copy from original skin pixels above (vertical nearest) --
+        # -- Helper: nearest-source lookup via distance transform --
+        def _nearest_source_copy(
+            target_mask: np.ndarray,      # bool H×W: where to fill
+            source_mask: np.ndarray,      # bool H×W: where to copy FROM
+            src_img: np.ndarray,          # H×W×3: source image
+        ) -> int:
+            """Vectorized nearest-source pixel copy using cv2.distanceTransform."""
+            count = int(target_mask.sum())
+            if count == 0 or int(source_mask.sum()) < 10:
+                return count
+            # distanceTransformWithLabels: each pixel gets label of nearest zero-pixel
+            # We make source pixels = 0 (foreground), rest = 255 (background)
+            inv_mask = (~source_mask).astype(np.uint8) * 255
+            _, labels = cv2.distanceTransformWithLabels(
+                inv_mask, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL
+            )
+            # labels[y,x] = raster-index (row*W+col) of nearest source pixel
+            # Build lookup: raster index → (y, x)
+            tgt_ys, tgt_xs = np.where(target_mask)
+            src_labels = labels[tgt_ys, tgt_xs]  # label for each target pixel
+            # Convert raster labels to (y, x) coordinates
+            src_ys = (src_labels - 1) // W
+            src_xs = (src_labels - 1) % W
+            # Clip to valid range
+            src_ys = np.clip(src_ys, 0, H - 1)
+            src_xs = np.clip(src_xs, 0, W - 1)
+            # Vectorized copy
+            output[tgt_ys, tgt_xs] = src_img[src_ys, src_xs]
+            return count
+
+        # -- 4a) SKIN zone --
         skin_cleanup = cleanup & result_skin
-        skin_count = int(skin_cleanup.sum())
+        orig_skin_available = orig_skin & (~orig_hair)
+        skin_count = _nearest_source_copy(skin_cleanup, orig_skin_available, original_rgb)
         if skin_count > 0:
-            # Find skin pixels in original that are NOT under hair
-            orig_skin_available = orig_skin & (~orig_hair)
-            if int(orig_skin_available.sum()) > 20:
-                # For each column, find the nearest skin pixel ABOVE in original
-                skin_ys, skin_xs = np.where(skin_cleanup)
-                for y, x in zip(skin_ys, skin_xs):
-                    # Search upward in original for available skin pixel
-                    col_skin = orig_skin_available[:y, x]
-                    if col_skin.any():
-                        src_y = np.where(col_skin)[0][-1]  # nearest above
-                        output[y, x] = original_rgb[src_y, x]
-                    else:
-                        # Fallback: average skin color from original
-                        # (computed once below, applied here)
-                        pass
-
-                # Fallback: fill remaining with average skin color
-                orig_skin_pixels = original_rgb[orig_skin_available]
-                if len(orig_skin_pixels) > 0:
-                    avg_skin = orig_skin_pixels.mean(axis=0).astype(np.uint8)
-                    # Check which pixels weren't filled (still match result)
-                    still_unfilled = skin_cleanup.copy()
-                    for y, x in zip(skin_ys, skin_xs):
-                        col_skin = orig_skin_available[:y, x]
-                        if col_skin.any():
-                            still_unfilled[y, x] = False
-                    if int(still_unfilled.sum()) > 0:
-                        output[still_unfilled] = avg_skin
-
+            # Fallback: unfilled pixels get average skin color
+            orig_skin_pixels = original_rgb[orig_skin_available]
+            if len(orig_skin_pixels) > 0 and int(orig_skin_available.sum()) < 10:
+                avg_skin = orig_skin_pixels.mean(axis=0).astype(np.uint8)
+                still_unfilled = skin_cleanup & (~orig_skin_available)
+                output[still_unfilled] = avg_skin
             logger.info(f"[SDPipeline] parsing_pixel_copy: skin zone={skin_count}px")
 
-        # -- 4b) CLOTH zone: copy from original cloth pixels (horizontal nearest) --
+        # -- 4b) CLOTH zone --
         cloth_cleanup = cleanup & result_cloth
-        cloth_count = int(cloth_cleanup.sum())
+        orig_cloth_available = orig_cloth & (~orig_hair)
+        cloth_count = _nearest_source_copy(cloth_cleanup, orig_cloth_available, original_rgb)
         if cloth_count > 0:
-            orig_cloth_available = orig_cloth & (~orig_hair)
-            if int(orig_cloth_available.sum()) > 20:
-                cloth_ys, cloth_xs = np.where(cloth_cleanup)
-                for y, x in zip(cloth_ys, cloth_xs):
-                    # Search horizontally in original for nearest cloth pixel
-                    row_cloth = orig_cloth_available[y, :]
-                    if row_cloth.any():
-                        available_xs = np.where(row_cloth)[0]
-                        nearest_idx = np.argmin(np.abs(available_xs - x))
-                        src_x = available_xs[nearest_idx]
-                        output[y, x] = original_rgb[y, src_x]
-                    else:
-                        # Search nearby rows
-                        found = False
-                        for dy in range(1, 30):
-                            for check_y in [y - dy, y + dy]:
-                                if 0 <= check_y < H:
-                                    row_c = orig_cloth_available[check_y, :]
-                                    if row_c.any():
-                                        avail_xs = np.where(row_c)[0]
-                                        n_idx = np.argmin(np.abs(avail_xs - x))
-                                        output[y, x] = original_rgb[check_y, avail_xs[n_idx]]
-                                        found = True
-                                        break
-                            if found:
-                                break
-
             logger.info(f"[SDPipeline] parsing_pixel_copy: cloth zone={cloth_count}px")
 
-        # -- 4c) BACKGROUND zone: copy from original bg pixels (nearest available) --
+        # -- 4c) BACKGROUND zone --
         bg_cleanup = cleanup & result_bg
-        bg_count = int(bg_cleanup.sum())
+        orig_bg_available = orig_bg & (~orig_hair)
+        bg_count = _nearest_source_copy(bg_cleanup, orig_bg_available, original_rgb)
         if bg_count > 0:
-            orig_bg_available = orig_bg & (~orig_hair)
-            if int(orig_bg_available.sum()) > 20:
-                bg_ys, bg_xs = np.where(bg_cleanup)
-                # Build distance transform for nearest bg pixel lookup
-                # Invert: 1 where bg available, 0 elsewhere → distance from non-bg
-                bg_avail_u8 = orig_bg_available.astype(np.uint8) * 255
-                bg_avail_inv = cv2.bitwise_not(bg_avail_u8)
-                dist, labels = cv2.distanceTransformWithLabels(
-                    bg_avail_inv, cv2.DIST_L2, 5,
-                    labelType=cv2.DIST_LABEL_PIXEL,
-                )
-                # labels maps each pixel to the nearest zero-pixel index in
-                # raster order. We can use it to find source coords.
-                # Build raster-index → (y, x) for available bg pixels
-                avail_indices = np.where(bg_avail_u8.ravel() > 0)[0]
-                if len(avail_indices) > 0:
-                    # For each bg cleanup pixel, find nearest source
-                    for y, x in zip(bg_ys, bg_xs):
-                        label_id = labels[y, x]
-                        # label_id is a 1-based index into the connected component
-                        # Use distance transform approach: find all bg available
-                        # and pick closest
-                        pass  # fallback below
-
-                    # Simpler approach: for each cleanup pixel, find nearest bg pixel
-                    # using vectorized distance
-                    avail_ys, avail_xs = np.where(orig_bg_available)
-                    if len(avail_ys) > 0:
-                        avail_coords = np.stack([avail_ys, avail_xs], axis=1)  # (N, 2)
-                        for y, x in zip(bg_ys, bg_xs):
-                            dists = np.abs(avail_coords[:, 0] - y) + np.abs(avail_coords[:, 1] - x)
-                            nearest = np.argmin(dists)
-                            sy, sx = avail_coords[nearest]
-                            output[y, x] = original_rgb[sy, sx]
-
             logger.info(f"[SDPipeline] parsing_pixel_copy: bg zone={bg_count}px")
 
-        # -- 4d) Unclassified cleanup pixels: use nearest-category fallback --
+        # -- 4d) Unclassified: nearest non-hair pixel --
         classified = skin_cleanup | cloth_cleanup | bg_cleanup
         unclassified = cleanup & (~classified)
-        unclass_count = int(unclassified.sum())
+        orig_not_hair = ~orig_hair
+        unclass_count = _nearest_source_copy(unclassified, orig_not_hair, original_rgb)
         if unclass_count > 0:
-            # Try to copy from original non-hair pixels using nearest neighbor
-            orig_not_hair = ~orig_hair
-            if int(orig_not_hair.sum()) > 0:
-                unc_ys, unc_xs = np.where(unclassified)
-                nh_ys, nh_xs = np.where(orig_not_hair)
-                if len(nh_ys) > 0:
-                    nh_coords = np.stack([nh_ys, nh_xs], axis=1)
-                    for y, x in zip(unc_ys, unc_xs):
-                        dists = np.abs(nh_coords[:, 0] - y) + np.abs(nh_coords[:, 1] - x)
-                        nearest = np.argmin(dists)
-                        sy, sx = nh_coords[nearest]
-                        output[y, x] = original_rgb[sy, sx]
             logger.info(f"[SDPipeline] parsing_pixel_copy: unclassified zone={unclass_count}px")
 
         # ── 5) Gaussian blur on boundaries for smooth blending ────────
