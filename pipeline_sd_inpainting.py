@@ -2304,7 +2304,18 @@ class MirrAISDPipeline:
         result_bg = np.isin(result_parsing, list(BG_CLASSES))
 
         # Original image: hair mask (pixels to AVOID copying from)
-        orig_hair = (original_parsing == HAIR_CLASS)
+        # 넉넉하게 dilate해서 머리카락 경계의 어두운 pixel도 제외
+        orig_hair_raw = (original_parsing == HAIR_CLASS)
+        hair_dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (51, 51))
+        orig_hair = cv2.dilate(
+            orig_hair_raw.astype(np.uint8), hair_dilate_k, iterations=1
+        ).astype(bool)
+
+        # 색 필터: 원본에서 너무 어두운 pixel도 제외 (머리카락 잔영)
+        orig_lab = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2LAB)
+        orig_too_dark = orig_lab[:, :, 0] < 80  # L < 80 → 어두운 pixel
+        orig_hair = orig_hair | orig_too_dark
+
         orig_skin = np.isin(original_parsing, list(SKIN_CLASSES))
         orig_cloth = np.isin(original_parsing, list(CLOTH_CLASSES))
         orig_bg = np.isin(original_parsing, list(BG_CLASSES))
@@ -2390,14 +2401,32 @@ class MirrAISDPipeline:
         if unclass_count > 0:
             logger.info(f"[SDPipeline] parsing_pixel_copy: unclassified zone={unclass_count}px")
 
-        # ── 5) Gaussian blur on boundaries for smooth blending ────────
-        # Create soft transition at the boundary of cleanup area
+        # ── 5) Post-copy smoothing + boundary blending ────────────────
+        # 5a) Median blur: cleanup 영역만 median filter로 glitch 패턴 제거
+        cleanup_u8_mask = cleanup.astype(np.uint8) * 255
+        output_blurred = cv2.medianBlur(output, 7)
+        # cleanup 영역만 median 적용, 나머지는 원본 유지
+        output = np.where(
+            cleanup[..., np.newaxis],
+            output_blurred,
+            output
+        )
+
+        # 5b) Bilateral filter: 색 보존하면서 smoothing (cleanup 영역)
+        output_bilateral = cv2.bilateralFilter(output, 9, 75, 75)
+        output = np.where(
+            cleanup[..., np.newaxis],
+            output_bilateral,
+            output
+        )
+
+        # 5c) Gaussian boundary blending
         cleanup_f32 = cleanup.astype(np.float32)
-        blend_alpha = cv2.GaussianBlur(cleanup_f32, (0, 0), sigmaX=8.0, sigmaY=8.0)
+        blend_alpha = cv2.GaussianBlur(cleanup_f32, (0, 0), sigmaX=12.0, sigmaY=12.0)
         blend_alpha = np.clip(blend_alpha, 0.0, 1.0)
 
-        # Erode the hard mask slightly to ensure interior is 100% new pixels
-        erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        # Erode the hard mask: interior = 100% new pixels
+        erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
         interior = cv2.erode(
             (cleanup.astype(np.uint8) * 255), erode_k, iterations=1
         )
@@ -2405,10 +2434,10 @@ class MirrAISDPipeline:
 
         # Final alpha: interior = 1.0, boundary = soft ramp
         final_alpha = np.maximum(interior_f, blend_alpha)
-        final_alpha = cv2.GaussianBlur(final_alpha, (0, 0), sigmaX=5.0, sigmaY=5.0)
+        final_alpha = cv2.GaussianBlur(final_alpha, (0, 0), sigmaX=8.0, sigmaY=8.0)
         final_alpha = np.clip(final_alpha, 0.0, 1.0)[..., np.newaxis]
 
-        # Blend: output (pixel-copied) where alpha=1, result_rgb where alpha=0
+        # Blend
         blended = (
             output.astype(np.float32) * final_alpha
             + result_rgb.astype(np.float32) * (1.0 - final_alpha)
