@@ -1,110 +1,230 @@
-# HairCLIPv2 RunPod 패키지
+# MirrAI SD Inpainting Runtime
 
-최적화된 RunPod 실행 경로만 남긴 HairCLIPv2 런타임 패키지입니다.  
-주요 진입점은 [`pipeline_optimized.py`](/workspace/pipeline_optimized.py) 와 [`runpod_handler.py`](/workspace/runpod_handler.py) 입니다.
+이 저장소의 현재 메인 경로는 `Stable Diffusion inpainting` 기반 헤어 변환 런타임입니다.  
+지금 RunPod 서버리스에 올려서 테스트하고 있는 엔트리포인트는 `handler_sd.py`이고, 핵심 추론 로직은 `pipeline_sd_inpainting.py`에 있습니다.
 
-## 포함된 구성
+기존 `pipeline_optimized.py` / `runpod_handler.py` 경로는 여전히 저장소에 남아 있지만, 현재 주력 생성 경로는 아닙니다. 그쪽은 추천/트렌드 분석 실험용 레거시 경로에 가깝고, 현재 SD 테스트 플로우와는 분리되어 있습니다.
 
-- `pipeline_optimized.py`: 추천, 정렬, 생성, 합성까지 포함한 CLI 실행 경로
-- `runpod_handler.py`: RunPod serverless 진입점
-- `download_weights.py`: 런타임 가중치 복구, 검증, 재다운로드
-- `install_requirements.sh`: 의존성 설치 + 가중치 bootstrap
-- `models/stylegan2`, `models/face_parsing`, `models/bald_proxy`: 실제 추론 코드
-- `utils/sam3_runtime.py`, `utils/sam_masking.py`: SAM3 및 BiRefNet 마스킹 refinement
+## 현재 메인 구성
 
-## 필수 모델 파일
+- `handler_sd.py`
+  RunPod Serverless handler. 입력 파싱, cold start 모델 준비, 결과 직렬화를 담당합니다.
+- `pipeline_sd_inpainting.py`
+  현재 메인 헤어 생성 파이프라인입니다. 얼굴 보호, 헤어 마스크 정제, SD inpainting, 후처리, top-k ranking까지 담당합니다.
+- `runtime_download.py`
+  cold start 시 Hugging Face 모델과 `seg.pth`를 준비합니다.
+- `test_runpod.py`
+  배포된 RunPod endpoint에 요청을 보내고 결과 이미지를 저장하는 테스트 클라이언트입니다.
+- `scripts/update_runpod_serverless.py`
+  RunPod endpoint-bound template 이미지를 새 버전으로 교체할 때 사용합니다.
+- `Dockerfile.sd.base`
+  SD 런타임 베이스 이미지입니다.
+- `Dockerfile.sd.app`
+  코드만 얹는 앱 이미지입니다. 현재 `handler_sd.py` 기반 서버리스 워커를 띄웁니다.
+- `entrypoint_sd.sh`
+  앱 컨테이너 시작 스크립트입니다.
 
-아래 파일은 `pretrained_models/` 아래에 있어야 합니다.
+## 현재 모델 스택
 
-- `ffhq.pt`
-- `seg.pth`
-- `bald_proxy.pt`
-- `ffhq_PCA.npz`
-- `sam3.pt` (SAM3를 쓸 때만 필요)
+- 얼굴 검출 / 랜드마크
+  `MediaPipe FaceDetection`, `MediaPipe FaceMesh`
+- 헤어 / 얼굴 / 옷 파싱
+  `SegFace / BiSeNet` 계열 파서
+  로컬 체크포인트: `pretrained_models/seg.pth`
+- 헤어 마스크 정제
+  `SAM2`
+  로컬 체크포인트: `pretrained_models/sam2.pt`
+- 생성 모델
+  `runwayml/stable-diffusion-inpainting`
+- 구조 가이드
+  `lllyasviel/control_v11p_sd15_canny`
+- 얼굴 아이덴티티 가이드
+  `h94/IP-Adapter`
+  weight: `ip-adapter-plus-face_sd15.bin`
+- 대형 영역 배경 / 잔여물 보정
+  `LaMa` 기반 fill
+  필요 시 `bg_fill_mode=sd`로 대체 가능
 
-아래 파일은 `criteria/lpips/weights/v0.1/` 아래에 있어야 합니다.
+## 현재 처리 프로세스
 
-- `vgg.pth`
+현재 SD 경로는 "추천을 먼저 하고 생성"하는 구조가 아니라, 이미 정해진 `hairstyle_text`와 `color_text`를 입력받아 바로 생성하는 구조입니다.
 
-## .env 설정
+1. 입력 이미지와 `hairstyle_text`, `color_text`를 받습니다.
+2. MediaPipe로 얼굴 bbox와 랜드마크를 검출합니다.
+3. SegFace로 hair / face / cloth 영역을 파싱합니다.
+4. face / cloth 보호 마스크를 만들고 생성 대상 hair mask를 정리합니다.
+5. SAM2로 hair mask 경계를 보정합니다.
+6. short / medium 변환일 때는 하단 긴머리 잔여물을 먼저 pre-clean 합니다.
+7. Canny edge를 만들어 ControlNet conditioning에 사용합니다.
+8. 얼굴 crop을 만들어 IP-Adapter conditioning에 사용합니다.
+9. SD 1.5 inpainting으로 top-k seed 결과를 생성합니다.
+10. 후처리, 합성, ranking을 거쳐 최종 결과를 반환합니다.
 
-이제 `.env` 파일에 토큰을 넣어두면 됩니다.  
+현재 ranking 결과에는 아래 점수가 포함됩니다.
 
-- `HF_TOKEN=hf_your_token_here`
+- `clip_score`
+- `color_score`
+- `silhouette_score`
+- `rank_score`
+
+## 입력 스키마
+
+현재 메인 handler(`handler_sd.py`)는 아래 형태를 받습니다.
+
+```json
+{
+  "input": {
+    "image": "<base64 or URL>",
+    "hairstyle_text": "short chin-length bob cut, hush cut",
+    "color_text": "ash beige",
+    "top_k": 3,
+    "bg_fill_mode": "lama",
+    "seed": 1037080612,
+    "return_base64": true,
+    "return_intermediates": false
+  }
+}
+```
+
+지원 입력 키:
+
+- `image`, `image_base64`, `image_url`, `image_path` 중 하나
+- `hairstyle_text`
+- `color_text`
+- `top_k` (`1~5`)
+- `bg_fill_mode` (`lama` 또는 `sd`)
+- `seed` (선택)
+- `return_base64` (선택)
+- `return_intermediates` (선택)
+- `cleanup_params` (ABI 호환용, 현재는 실질적으로 사용하지 않음)
+
+주의:
+
+- 현재 이 경로는 취향 추천, 트렌드 추천, 얼굴 분석 기반 스타일 추천을 직접 수행하지 않습니다.
+- 그런 추천형 플로우는 `runpod_handler.py` + `pipeline_optimized.py` 쪽에 별도로 남아 있습니다.
+
+## 출력 스키마
+
+대표 응답 구조는 아래와 같습니다.
+
+```json
+{
+  "results": [
+    {
+      "rank": 0,
+      "seed": 1037080612,
+      "clip_score": 0.615,
+      "color_score": 0.201,
+      "silhouette_score": 0.711,
+      "rank_score": 0.572,
+      "mask_used": "sam2",
+      "image_base64": "..."
+    }
+  ],
+  "elapsed_seconds": 64.2,
+  "intermediates": {},
+  "intermediate_data": {}
+}
+```
+
+`return_intermediates=true`인 경우 rank 0 기준 중간 디버그 이미지와 메타데이터가 같이 반환됩니다.
 
 ## 설치 및 준비
 
-기본 런타임 및 BiRefNet(정밀 마스킹) 설치:
+현재 SD 런타임 기준 의존성 설치:
 
 ```bash
-# BiRefNet 구동에 필요한 패키지 설치
-pip install transformers timm torchvision huggingface_hub
-bash install_requirements.sh
+pip install -r requirements-sd.txt
 ```
 
-## 실행 명령어 정리
-
-### 1. 스타일 추천만 실행
-이미지를 분석하여 어울리는 헤어스타일 목록과 이유를 출력합니다.
-```bash
-python pipeline_optimized.py --image images/12345.png --text "trendy" --recommend-only
-```
-
-### 2. 스타일 생성 (기본)
-추천된 스타일 중 상위 1개를 생성합니다. (`--trend-limit`으로 개수 조절)
-```bash
-python pipeline_optimized.py \
-  --image images/12345.png \
-  --text "trendy" \
-  --trend-limit 1 \
-  --output-dir output/
-```
-
-### 3. 정밀 마스킹 (BiRefNet) 적용 생성
-현재 **BiRefNet**이 기본 정밀 마스킹 모델로 설정되어 있습니다. `transformers` 패키지가 설치되어 있으면 자동으로 활성화됩니다.
-- **특징**: 잔머리, 머리카락 끝부분 등 육안 식별이 어려운 경계선을 매우 정밀하게 추출합니다.
-- **작동**: BiRefNet(인물 전체 윤곽) ∩ BiSeNet(헤어 라벨) 교집합 방식을 사용하여 몸/얼굴을 제외한 정밀한 머리카락 영역만 추출합니다.
+권장 환경변수:
 
 ```bash
-# 별도 옵션 없이도 정밀 마스킹이 적용됩니다. (JSON 결과에서 source: "birefnet" 확인)
-python pipeline_optimized.py --image images/12345.png --text "chic style" --output-dir output/
+HF_TOKEN=hf_xxx
+RUNPOD_API_KEY=rpa_xxx
+RUNPOD_ENDPOINT_ID=your_endpoint_id
 ```
 
-### 4. 마스킹 단독 테스트 및 디버깅
-모델별 마스킹 결과만 이미지 파일로 확인하고 싶을 때 사용합니다.
+모델 준비:
 
-- **BiRefNet (인물 전체 윤곽)**:
-  ```bash
-  python test_birefnet.py
-  # 결과: output/birefnet_mask.png (인물 실루엣)
-  ```
-- **BiSeNet (기본 헤어 파싱)**:
-  ```bash
-  python test_bisenet.py
-  # 결과: output/bisenet_hair_mask.png (거친 헤어 영역)
-  ```
+- `pretrained_models/sam2.pt`는 로컬에 있어야 합니다.
+- `pretrained_models/seg.pth`는 아래 중 하나로 준비됩니다.
+  - 파일을 직접 마운트
+  - `SEG_PTH_URL` 설정
+  - `GITHUB_TOKEN` + 기본 GitHub 다운로드 경로 사용
+- Hugging Face 기반 모델은 `runtime_download.py`가 cold start 시 캐시합니다.
 
-## 마스킹 Refinement 모델 안내
+## RunPod 테스트
 
-현재 시스템은 두 가지 정밀 마스킹 엔진을 지원합니다:
-
-1. **BiRefNet (권장)**: 
-   - **장점**: 가장 정밀한 경계선 추출, 잔머리 보존 우수.
-   - **상태**: 현재 서버 환경에서 가장 안정적으로 동작합니다.
-   - **확인**: 결과 JSON에서 `"masking": {"source": "birefnet"}` 확인.
-
-2. **SAM3 (Segment Anything 3)**:
-   - **주의**: 특정 CUDA 환경에서 메모리 충돌(Segmentation Fault)이 발생할 수 있습니다. 
-   - **활성화**: `--enable-sam3` 옵션 사용 시 동작 시도.
-
-## RunPod 실행
+배포된 endpoint를 기준으로 가장 많이 쓰는 테스트 명령은 아래입니다.
 
 ```bash
-python runpod_handler.py
+python test_runpod.py \
+  --image images/test_2.jpg \
+  --hairstyle "short chin-length bob cut, hush cut" \
+  --color "ash beige"
 ```
 
-## 현재 확인된 사항 및 팁
+URL 입력:
 
-- **마스크 확인**: 스타일 생성 시 `output/` 폴더에 `{스타일명}_mask.png` 파일이 함께 저장되어, 실제 적용된 영역을 확인할 수 있습니다.
-- **속도 최적화**: 동일 이미지를 반복 수정 시 `--preset realtime` 사용을 권장합니다.
-- **가중치**: `ffhq_PCA.npz` 등이 누락되면 오류가 발생하므로 `download_weights.py`로 확인하십시오.
+```bash
+python test_runpod.py \
+  --image-url https://example.com/photo.jpg \
+  --hairstyle "bob cut" \
+  --color "black"
+```
+
+헬스체크:
+
+```bash
+python test_runpod.py --health-check
+```
+
+중간 산출물까지 받고 싶으면 `test_runpod.py` 쪽 옵션을 사용해 `return_intermediates`를 켜서 확인하면 됩니다.
+
+## 서버리스 워커 실행
+
+현재 앱 이미지는 `handler_sd.py`를 직접 엔트리포인트로 사용합니다.
+
+```bash
+python handler_sd.py
+```
+
+이 명령은 일반 HTTP 서버를 띄우는 것이 아니라 `runpod.serverless.start(...)`를 호출해 RunPod worker 프로세스로 동작합니다.
+
+## Docker / 배포 흐름
+
+현재 배포는 보통 아래 흐름을 따릅니다.
+
+1. `Dockerfile.sd.base`로 베이스 이미지를 준비합니다.
+2. `Dockerfile.sd.app`으로 코드 전용 앱 이미지를 빌드합니다.
+3. 새 이미지 태그를 RunPod template에 반영합니다.
+4. endpoint worker rollout 완료 후 `test_runpod.py`로 검증합니다.
+
+예시:
+
+```bash
+docker build -f Dockerfile.sd.base -t byoungj/sd:base-latest .
+
+docker build \
+  -f Dockerfile.sd.app \
+  --build-arg BASE_IMAGE=byoungj/sd:base-latest \
+  -t byoungj/sd:v129 .
+
+python scripts/update_runpod_serverless.py \
+  --image byoungj/sd:v129 \
+  --wait
+```
+
+`entrypoint_sd.sh`는 기본적으로 이미지에 포함된 코드를 그대로 사용합니다.  
+`ENABLE_STARTUP_GIT_PULL=1`일 때만 컨테이너 시작 시 git pull을 시도합니다.
+
+## 레거시 / 보조 경로
+
+아래 파일들은 아직 저장소에 남아 있지만, 현재 주력 SD 서버리스 테스트 경로와는 다릅니다.
+
+- `runpod_handler.py`
+- `pipeline_optimized.py`
+
+이 경로는 추천 / 트렌드 / 분석 중심 플로우를 포함한 예전 런타임입니다.  
+현재 `handler_sd.py` 기반 테스트 결과를 해석할 때는 이 경로의 입력 스키마와 혼동하지 않는 것이 중요합니다.
