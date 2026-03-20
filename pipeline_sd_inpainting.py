@@ -1370,6 +1370,200 @@ class MirrAISDPipeline:
         )
         return np.clip(blended, 0, 255).astype(np.uint8), work_u8
 
+    def _apply_cloth_reference_fill(
+        self,
+        result_rgb: np.ndarray,
+        reference_rgb: np.ndarray,
+        target_mask_u8: np.ndarray,
+        cloth_ref_mask_u8: np.ndarray,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        cleanup ROI 안의 cloth-only target에 대해, ROI 바깥 clean cloth patch를
+        source로 가져와 색/패턴을 함께 이식한다.
+
+        기존 same-location texture restoration과 달리, 원본의 hair contamination이
+        섞인 위치는 참조하지 않고 clean cloth reference만 사용한다.
+        """
+        H, W = result_rgb.shape[:2]
+        debug: Dict[str, Any] = {
+            "cloth_reference_fill_applied": False,
+            "cloth_reference_fill_coverage": 0.0,
+        }
+        if (
+            target_mask_u8.shape != (H, W)
+            or cloth_ref_mask_u8.shape != (H, W)
+        ):
+            return result_rgb, debug
+
+        work_u8 = (target_mask_u8 > 0).astype(np.uint8) * 255
+        ref_u8 = (cloth_ref_mask_u8 > 0).astype(np.uint8) * 255
+        target_pixels = int((work_u8 > 0).sum())
+        if target_pixels < 180 or int((ref_u8 > 0).sum()) < max(600, target_pixels):
+            return result_rgb, debug
+
+        ys, xs = np.where(work_u8 > 0)
+        if len(xs) < 1:
+            return result_rgb, debug
+
+        pad = 6
+        x0 = max(0, int(xs.min()) - pad)
+        x1 = min(W, int(xs.max()) + pad + 1)
+        y0 = max(0, int(ys.min()) - pad)
+        y1 = min(H, int(ys.max()) + pad + 1)
+        box_w = x1 - x0
+        box_h = y1 - y0
+        if box_w < 18 or box_h < 18:
+            return result_rgb, debug
+
+        local_mask = work_u8[y0:y1, x0:x1]
+        local_target_pixels = int((local_mask > 0).sum())
+        if local_target_pixels < 180:
+            return result_rgb, debug
+
+        ref_ys, ref_xs = np.where(ref_u8 > 0)
+        ref_xmin = int(ref_xs.min())
+        ref_xmax = int(ref_xs.max())
+        ref_ymin = int(ref_ys.min())
+        ref_ymax = int(ref_ys.max())
+
+        def _clamp_window(sx0: int, sy0: int) -> Optional[Tuple[int, int, int, int]]:
+            sx0 = max(0, min(sx0, W - box_w))
+            sy0 = max(0, min(sy0, H - box_h))
+            sx1 = sx0 + box_w
+            sy1 = sy0 + box_h
+            if sx1 > W or sy1 > H:
+                return None
+            return sx0, sy0, sx1, sy1
+
+        best_window: Optional[Tuple[int, int, int, int]] = None
+        best_score = -1e9
+        best_coverage = 0.0
+        shift_xs = [
+            -int(box_w * 1.25), -box_w, -max(12, box_w // 2),
+            max(12, box_w // 2), box_w, int(box_w * 1.25),
+        ]
+        shift_ys = [
+            -box_h, -max(12, box_h // 2),
+            max(12, box_h // 2), box_h, int(box_h * 1.25),
+        ]
+        for dy in shift_ys:
+            for dx in shift_xs:
+                window = _clamp_window(x0 + dx, y0 + dy)
+                if window is None:
+                    continue
+                sx0, sy0, sx1, sy1 = window
+                ref_crop = ref_u8[sy0:sy1, sx0:sx1]
+                coverage = float(np.count_nonzero((local_mask > 0) & (ref_crop > 0))) / float(local_target_pixels)
+                if coverage < 0.82:
+                    continue
+                dist_penalty = (abs(dx) / max(1.0, float(box_w))) + (abs(dy) / max(1.0, float(box_h)))
+                center_bias = abs((sx0 + sx1) * 0.5 - (x0 + x1) * 0.5) / max(1.0, float(W))
+                score = coverage * 4.0 - dist_penalty * 0.32 - center_bias * 0.18
+                if score > best_score:
+                    best_score = score
+                    best_window = window
+                    best_coverage = coverage
+
+        if best_window is None:
+            step_x = max(18, box_w // 3)
+            step_y = max(18, box_h // 3)
+            for sy0 in range(ref_ymin, max(ref_ymin + 1, ref_ymax - box_h + 2), step_y):
+                for sx0 in range(ref_xmin, max(ref_xmin + 1, ref_xmax - box_w + 2), step_x):
+                    window = _clamp_window(sx0, sy0)
+                    if window is None:
+                        continue
+                    sx0, sy0, sx1, sy1 = window
+                    ref_crop = ref_u8[sy0:sy1, sx0:sx1]
+                    coverage = float(np.count_nonzero((local_mask > 0) & (ref_crop > 0))) / float(local_target_pixels)
+                    if coverage < 0.88:
+                        continue
+                    dist_penalty = (
+                        abs((sx0 + sx1) * 0.5 - (x0 + x1) * 0.5) / max(1.0, float(box_w))
+                        + abs((sy0 + sy1) * 0.5 - (y0 + y1) * 0.5) / max(1.0, float(box_h))
+                    )
+                    score = coverage * 4.0 - dist_penalty * 0.16
+                    if score > best_score:
+                        best_score = score
+                        best_window = window
+                        best_coverage = coverage
+
+        if best_window is None:
+            return result_rgb, debug
+
+        sx0, sy0, sx1, sy1 = best_window
+        source_patch = reference_rgb[sy0:sy1, sx0:sx1].copy()
+
+        context_u8 = cv2.dilate(
+            work_u8,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+            iterations=1,
+        )
+        inner_u8 = cv2.dilate(
+            work_u8,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=1,
+        )
+        context_u8 = cv2.bitwise_and(context_u8, cv2.bitwise_not(inner_u8))
+        context_u8 = cv2.bitwise_and(context_u8, ref_u8)
+        if int((context_u8 > 0).sum()) < 120:
+            context_u8 = ref_u8
+
+        source_lab = cv2.cvtColor(source_patch, cv2.COLOR_RGB2LAB).astype(np.float32)
+        result_lab = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+        src_vals = source_lab[local_mask > 0]
+        ctx_vals = result_lab[context_u8 > 0]
+        if len(src_vals) >= 120 and len(ctx_vals) >= 120:
+            src_med = np.median(src_vals, axis=0)
+            ctx_med = np.median(ctx_vals, axis=0)
+            shift = ctx_med - src_med
+            source_lab[:, :, 0] += shift[0] * 0.78
+            source_lab[:, :, 1] += shift[1] * 0.42
+            source_lab[:, :, 2] += shift[2] * 0.42
+            source_patch = cv2.cvtColor(
+                np.clip(source_lab, 0, 255).astype(np.uint8),
+                cv2.COLOR_LAB2RGB,
+            )
+
+        try:
+            cloned_bgr = cv2.seamlessClone(
+                source_patch[:, :, ::-1],
+                result_rgb[:, :, ::-1],
+                local_mask,
+                (int((x0 + x1) * 0.5), int((y0 + y1) * 0.5)),
+                cv2.MIXED_CLONE,
+            )
+        except cv2.error as e:
+            logger.warning(f"[SDPipeline] cloth reference fill seamlessClone failed: {e}")
+            return result_rgb, debug
+
+        cloned_rgb = cloned_bgr[:, :, ::-1]
+        alpha = cv2.GaussianBlur(
+            local_mask.astype(np.float32) / 255.0,
+            (0, 0),
+            sigmaX=4.0,
+            sigmaY=4.0,
+        )
+        alpha = np.clip(alpha * 0.86, 0.0, 0.86)[..., np.newaxis]
+        out_rgb = (
+            cloned_rgb.astype(np.float32) * alpha
+            + result_rgb.astype(np.float32) * (1.0 - alpha)
+        )
+
+        source_mask_u8 = np.zeros((H, W), dtype=np.uint8)
+        source_mask_u8[sy0:sy1, sx0:sx1] = local_mask
+        debug.update(
+            {
+                "cloth_reference_fill_applied": True,
+                "cloth_reference_fill_coverage": float(best_coverage),
+                "cloth_reference_fill_source_xyxy": [int(sx0), int(sy0), int(sx1), int(sy1)],
+                "cloth_reference_fill_target_xyxy": [int(x0), int(y0), int(x1), int(y1)],
+                "pipeline_cloth_reference_fill_target_mask": work_u8.astype(np.float32) / 255.0,
+                "pipeline_cloth_reference_fill_source_mask": source_mask_u8.astype(np.float32) / 255.0,
+                "pipeline_cloth_reference_fill_result": np.clip(out_rgb, 0, 255).astype(np.uint8),
+            }
+        )
+        return np.clip(out_rgb, 0, 255).astype(np.uint8), debug
+
     def _lama_inpaint_region_blend(
         self,
         img_rgb: np.ndarray,
@@ -4506,6 +4700,13 @@ class MirrAISDPipeline:
             iterative_total_mask_u8 = np.zeros((H, W), dtype=np.uint8)
             poisson_applied = False
             _has_cloth = cloth_mask is not None and cloth_mask.shape == (H, W)
+            cloth_reference_fill_applied = False
+            cloth_reference_fill_coverage = 0.0
+            cloth_reference_fill_source_xyxy: Optional[List[int]] = None
+            cloth_reference_fill_target_xyxy: Optional[List[int]] = None
+            cloth_reference_fill_target_mask = np.zeros((H, W), dtype=np.float32)
+            cloth_reference_fill_source_mask = np.zeros((H, W), dtype=np.float32)
+            cloth_reference_fill_result: Optional[np.ndarray] = None
             if _has_cloth:
                 cleanup_roi_top = min(H, int(cutoff_y + face_h * 0.08))
                 cleanup_roi_bottom = min(H, int(cutoff_y + face_h * 1.60))
@@ -4770,10 +4971,45 @@ class MirrAISDPipeline:
                             f"ref_L={ref_median_L:.1f}, thresh={cc_dark_thresh:.1f}"
                         )
 
-            # ── Texture restoration: 원본 cloth의 high-freq texture 복원 ──
-            # color correction이 L channel을 올리면서 니트 등 텍스처가 flat해질 수 있음.
-            # 원본(pre_cleanup)의 cloth 영역에서 high-frequency detail을 추출해 합성.
-            if _has_cloth and int((all_cleanup_u8 > 0).sum()) >= 200:
+            # ── Cloth-only reference fill ──────────────────────────────
+            # cleanup된 cloth 영역은 ROI 바깥 clean cloth patch의 색/패턴으로 메운다.
+            if _has_cloth and int((all_cleanup_u8 > 0).sum()) >= 200 and int((cloth_ref_mask > 0).sum()) >= 800:
+                cloth_fill_target_u8 = cv2.bitwise_and(all_cleanup_u8, _cloth_u8)
+                if int((split_cloth_mask > 0).sum()) >= 64:
+                    split_cloth_u8_for_fill = (split_cloth_mask > 0.05).astype(np.uint8) * 255
+                    cloth_fill_target_u8 = cv2.bitwise_and(cloth_fill_target_u8, split_cloth_u8_for_fill)
+                cloth_fill_target_u8 = cv2.bitwise_and(cloth_fill_target_u8, cv2.bitwise_not(protect_u8))
+                if int((cloth_fill_target_u8 > 0).sum()) >= 180:
+                    result_rgb, cloth_fill_debug = self._apply_cloth_reference_fill(
+                        result_rgb,
+                        pre_cleanup_rgb,
+                        cloth_fill_target_u8,
+                        cloth_ref_mask,
+                    )
+                    cloth_reference_fill_applied = bool(cloth_fill_debug.get("cloth_reference_fill_applied"))
+                    cloth_reference_fill_coverage = float(cloth_fill_debug.get("cloth_reference_fill_coverage", 0.0))
+                    cloth_reference_fill_source_xyxy = cloth_fill_debug.get("cloth_reference_fill_source_xyxy")
+                    cloth_reference_fill_target_xyxy = cloth_fill_debug.get("cloth_reference_fill_target_xyxy")
+                    if "pipeline_cloth_reference_fill_target_mask" in cloth_fill_debug:
+                        cloth_reference_fill_target_mask = cloth_fill_debug["pipeline_cloth_reference_fill_target_mask"]
+                    if "pipeline_cloth_reference_fill_source_mask" in cloth_fill_debug:
+                        cloth_reference_fill_source_mask = cloth_fill_debug["pipeline_cloth_reference_fill_source_mask"]
+                    cloth_reference_fill_result = cloth_fill_debug.get("pipeline_cloth_reference_fill_result")
+                    if cloth_reference_fill_applied:
+                        logger.info(
+                            "[SDPipeline] Cloth reference fill applied: "
+                            f"coverage={cloth_reference_fill_coverage:.3f}, "
+                            f"source={cloth_reference_fill_source_xyxy}, "
+                            f"target={cloth_reference_fill_target_xyxy}"
+                        )
+
+            # ── Texture restoration fallback: same-location cloth high-freq 복원 ──
+            # clean cloth patch fill이 실패한 경우에만 기존 fallback을 사용한다.
+            if (
+                (not cloth_reference_fill_applied)
+                and _has_cloth
+                and int((all_cleanup_u8 > 0).sum()) >= 200
+            ):
                 try:
                     # 원본 cloth 영역의 texture (high-pass filter)
                     orig_gray = cv2.cvtColor(pre_cleanup_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
@@ -4816,10 +5052,16 @@ class MirrAISDPipeline:
             debug_bundle = {
                 "pipeline_lama_post_cleanup_mask": force_mask,
                 "pipeline_lama_post_cleanup_result": result_rgb,
+                "pipeline_cloth_reference_fill_target_mask": cloth_reference_fill_target_mask,
+                "pipeline_cloth_reference_fill_source_mask": cloth_reference_fill_source_mask,
                 "pipeline_lama_pre_neutralize_mask": force_prefill_u8.astype(np.float32) / 255.0,
                 "pipeline_lama_pre_neutralized_input_rgb": force_prefill_rgb,
                 "lama_post_cleanup_applied": True,
                 "lama_post_cleanup_pixels": force_pixels,
+                "cloth_reference_fill_applied": cloth_reference_fill_applied,
+                "cloth_reference_fill_coverage": cloth_reference_fill_coverage,
+                "cloth_reference_fill_source_xyxy": cloth_reference_fill_source_xyxy,
+                "cloth_reference_fill_target_xyxy": cloth_reference_fill_target_xyxy,
                 "pipeline_short_front_cleanup_mask": front_cleanup_u8.astype(np.float32) / 255.0,
                 "pipeline_short_side_cleanup_mask": side_cleanup_u8.astype(np.float32) / 255.0,
                 "pipeline_short_side_outer_cleanup_mask": side_outer_cleanup_u8.astype(np.float32) / 255.0,
@@ -4842,6 +5084,8 @@ class MirrAISDPipeline:
                 "poisson_blend_applied": poisson_applied,
                 "boundary_interpolation_used": boundary_y_map is not None,
             }
+            if cloth_reference_fill_result is not None:
+                debug_bundle["pipeline_cloth_reference_fill_result"] = cloth_reference_fill_result
             if cv2_post_rgb is not None:
                 debug_bundle["pipeline_cv2_post_cleanup_result"] = cv2_post_rgb
             if cv2_front_rgb is not None:
