@@ -1309,6 +1309,62 @@ class MirrAISDPipeline:
         out_bgr = blend_bgr * alpha + img_bgr.astype(np.float32) * (1.0 - alpha)
         return cv2.cvtColor(np.clip(out_bgr, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
 
+    def _pre_neutralize_lama_input(
+        self,
+        img_rgb: np.ndarray,
+        mask_u8: np.ndarray,
+        *,
+        protect_mask: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        LaMa 직전, cleanup mask 전체를 작은 반경 Telea로 한 번 prefill해
+        경계 주변 dark contamination이 안쪽으로 끌려 들어오는 것을 줄인다.
+
+        목적:
+        - LaMa가 참조하는 마스크 주변 색을 먼저 밝고 중성적으로 정리
+        - soft alpha 경계에서 원본 dark strand가 다시 비치지 않게 함
+        """
+        H, W = img_rgb.shape[:2]
+        if mask_u8.shape != (H, W):
+            return img_rgb, np.zeros((H, W), dtype=np.uint8)
+
+        work_u8 = (mask_u8 > 0).astype(np.uint8) * 255
+        if int((work_u8 > 0).sum()) < 64:
+            return img_rgb, np.zeros((H, W), dtype=np.uint8)
+
+        protect_u8 = np.zeros((H, W), dtype=np.uint8)
+        if protect_mask is not None and protect_mask.shape == (H, W):
+            protect_u8 = (np.clip(protect_mask, 0.0, 1.0) > 0.35).astype(np.uint8) * 255
+            if int((protect_u8 > 0).sum()) > 0:
+                protect_u8 = cv2.dilate(
+                    protect_u8,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+                    iterations=1,
+                )
+                work_u8 = cv2.bitwise_and(work_u8, cv2.bitwise_not(protect_u8))
+        if int((work_u8 > 0).sum()) < 64:
+            return img_rgb, np.zeros((H, W), dtype=np.uint8)
+
+        neutralized_bgr = cv2.inpaint(
+            cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR),
+            work_u8,
+            inpaintRadius=5,
+            flags=cv2.INPAINT_TELEA,
+        )
+        neutralized_rgb = cv2.cvtColor(neutralized_bgr, cv2.COLOR_BGR2RGB)
+        alpha = cv2.GaussianBlur(
+            work_u8.astype(np.float32) / 255.0,
+            (0, 0),
+            sigmaX=2.2,
+            sigmaY=2.2,
+        )
+        alpha = np.clip(alpha, 0.0, 1.0)[..., np.newaxis]
+        blended = (
+            neutralized_rgb.astype(np.float32) * alpha
+            + img_rgb.astype(np.float32) * (1.0 - alpha)
+        )
+        return np.clip(blended, 0, 255).astype(np.uint8), work_u8
+
     def _lama_inpaint_region_blend(
         self,
         img_rgb: np.ndarray,
@@ -1352,6 +1408,12 @@ class MirrAISDPipeline:
         if int((work_u8 > 0).sum()) < min_pixels:
             return img_rgb, np.zeros((H, W), dtype=np.uint8)
 
+        lama_input_rgb, _ = self._pre_neutralize_lama_input(
+            img_rgb,
+            work_u8,
+            protect_mask=protect_mask,
+        )
+
         # ── Multi-scale LaMa: 큰 mask는 축소 pass 선행 ──────────────
         # LaMa는 작은 mask에서 더 좋은 결과를 내므로,
         # 50% 축소 → LaMa → upscale → full-res LaMa 순서로 처리
@@ -1360,7 +1422,7 @@ class MirrAISDPipeline:
         if use_multiscale:
             scale = 0.5
             H_s, W_s = int(H * scale), int(W * scale)
-            img_small = cv2.resize(img_rgb, (W_s, H_s), interpolation=cv2.INTER_AREA)
+            img_small = cv2.resize(lama_input_rgb, (W_s, H_s), interpolation=cv2.INTER_AREA)
             mask_small = cv2.resize(work_u8, (W_s, H_s), interpolation=cv2.INTER_NEAREST)
             # Ensure mask stays binary after resize
             mask_small = ((mask_small > 127).astype(np.uint8)) * 255
@@ -1372,7 +1434,7 @@ class MirrAISDPipeline:
                 ms_alpha = (work_u8.astype(np.float32) / 255.0)[..., np.newaxis]
                 img_for_lama = (
                     lama_upscaled.astype(np.float32) * ms_alpha
-                    + img_rgb.astype(np.float32) * (1.0 - ms_alpha)
+                    + lama_input_rgb.astype(np.float32) * (1.0 - ms_alpha)
                 )
                 img_for_lama = np.clip(img_for_lama, 0, 255).astype(np.uint8)
                 logger.info(
@@ -1380,9 +1442,9 @@ class MirrAISDPipeline:
                     f"downscaled {H}x{W} -> {H_s}x{W_s}"
                 )
             else:
-                img_for_lama = img_rgb
+                img_for_lama = lama_input_rgb
         else:
-            img_for_lama = img_rgb
+            img_for_lama = lama_input_rgb
 
         lama_rgb = self._lama_inpaint(img_for_lama, work_u8, force_single_pass=True)
         alpha = cv2.GaussianBlur(
@@ -1394,7 +1456,7 @@ class MirrAISDPipeline:
         alpha = np.clip(alpha, 0.0, 1.0)[..., np.newaxis]
         blended = (
             lama_rgb.astype(np.float32) * alpha
-            + img_rgb.astype(np.float32) * (1.0 - alpha)
+            + lama_input_rgb.astype(np.float32) * (1.0 - alpha)
         )
         return np.clip(blended, 0, 255).astype(np.uint8), work_u8
 
@@ -4051,6 +4113,11 @@ class MirrAISDPipeline:
         # 목 피부와 의상 질감을 한 번에 지울 때 생기는 뭉개짐을 줄이기 위한 분리 fill이다.
         result_rgb = img_rgb
         pre_cleanup_rgb = img_rgb.copy()  # Poisson dst용: cleanup 전 상태 보존
+        force_prefill_rgb, force_prefill_u8 = self._pre_neutralize_lama_input(
+            img_rgb,
+            force_u8,
+            protect_mask=protect_mask,
+        )
         split_cloth_mask = np.zeros((H, W), dtype=np.float32)
         split_skin_mask = np.zeros((H, W), dtype=np.float32)
         split_background_mask = np.zeros((H, W), dtype=np.float32)
@@ -4263,11 +4330,11 @@ class MirrAISDPipeline:
                     split_residual_result = result_rgb.copy()
                     split_applied = True
                 if not split_applied:
-                    result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
+                    result_rgb = self._lama_inpaint(force_prefill_rgb, force_u8, force_single_pass=True)
             else:
-                result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
+                result_rgb = self._lama_inpaint(force_prefill_rgb, force_u8, force_single_pass=True)
         else:
-            result_rgb = self._lama_inpaint(img_rgb, force_u8, force_single_pass=True)
+            result_rgb = self._lama_inpaint(force_prefill_rgb, force_u8, force_single_pass=True)
         cv2_post_rgb: Optional[np.ndarray] = None
         cv2_front_rgb: Optional[np.ndarray] = None
         cv2_side_rgb: Optional[np.ndarray] = None
@@ -4744,6 +4811,8 @@ class MirrAISDPipeline:
             debug_bundle = {
                 "pipeline_lama_post_cleanup_mask": force_mask,
                 "pipeline_lama_post_cleanup_result": result_rgb,
+                "pipeline_lama_pre_neutralize_mask": force_prefill_u8.astype(np.float32) / 255.0,
+                "pipeline_lama_pre_neutralized_input_rgb": force_prefill_rgb,
                 "lama_post_cleanup_applied": True,
                 "lama_post_cleanup_pixels": force_pixels,
                 "pipeline_short_front_cleanup_mask": front_cleanup_u8.astype(np.float32) / 255.0,
