@@ -1397,6 +1397,7 @@ class MirrAISDPipeline:
 
         work_u8 = (target_mask_u8 > 0).astype(np.uint8) * 255
         ref_u8 = (cloth_ref_mask_u8 > 0).astype(np.uint8) * 255
+        debug["pipeline_cloth_reference_fill_target_mask"] = work_u8.astype(np.float32) / 255.0
         target_pixels = int((work_u8 > 0).sum())
         if target_pixels < 180 or int((ref_u8 > 0).sum()) < max(600, target_pixels):
             return result_rgb, debug
@@ -1453,8 +1454,10 @@ class MirrAISDPipeline:
                     continue
                 sx0, sy0, sx1, sy1 = window
                 ref_crop = ref_u8[sy0:sy1, sx0:sx1]
-                coverage = float(np.count_nonzero((local_mask > 0) & (ref_crop > 0))) / float(local_target_pixels)
-                if coverage < 0.82:
+                mask_coverage = float(np.count_nonzero((local_mask > 0) & (ref_crop > 0))) / float(local_target_pixels)
+                rect_coverage = float(np.count_nonzero(ref_crop > 0)) / float(ref_crop.size)
+                coverage = mask_coverage * 0.7 + rect_coverage * 0.3
+                if mask_coverage < 0.52 or rect_coverage < 0.62:
                     continue
                 dist_penalty = (abs(dx) / max(1.0, float(box_w))) + (abs(dy) / max(1.0, float(box_h)))
                 center_bias = abs((sx0 + sx1) * 0.5 - (x0 + x1) * 0.5) / max(1.0, float(W))
@@ -1474,8 +1477,10 @@ class MirrAISDPipeline:
                         continue
                     sx0, sy0, sx1, sy1 = window
                     ref_crop = ref_u8[sy0:sy1, sx0:sx1]
-                    coverage = float(np.count_nonzero((local_mask > 0) & (ref_crop > 0))) / float(local_target_pixels)
-                    if coverage < 0.88:
+                    mask_coverage = float(np.count_nonzero((local_mask > 0) & (ref_crop > 0))) / float(local_target_pixels)
+                    rect_coverage = float(np.count_nonzero(ref_crop > 0)) / float(ref_crop.size)
+                    coverage = mask_coverage * 0.7 + rect_coverage * 0.3
+                    if mask_coverage < 0.46 or rect_coverage < 0.60:
                         continue
                     dist_penalty = (
                         abs((sx0 + sx1) * 0.5 - (x0 + x1) * 0.5) / max(1.0, float(box_w))
