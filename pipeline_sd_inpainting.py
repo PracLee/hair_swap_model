@@ -1399,7 +1399,10 @@ class MirrAISDPipeline:
         ref_u8 = (cloth_ref_mask_u8 > 0).astype(np.uint8) * 255
         debug["pipeline_cloth_reference_fill_target_mask"] = work_u8.astype(np.float32) / 255.0
         target_pixels = int((work_u8 > 0).sum())
-        if target_pixels < 180 or int((ref_u8 > 0).sum()) < max(600, target_pixels):
+        ref_pixels = int((ref_u8 > 0).sum())
+        debug["cloth_reference_fill_target_pixels"] = target_pixels
+        debug["cloth_reference_fill_ref_pixels"] = ref_pixels
+        if target_pixels < 180 or ref_pixels < 1200:
             return result_rgb, debug
 
         ys, xs = np.where(work_u8 > 0)
@@ -4709,6 +4712,9 @@ class MirrAISDPipeline:
             cloth_reference_fill_coverage = 0.0
             cloth_reference_fill_source_xyxy: Optional[List[int]] = None
             cloth_reference_fill_target_xyxy: Optional[List[int]] = None
+            cloth_reference_fill_target_pixels = 0
+            cloth_reference_fill_ref_pixels = 0
+            cloth_reference_fill_helper_called = False
             cloth_reference_fill_target_mask = np.zeros((H, W), dtype=np.float32)
             cloth_reference_fill_source_mask = np.zeros((H, W), dtype=np.float32)
             cloth_reference_fill_result: Optional[np.ndarray] = None
@@ -4980,11 +4986,18 @@ class MirrAISDPipeline:
             # cleanup된 cloth 영역은 ROI 바깥 clean cloth patch의 색/패턴으로 메운다.
             if _has_cloth and int((all_cleanup_u8 > 0).sum()) >= 200 and int((cloth_ref_mask > 0).sum()) >= 800:
                 cloth_fill_target_u8 = cv2.bitwise_and(all_cleanup_u8, _cloth_u8)
-                if int((split_cloth_mask > 0).sum()) >= 64:
-                    split_cloth_u8_for_fill = (split_cloth_mask > 0.05).astype(np.uint8) * 255
-                    cloth_fill_target_u8 = cv2.bitwise_and(cloth_fill_target_u8, split_cloth_u8_for_fill)
                 cloth_fill_target_u8 = cv2.bitwise_and(cloth_fill_target_u8, cv2.bitwise_not(protect_u8))
-                if int((cloth_fill_target_u8 > 0).sum()) >= 180:
+                cloth_fill_target_u8 = cv2.morphologyEx(
+                    cloth_fill_target_u8,
+                    cv2.MORPH_CLOSE,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 13)),
+                )
+                cloth_fill_target_pixels = int((cloth_fill_target_u8 > 0).sum())
+                cloth_reference_fill_target_pixels = cloth_fill_target_pixels
+                cloth_reference_fill_ref_pixels = int((cloth_ref_mask > 0).sum())
+                cloth_reference_fill_target_mask = cloth_fill_target_u8.astype(np.float32) / 255.0
+                if cloth_fill_target_pixels >= 180:
+                    cloth_reference_fill_helper_called = True
                     result_rgb, cloth_fill_debug = self._apply_cloth_reference_fill(
                         result_rgb,
                         pre_cleanup_rgb,
@@ -4995,6 +5008,8 @@ class MirrAISDPipeline:
                     cloth_reference_fill_coverage = float(cloth_fill_debug.get("cloth_reference_fill_coverage", 0.0))
                     cloth_reference_fill_source_xyxy = cloth_fill_debug.get("cloth_reference_fill_source_xyxy")
                     cloth_reference_fill_target_xyxy = cloth_fill_debug.get("cloth_reference_fill_target_xyxy")
+                    cloth_reference_fill_target_pixels = int(cloth_fill_debug.get("cloth_reference_fill_target_pixels", cloth_reference_fill_target_pixels))
+                    cloth_reference_fill_ref_pixels = int(cloth_fill_debug.get("cloth_reference_fill_ref_pixels", cloth_reference_fill_ref_pixels))
                     if "pipeline_cloth_reference_fill_target_mask" in cloth_fill_debug:
                         cloth_reference_fill_target_mask = cloth_fill_debug["pipeline_cloth_reference_fill_target_mask"]
                     if "pipeline_cloth_reference_fill_source_mask" in cloth_fill_debug:
@@ -5067,6 +5082,9 @@ class MirrAISDPipeline:
                 "cloth_reference_fill_coverage": cloth_reference_fill_coverage,
                 "cloth_reference_fill_source_xyxy": cloth_reference_fill_source_xyxy,
                 "cloth_reference_fill_target_xyxy": cloth_reference_fill_target_xyxy,
+                "cloth_reference_fill_target_pixels": cloth_reference_fill_target_pixels,
+                "cloth_reference_fill_ref_pixels": cloth_reference_fill_ref_pixels,
+                "cloth_reference_fill_helper_called": cloth_reference_fill_helper_called,
                 "pipeline_short_front_cleanup_mask": front_cleanup_u8.astype(np.float32) / 255.0,
                 "pipeline_short_side_cleanup_mask": side_cleanup_u8.astype(np.float32) / 255.0,
                 "pipeline_short_side_outer_cleanup_mask": side_outer_cleanup_u8.astype(np.float32) / 255.0,
