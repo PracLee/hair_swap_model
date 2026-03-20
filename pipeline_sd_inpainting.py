@@ -2185,6 +2185,306 @@ class MirrAISDPipeline:
             (cloth_orig > 0.5).astype(np.float32),
         )
 
+    def _segface_full_parsing(
+        self, img_rgb: np.ndarray, face_bbox: Tuple[int, int, int, int]
+    ) -> np.ndarray:
+        """
+        SegFace로 전체 semantic parsing map을 원본 해상도로 반환.
+        _segface_hair_mask와 동일한 크롭/리사이즈 로직이지만,
+        argmax parsing map(int) 자체를 반환한다.
+
+        Returns:
+            parsing_map (H×W int32): 0=bg, 1=neck, 2=face, 3=cloth, 14=hair 등
+        """
+        H, W = img_rgb.shape[:2]
+        x1, y1, x2, y2 = face_bbox
+        bw, bh = x2 - x1, y2 - y1
+        cx, cy = x1 + bw // 2, y1 + bh // 2
+
+        box_size = int(max(bw, bh) * 2.8)
+        cy = max(0, cy - int(box_size * 0.1))
+
+        crop_x1 = max(0, cx - box_size // 2)
+        crop_y1 = max(0, cy - box_size // 2)
+        crop_x2 = min(W, crop_x1 + box_size)
+        crop_y2 = min(H, crop_y1 + box_size)
+
+        cw = crop_x2 - crop_x1
+        ch = crop_y2 - crop_y1
+
+        crop_max = max(cw, ch)
+        pad_bottom = crop_max - ch
+        pad_right = crop_max - cw
+
+        crop_img = img_rgb[crop_y1:crop_y2, crop_x1:crop_x2]
+        if pad_bottom > 0 or pad_right > 0:
+            crop_img = cv2.copyMakeBorder(
+                crop_img, 0, pad_bottom, 0, pad_right,
+                cv2.BORDER_CONSTANT, value=(0, 0, 0),
+            )
+
+        crop_h, crop_w = crop_img.shape[:2]
+        inp_np = cv2.resize(crop_img, (512, 512), interpolation=cv2.INTER_AREA)
+
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        inp_t = (inp_np / 255.0 - mean) / std
+        inp_t = torch.from_numpy(inp_t).float().permute(2, 0, 1).unsqueeze(0)
+        inp_t = inp_t.float().to(self.device)
+
+        with torch.no_grad():
+            logits = self._segface(inp_t, None, None)
+            parsing_512 = logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int32)
+
+        # Resize to crop dimensions using nearest-neighbor (class labels)
+        parsing_crop = cv2.resize(
+            parsing_512.astype(np.float32), (crop_max, crop_max),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(np.int32)
+        parsing_crop = parsing_crop[:ch, :cw]
+
+        # Place into full-resolution canvas (default = 0 = background)
+        parsing_full = np.zeros((H, W), dtype=np.int32)
+        parsing_full[crop_y1:crop_y2, crop_x1:crop_x2] = parsing_crop
+
+        return parsing_full
+
+    def _parsing_pixel_copy_cleanup(
+        self,
+        result_rgb: np.ndarray,
+        original_rgb: np.ndarray,
+        face_bbox: Tuple[int, int, int, int],
+        cleanup_mask_u8: np.ndarray,
+        cutoff_y: int,
+        protect_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Parsing-based original pixel copy cleanup.
+
+        원리: 생성으로 채우는 대신 원본 이미지에서 동일 semantic 카테고리의
+        non-hair 픽셀을 복사하여 잔여 dark mass를 교체한다.
+
+        Args:
+            result_rgb: hair swap 이후 결과 이미지 (RGB)
+            original_rgb: 원본 이미지 (RGB, hair swap 전)
+            face_bbox: (x1, y1, x2, y2)
+            cleanup_mask_u8: 정리 대상 영역 (0/255)
+            cutoff_y: cutoff line (이 아래만 cleanup)
+            protect_mask: 보호 영역 (float32, 0~1)
+
+        Returns:
+            cleaned RGB image
+        """
+        H, W = result_rgb.shape[:2]
+        if original_rgb is None or original_rgb.shape[:2] != (H, W):
+            logger.warning("[SDPipeline] parsing_pixel_copy: original_rgb unavailable, skipping")
+            return result_rgb
+        if cleanup_mask_u8.shape != (H, W):
+            return result_rgb
+        if int((cleanup_mask_u8 > 0).sum()) < 100:
+            return result_rgb
+
+        # ── 1) Run SegFace parsing on RESULT and ORIGINAL images ──────
+        try:
+            result_parsing = self._segface_full_parsing(result_rgb, face_bbox)
+            original_parsing = self._segface_full_parsing(original_rgb, face_bbox)
+        except Exception as e:
+            logger.warning(f"[SDPipeline] parsing_pixel_copy: SegFace failed: {e}")
+            return result_rgb
+
+        # ── 2) Build semantic category maps ───────────────────────────
+        # Result image parsing → determines what each cleanup pixel SHOULD be
+        SKIN_CLASSES = {1, 2}       # neck, face
+        CLOTH_CLASSES = {3}         # cloth
+        BG_CLASSES = {0}            # background
+        HAIR_CLASS = 14
+
+        result_skin = np.isin(result_parsing, list(SKIN_CLASSES))
+        result_cloth = np.isin(result_parsing, list(CLOTH_CLASSES))
+        result_bg = np.isin(result_parsing, list(BG_CLASSES))
+
+        # Original image: hair mask (pixels to AVOID copying from)
+        orig_hair = (original_parsing == HAIR_CLASS)
+        orig_skin = np.isin(original_parsing, list(SKIN_CLASSES))
+        orig_cloth = np.isin(original_parsing, list(CLOTH_CLASSES))
+        orig_bg = np.isin(original_parsing, list(BG_CLASSES))
+
+        # ── 3) Cleanup target mask ────────────────────────────────────
+        cleanup = cleanup_mask_u8 > 127
+        cleanup[:cutoff_y, :] = False
+
+        # Exclude protected area
+        if protect_mask is not None and protect_mask.shape == (H, W):
+            protect_bool = np.clip(protect_mask, 0.0, 1.0) > 0.5
+            cleanup = cleanup & (~protect_bool)
+
+        cleanup_count = int(cleanup.sum())
+        if cleanup_count < 50:
+            return result_rgb
+
+        # ── 4) Pixel copy per semantic zone ───────────────────────────
+        output = result_rgb.copy()
+
+        # -- 4a) SKIN zone: copy from original skin pixels above (vertical nearest) --
+        skin_cleanup = cleanup & result_skin
+        skin_count = int(skin_cleanup.sum())
+        if skin_count > 0:
+            # Find skin pixels in original that are NOT under hair
+            orig_skin_available = orig_skin & (~orig_hair)
+            if int(orig_skin_available.sum()) > 20:
+                # For each column, find the nearest skin pixel ABOVE in original
+                skin_ys, skin_xs = np.where(skin_cleanup)
+                for y, x in zip(skin_ys, skin_xs):
+                    # Search upward in original for available skin pixel
+                    col_skin = orig_skin_available[:y, x]
+                    if col_skin.any():
+                        src_y = np.where(col_skin)[0][-1]  # nearest above
+                        output[y, x] = original_rgb[src_y, x]
+                    else:
+                        # Fallback: average skin color from original
+                        # (computed once below, applied here)
+                        pass
+
+                # Fallback: fill remaining with average skin color
+                orig_skin_pixels = original_rgb[orig_skin_available]
+                if len(orig_skin_pixels) > 0:
+                    avg_skin = orig_skin_pixels.mean(axis=0).astype(np.uint8)
+                    # Check which pixels weren't filled (still match result)
+                    still_unfilled = skin_cleanup.copy()
+                    for y, x in zip(skin_ys, skin_xs):
+                        col_skin = orig_skin_available[:y, x]
+                        if col_skin.any():
+                            still_unfilled[y, x] = False
+                    if int(still_unfilled.sum()) > 0:
+                        output[still_unfilled] = avg_skin
+
+            logger.info(f"[SDPipeline] parsing_pixel_copy: skin zone={skin_count}px")
+
+        # -- 4b) CLOTH zone: copy from original cloth pixels (horizontal nearest) --
+        cloth_cleanup = cleanup & result_cloth
+        cloth_count = int(cloth_cleanup.sum())
+        if cloth_count > 0:
+            orig_cloth_available = orig_cloth & (~orig_hair)
+            if int(orig_cloth_available.sum()) > 20:
+                cloth_ys, cloth_xs = np.where(cloth_cleanup)
+                for y, x in zip(cloth_ys, cloth_xs):
+                    # Search horizontally in original for nearest cloth pixel
+                    row_cloth = orig_cloth_available[y, :]
+                    if row_cloth.any():
+                        available_xs = np.where(row_cloth)[0]
+                        nearest_idx = np.argmin(np.abs(available_xs - x))
+                        src_x = available_xs[nearest_idx]
+                        output[y, x] = original_rgb[y, src_x]
+                    else:
+                        # Search nearby rows
+                        found = False
+                        for dy in range(1, 30):
+                            for check_y in [y - dy, y + dy]:
+                                if 0 <= check_y < H:
+                                    row_c = orig_cloth_available[check_y, :]
+                                    if row_c.any():
+                                        avail_xs = np.where(row_c)[0]
+                                        n_idx = np.argmin(np.abs(avail_xs - x))
+                                        output[y, x] = original_rgb[check_y, avail_xs[n_idx]]
+                                        found = True
+                                        break
+                            if found:
+                                break
+
+            logger.info(f"[SDPipeline] parsing_pixel_copy: cloth zone={cloth_count}px")
+
+        # -- 4c) BACKGROUND zone: copy from original bg pixels (nearest available) --
+        bg_cleanup = cleanup & result_bg
+        bg_count = int(bg_cleanup.sum())
+        if bg_count > 0:
+            orig_bg_available = orig_bg & (~orig_hair)
+            if int(orig_bg_available.sum()) > 20:
+                bg_ys, bg_xs = np.where(bg_cleanup)
+                # Build distance transform for nearest bg pixel lookup
+                # Invert: 1 where bg available, 0 elsewhere → distance from non-bg
+                bg_avail_u8 = orig_bg_available.astype(np.uint8) * 255
+                bg_avail_inv = cv2.bitwise_not(bg_avail_u8)
+                dist, labels = cv2.distanceTransformWithLabels(
+                    bg_avail_inv, cv2.DIST_L2, 5,
+                    labelType=cv2.DIST_LABEL_PIXEL,
+                )
+                # labels maps each pixel to the nearest zero-pixel index in
+                # raster order. We can use it to find source coords.
+                # Build raster-index → (y, x) for available bg pixels
+                avail_indices = np.where(bg_avail_u8.ravel() > 0)[0]
+                if len(avail_indices) > 0:
+                    # For each bg cleanup pixel, find nearest source
+                    for y, x in zip(bg_ys, bg_xs):
+                        label_id = labels[y, x]
+                        # label_id is a 1-based index into the connected component
+                        # Use distance transform approach: find all bg available
+                        # and pick closest
+                        pass  # fallback below
+
+                    # Simpler approach: for each cleanup pixel, find nearest bg pixel
+                    # using vectorized distance
+                    avail_ys, avail_xs = np.where(orig_bg_available)
+                    if len(avail_ys) > 0:
+                        avail_coords = np.stack([avail_ys, avail_xs], axis=1)  # (N, 2)
+                        for y, x in zip(bg_ys, bg_xs):
+                            dists = np.abs(avail_coords[:, 0] - y) + np.abs(avail_coords[:, 1] - x)
+                            nearest = np.argmin(dists)
+                            sy, sx = avail_coords[nearest]
+                            output[y, x] = original_rgb[sy, sx]
+
+            logger.info(f"[SDPipeline] parsing_pixel_copy: bg zone={bg_count}px")
+
+        # -- 4d) Unclassified cleanup pixels: use nearest-category fallback --
+        classified = skin_cleanup | cloth_cleanup | bg_cleanup
+        unclassified = cleanup & (~classified)
+        unclass_count = int(unclassified.sum())
+        if unclass_count > 0:
+            # Try to copy from original non-hair pixels using nearest neighbor
+            orig_not_hair = ~orig_hair
+            if int(orig_not_hair.sum()) > 0:
+                unc_ys, unc_xs = np.where(unclassified)
+                nh_ys, nh_xs = np.where(orig_not_hair)
+                if len(nh_ys) > 0:
+                    nh_coords = np.stack([nh_ys, nh_xs], axis=1)
+                    for y, x in zip(unc_ys, unc_xs):
+                        dists = np.abs(nh_coords[:, 0] - y) + np.abs(nh_coords[:, 1] - x)
+                        nearest = np.argmin(dists)
+                        sy, sx = nh_coords[nearest]
+                        output[y, x] = original_rgb[sy, sx]
+            logger.info(f"[SDPipeline] parsing_pixel_copy: unclassified zone={unclass_count}px")
+
+        # ── 5) Gaussian blur on boundaries for smooth blending ────────
+        # Create soft transition at the boundary of cleanup area
+        cleanup_f32 = cleanup.astype(np.float32)
+        blend_alpha = cv2.GaussianBlur(cleanup_f32, (0, 0), sigmaX=8.0, sigmaY=8.0)
+        blend_alpha = np.clip(blend_alpha, 0.0, 1.0)
+
+        # Erode the hard mask slightly to ensure interior is 100% new pixels
+        erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        interior = cv2.erode(
+            (cleanup.astype(np.uint8) * 255), erode_k, iterations=1
+        )
+        interior_f = (interior > 127).astype(np.float32)
+
+        # Final alpha: interior = 1.0, boundary = soft ramp
+        final_alpha = np.maximum(interior_f, blend_alpha)
+        final_alpha = cv2.GaussianBlur(final_alpha, (0, 0), sigmaX=5.0, sigmaY=5.0)
+        final_alpha = np.clip(final_alpha, 0.0, 1.0)[..., np.newaxis]
+
+        # Blend: output (pixel-copied) where alpha=1, result_rgb where alpha=0
+        blended = (
+            output.astype(np.float32) * final_alpha
+            + result_rgb.astype(np.float32) * (1.0 - final_alpha)
+        )
+        blended = np.clip(blended, 0, 255).astype(np.uint8)
+
+        logger.info(
+            f"[SDPipeline] parsing_pixel_copy cleanup done: "
+            f"total={cleanup_count}px (skin={skin_count}, cloth={cloth_count}, "
+            f"bg={bg_count}, unclassified={unclass_count})"
+        )
+        return blended
+
     def _refine_with_sam2(
         self,
         img_rgb: np.ndarray,           # H×W×3 RGB
@@ -4836,96 +5136,97 @@ class MirrAISDPipeline:
                     )
                     iterative_cleanup_count += 1
 
-            # ── SD inpainting ROI cleanup ─────────────────────────────────
-            # Iterative LaMa 후에도 남은 dark residual을 SD inpainting으로 채운다.
-            # LaMa는 큰 영역의 texture 복원에 한계가 있으므로, 남은 잔여물 ROI만
-            # SD pipe로 재생성하여 옷/피부/배경 텍스처를 자연스럽게 복원한다.
+            # ── Parsing-based original pixel copy cleanup ─────────────────
+            # Iterative LaMa 후에도 남은 dark residual을 원본 이미지의 동일
+            # semantic 카테고리 픽셀로 복사하여 교체한다.
+            # SD inpainting 대신 원본 pixel copy를 사용하면:
+            #   1. 텍스처가 원본과 완벽히 일치 (blur/artifact 없음)
+            #   2. 머리카락을 다시 생성하지 않음
+            #   3. GPU 추가 소비 없음 (SegFace만 사용)
             sd_roi_applied = False
-            if _has_cloth and self._sd_pipe is not None:
+            parsing_copy_applied = False
+            if _has_cloth and original_rgb is not None:
                 # 잔여물 재감지: iterative cleanup 후 기준으로 재스캔
-                sd_detect_lab = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-                sd_detect_L = sd_detect_lab[:, :, 0]
+                pc_detect_lab = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+                pc_detect_L = pc_detect_lab[:, :, 0]
 
-                sd_residual_u8 = np.zeros((H, W), dtype=np.uint8)
+                pc_residual_u8 = np.zeros((H, W), dtype=np.uint8)
 
-                # Cloth dark outliers (configurable σ — iterative보다 더 엄격하게 잡음)
-                sd_cloth_ref = sd_detect_L[cloth_ref_mask > 0]
-                if len(sd_cloth_ref) >= 64:
-                    sd_cloth_med = float(np.median(sd_cloth_ref))
-                    sd_cloth_std = max(float(np.std(sd_cloth_ref)), 6.0)
-                    sd_cloth_thresh = sd_cloth_med - sd_cloth_std * _cp_sd_cloth_sigma
-                    sd_cloth_dark = (
-                        (cloth_scan_base > 0) & (sd_detect_L < sd_cloth_thresh)
+                # Cloth dark outliers
+                pc_cloth_ref = pc_detect_L[cloth_ref_mask > 0]
+                if len(pc_cloth_ref) >= 64:
+                    pc_cloth_med = float(np.median(pc_cloth_ref))
+                    pc_cloth_std = max(float(np.std(pc_cloth_ref)), 6.0)
+                    pc_cloth_thresh = pc_cloth_med - pc_cloth_std * _cp_sd_cloth_sigma
+                    pc_cloth_dark = (
+                        (cloth_scan_base > 0) & (pc_detect_L < pc_cloth_thresh)
                     ).astype(np.uint8) * 255
-                    sd_residual_u8 = cv2.bitwise_or(sd_residual_u8, sd_cloth_dark)
+                    pc_residual_u8 = cv2.bitwise_or(pc_residual_u8, pc_cloth_dark)
 
                 # Background dark outliers
-                sd_bg_ref = sd_detect_L[bg_ref_mask > 0]
-                if len(sd_bg_ref) >= 64:
-                    sd_bg_med = float(np.median(sd_bg_ref))
-                    sd_bg_std = max(float(np.std(sd_bg_ref)), 6.0)
-                    sd_bg_thresh = sd_bg_med - sd_bg_std * _cp_sd_bg_sigma
-                    sd_bg_dark = (
-                        (bg_scan_base > 0) & (sd_detect_L < sd_bg_thresh)
+                pc_bg_ref = pc_detect_L[bg_ref_mask > 0]
+                if len(pc_bg_ref) >= 64:
+                    pc_bg_med = float(np.median(pc_bg_ref))
+                    pc_bg_std = max(float(np.std(pc_bg_ref)), 6.0)
+                    pc_bg_thresh = pc_bg_med - pc_bg_std * _cp_sd_bg_sigma
+                    pc_bg_dark = (
+                        (bg_scan_base > 0) & (pc_detect_L < pc_bg_thresh)
                     ).astype(np.uint8) * 255
-                    sd_residual_u8 = cv2.bitwise_or(sd_residual_u8, sd_bg_dark)
+                    pc_residual_u8 = cv2.bitwise_or(pc_residual_u8, pc_bg_dark)
 
                 # Constraints
-                sd_residual_u8[:cleanup_roi_top, :] = 0
-                sd_residual_u8 = cv2.bitwise_and(sd_residual_u8, corridor)
-                sd_residual_u8 = cv2.bitwise_and(sd_residual_u8, cv2.bitwise_not(protect_u8))
+                pc_residual_u8[:cleanup_roi_top, :] = 0
+                pc_residual_u8 = cv2.bitwise_and(pc_residual_u8, corridor)
+                pc_residual_u8 = cv2.bitwise_and(pc_residual_u8, cv2.bitwise_not(protect_u8))
                 if int((residual_keepout_u8 > 0).sum()) > 0:
-                    sd_residual_u8 = cv2.bitwise_and(
-                        sd_residual_u8, cv2.bitwise_not(residual_keepout_u8)
+                    pc_residual_u8 = cv2.bitwise_and(
+                        pc_residual_u8, cv2.bitwise_not(residual_keepout_u8)
                     )
 
                 # Component filtering
-                if int((sd_residual_u8 > 0).sum()) > 0:
-                    n_sd, lbl_sd, stats_sd, _ = cv2.connectedComponentsWithStats(
-                        sd_residual_u8, connectivity=8
+                if int((pc_residual_u8 > 0).sum()) > 0:
+                    n_pc, lbl_pc, stats_pc, _ = cv2.connectedComponentsWithStats(
+                        pc_residual_u8, connectivity=8
                     )
-                    sd_filtered = np.zeros_like(sd_residual_u8)
-                    for sd_lbl in range(1, n_sd):
-                        if stats_sd[sd_lbl, cv2.CC_STAT_AREA] >= _cp_sd_comp_min:
-                            sd_filtered[lbl_sd == sd_lbl] = 255
-                    sd_residual_u8 = sd_filtered
+                    pc_filtered = np.zeros_like(pc_residual_u8)
+                    for pc_lbl in range(1, n_pc):
+                        if stats_pc[pc_lbl, cv2.CC_STAT_AREA] >= _cp_sd_comp_min:
+                            pc_filtered[lbl_pc == pc_lbl] = 255
+                    pc_residual_u8 = pc_filtered
 
                 # Morphological cleanup
-                if int((sd_residual_u8 > 0).sum()) >= 300:
-                    sd_residual_u8 = cv2.morphologyEx(
-                        sd_residual_u8,
+                if int((pc_residual_u8 > 0).sum()) >= 200:
+                    pc_residual_u8 = cv2.morphologyEx(
+                        pc_residual_u8,
                         cv2.MORPH_CLOSE,
                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
                     )
 
-                sd_residual_pixels = int((sd_residual_u8 > 0).sum())
+                pc_residual_pixels = int((pc_residual_u8 > 0).sum())
                 logger.info(
-                    f"[SDPipeline] SD ROI residual detection: {sd_residual_pixels}px remaining"
+                    f"[SDPipeline] Parsing pixel copy residual detection: "
+                    f"{pc_residual_pixels}px remaining"
                 )
 
-                if sd_residual_pixels >= 300:
-                    _use_seed = seed if seed is not None else 42
-                    result_rgb = self._sd_inpaint_roi_cleanup(
-                        result_rgb,
-                        sd_residual_u8,
-                        face_bbox,
-                        protect_mask=protect_mask,
-                        cloth_mask=cloth_mask,
-                        seed=_use_seed,
-                        roi_pad_ratio=0.30,
-                        min_residual_pixels=300,
-                        sd_strength=_cp_sd_strength,
-                        sd_steps=_cp_sd_steps,
-                        sd_blend_sigma=_cp_sd_blend_sigma,
-                        sd_guidance=_cp_sd_guidance,
-                        sd_controlnet=_cp_sd_controlnet,
-                        original_rgb=original_rgb,
-                    )
-                    sd_roi_applied = True
-                    # 누적 cleanup mask 업데이트
-                    iterative_total_mask_u8 = cv2.bitwise_or(
-                        iterative_total_mask_u8, sd_residual_u8
-                    )
+                if pc_residual_pixels >= 200:
+                    try:
+                        result_rgb = self._parsing_pixel_copy_cleanup(
+                            result_rgb,
+                            original_rgb,
+                            face_bbox,
+                            pc_residual_u8,
+                            cutoff_y,
+                            protect_mask=protect_mask,
+                        )
+                        parsing_copy_applied = True
+                        # 누적 cleanup mask 업데이트
+                        iterative_total_mask_u8 = cv2.bitwise_or(
+                            iterative_total_mask_u8, pc_residual_u8
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[SDPipeline] Parsing pixel copy failed, skipping: {e}"
+                        )
 
             # ── Poisson blending (seamlessClone) ─────────────────────────
             # src = cleanup 완료된 이미지 (LaMa가 채운 텍스처)
@@ -5129,6 +5430,7 @@ class MirrAISDPipeline:
                 "iterative_cleanup_count": iterative_cleanup_count,
                 "poisson_blend_applied": poisson_applied,
                 "sd_roi_cleanup_applied": sd_roi_applied,
+                "parsing_pixel_copy_applied": parsing_copy_applied,
                 "boundary_interpolation_used": boundary_y_map is not None,
             }
             if cv2_post_rgb is not None:
